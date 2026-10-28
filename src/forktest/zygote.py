@@ -17,36 +17,18 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
 
-from forktest.events import CollectError, Done, Event, Miss, Selection, TestResult, Verified
+from forktest.events import CollectError, Done, Event, Miss, Request, Selection, TestResult, Verified
 from forktest.fingerprint import FILE, MODULE, Fingerprints, normalize_qualname
 from forktest.selection import ImportGraph, Reason, changed_paths, config_files, select
 from forktest.store import Dep, GitBaseline, Record, Store, StoreView
 from forktest.worker import ProjectFiles, Recorder, run_items, worker_main
 
 Emit = Callable[[Event], None]
-
-
-@dataclass
-class Request:
-    mode: str = "affected"
-    since: str | None = None
-    verify: bool = False
-    workers: int = 0
-    strict: bool = False
-    nice: bool = False
-    pytest_args: list[str] = field(default_factory=list)
-
-    def to_json(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_json(cls, d: dict[str, Any]) -> Request:
-        return cls(**d)
 
 
 class Cancelled(Exception):

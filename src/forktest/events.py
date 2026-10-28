@@ -1,4 +1,7 @@
-"""The event stream a run produces. Reporters consume it; the daemon ships it."""
+"""What a client asks for (Request) and the event stream a run produces.
+
+Reporters consume events; the daemon ships both over its socket.
+"""
 
 from __future__ import annotations
 
@@ -120,3 +123,21 @@ def parse(line: str | bytes) -> Event:
         "done": Done,
     }[kind]
     return cls(**d)
+
+
+@dataclass
+class Request:
+    mode: str = "affected"
+    since: str | None = None
+    verify: bool = False
+    workers: int = 0
+    strict: bool = False
+    nice: bool = False
+    pytest_args: list[str] = field(default_factory=list)
+
+    def to_json(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_json(cls, d: dict[str, Any]) -> Request:
+        return cls(**d)

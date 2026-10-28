@@ -21,10 +21,9 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
-from forktest.events import CollectError, Done, Event, dumps, parse
+from forktest.events import CollectError, Done, Event, Request, dumps, parse
 from forktest.reporters import HumanReporter
 from forktest.selection import is_config_file, is_excluded
-from forktest.zygote import Cancelled, ClientGone, Request, Runner, ZygotePlugin
 
 POLL_INTERVAL = 0.3
 DEBOUNCE = 0.15
@@ -97,7 +96,7 @@ def log(msg: str) -> None:
 
 # --------------------------------------------------------------------------- L1
 
-_runner: Runner | None = None
+_runner: Any = None
 
 
 def _l1_sigterm(signum: int, frame: Any) -> NoReturn:
@@ -110,14 +109,16 @@ def l1_main(control: socket.socket, pytest_args: list[str]) -> NoReturn:
     os.setpgid(0, 0)
     signal.signal(signal.SIGTERM, _l1_sigterm)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    import pytest
+
+    from forktest.zygote import ZygotePlugin
+
     served = False
 
-    def loop(runner: Runner) -> None:
+    def loop(runner: Any) -> None:
         nonlocal served
         served = True
         serve_forever(runner, control)
-
-    import pytest
 
     rc = pytest.main(pytest_args, plugins=[ZygotePlugin(loop)])
     if not served:
@@ -128,7 +129,9 @@ def l1_main(control: socket.socket, pytest_args: list[str]) -> NoReturn:
     os._exit(0)
 
 
-def serve_forever(runner: Runner, control: socket.socket) -> None:
+def serve_forever(runner: Any, control: socket.socket) -> None:
+    from forktest.zygote import Cancelled, ClientGone
+
     global _runner
     _runner = runner
     send_frame(control, {"state": "ready", "imported": runner.imported_files()})

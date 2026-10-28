@@ -7,7 +7,7 @@ import os
 import sys
 from collections.abc import Callable
 
-from forktest.events import CollectError, Done, Event, Miss, Selection
+from forktest.events import CollectError, Done, Event, Miss, Request, Selection
 from forktest.reporters import HumanReporter, JsonlReporter, JunitReporter, Reporter
 
 INI_FILES = ("pytest.ini", ".pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg")
@@ -140,19 +140,19 @@ def main(argv: list[str] | None = None) -> int:
 
 def _main(argv: list[str] | None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    reexec_for_fork_safety(argv)
     from forktest import daemon
 
     if argv[:1] == ["watch"]:
+        reexec_for_fork_safety(argv)
         return daemon.watch_command(argv[1:])
     if argv[:1] == ["daemon"]:
+        if argv[1:2] == ["start"]:
+            reexec_for_fork_safety(argv)
         return daemon.daemon_command(argv[1:])
     opts, pytest_args = parse_args(argv)
     root = find_root(os.getcwd())
     if opts.why:
         return why_command(root, opts.why)
-
-    from forktest.zygote import Request, run_oneshot
 
     request = Request(
         mode="all" if opts.all else "since" if opts.since else "affected",
@@ -176,6 +176,9 @@ def _main(argv: list[str] | None) -> int:
 
     rc = 0
     if opts.no_daemon or not daemon.run_via_daemon(root, request, emit):
+        reexec_for_fork_safety(argv)
+        from forktest.zygote import run_oneshot
+
         rc = run_oneshot(request, pytest_args, emit)
     for r in reporters:
         r.close()

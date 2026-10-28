@@ -94,8 +94,6 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
-# --------------------------------------------------------------------------- L1
-
 _runner: Any = None
 
 
@@ -169,8 +167,6 @@ def serve_forever(runner: Any, control: socket.socket) -> None:
         send_frame(control, {"state": "idle", "imported": runner.imported_files()})
 
 
-# --------------------------------------------------------------------------- L0
-
 
 class L1State(enum.Enum):
     ABSENT = "absent"
@@ -231,7 +227,7 @@ def _preimport(root: str) -> int:
         try:
             importlib.import_module(name)
             count += 1
-        except Exception:  # noqa: BLE001 - a stale or broken module name must not stop the daemon
+        except Exception:  # the list came from an earlier environment; a name that no longer imports is not an error
             pass
     return count
 
@@ -255,8 +251,6 @@ class Daemon:
         self.watch_reporter: HumanReporter | None = None
         self.watch_buf = b""
         self.preimported = 0
-
-    # lifecycle ------------------------------------------------------------
 
     def run(self) -> None:
         os.makedirs(self.paths.dir, exist_ok=True)
@@ -305,8 +299,6 @@ class Daemon:
                     pass
         for client, _ in self.queue:
             client.close()
-
-    # L1 state machine -----------------------------------------------------
 
     def build_l1(self, args: tuple[str, ...]) -> None:
         assert self.l1.state == L1State.ABSENT
@@ -378,8 +370,6 @@ class Daemon:
                 return
             if pid == self.l1.pid and self.l1.state != L1State.ABSENT:
                 self._l1_gone()
-
-    # requests -------------------------------------------------------------
 
     def _accept(self) -> None:
         assert self.listener is not None
@@ -457,8 +447,6 @@ class Daemon:
         send_frame(self.l1.control, {"op": "run", "request": request}, [client.fileno()])
         self.l1.outstanding += 1
 
-    # files ----------------------------------------------------------------
-
     def _poll_files(self) -> None:
         before = set(self.watcher.snapshot)
         changed = self.watcher.poll()
@@ -483,8 +471,6 @@ class Daemon:
     def _restart(self) -> NoReturn:
         self.shutdown()
         os.execv(sys.executable, [sys.executable, "-m", "forktest", *sys.argv[1:]])
-
-    # watch mode -----------------------------------------------------------
 
     def _start_watch_run(self) -> None:
         a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -525,8 +511,6 @@ class Daemon:
             sys.stdout.write("\n")
             sys.stdout.flush()
 
-
-# --------------------------------------------------------------------------- client side
 
 
 def daemon_status(root: str) -> dict[str, Any] | None:
@@ -570,8 +554,6 @@ def run_via_daemon(root: str, request: Request, emit: Callable[[Event], None]) -
             sys.stderr.write("forktest: the daemon's zygote restarted during the run; retrying\n")
     return True
 
-
-# --------------------------------------------------------------------------- commands
 
 
 def _parse_daemon_args(argv: list[str]) -> tuple[int, list[str]]:

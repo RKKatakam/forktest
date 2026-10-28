@@ -177,10 +177,12 @@ def test_all_matches_plain_pytest_and_honours_passthrough_args(demo):
         assert selection(events).reasons == {"all": selection(events).total}
 
 
-def test_exit_first_stops_after_the_first_failure(demo):
+def test_exit_first_stops_scheduling_after_the_first_failure(demo):
+    """Workers already running may still report their failure, so 1 or 2 failures; never the full 12."""
     demo.edit("config.py", 'CURRENCY = "EUR"', 'CURRENCY = "EURO"')
     events, rc = demo.forktest("-x")
-    assert rc == 1 and done(events).failed == 1
+    assert rc == 1 and 1 <= done(events).failed <= 2
+    assert done(events).passed + done(events).failed < 12
 
 
 def test_verify_selection_reports_a_miss_when_a_baseline_is_wrong(demo):

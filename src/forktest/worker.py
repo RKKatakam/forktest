@@ -201,10 +201,10 @@ def worker_main(
         recorder.start()
         run_items(items, send, recorder, project)
         send({"type": "done"})
-    except BaseException as exc:  # noqa: BLE001 - the parent must learn why the worker stopped
+    except BaseException as exc:
         try:
             send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     finally:
         try:

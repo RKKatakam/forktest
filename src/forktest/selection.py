@@ -39,7 +39,22 @@ PRIORITY = [
 CONFIG_FILES = ("pytest.ini", ".pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "uv.lock", "poetry.lock")
 CONFIG_GLOBS = ("requirements*.txt",)
 EXCLUDED_DIRS = frozenset(
-    {".git", ".hg", ".venv", "venv", ".tox", ".nox", "__pycache__", ".forktest", ".pytest_cache", "node_modules", "site-packages"}
+    {
+        ".git",
+        ".hg",
+        ".venv",
+        "venv",
+        ".tox",
+        ".nox",
+        "__pycache__",
+        ".forktest",
+        ".pytest_cache",
+        ".hypothesis",
+        ".mypy_cache",
+        ".ruff_cache",
+        "node_modules",
+        "site-packages",
+    }
 )
 
 

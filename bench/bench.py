@@ -3,10 +3,13 @@ one-function edit, and the same edit against a warm daemon.
 
     uv run python bench/bench.py [--project examples/demo] [--runs 5]
 
-The project is copied to a temp dir first. Sides alternate within each round
-so warm caches and drift favour neither. Every run's pass/fail counts are
-checked against the expected ones, so a fast run that did no work fails the
-bench instead of winning it.
+The project is copied to a temp dir first, unless --in-place is given, which
+you need when the project is installed editable from its checkout (otherwise
+the tests import the original source and the copy's edit never runs). In
+place, the edited file is restored afterwards. Sides alternate within each
+round so warm caches and drift favour neither. Every run's pass/fail counts
+are printed next to the time, so a fast run that did no work shows up as
+such instead of winning.
 """
 
 from __future__ import annotations
@@ -30,15 +33,20 @@ PYTEST = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"]
 
 
 class Bench:
-    def __init__(self, project: Path, edit_file: str, edit_line: str, runs: int, pytest_args: list[str]) -> None:
+    def __init__(self, project: Path, edit_file: str, edit_line: str, runs: int, pytest_args: list[str], in_place: bool) -> None:
         self.src = project
         self.runs = runs
         self.edit_file = edit_file
         self.edit_line = edit_line
         self.pytest_args = pytest_args
-        self.tmp = Path(tempfile.mkdtemp(prefix="forktest-bench-"))
-        self.root = self.tmp / project.name
-        shutil.copytree(project, self.root, ignore=shutil.ignore_patterns(".forktest", ".pytest_cache", "__pycache__", ".git"))
+        self.tmp: Path | None = None
+        if in_place:
+            self.root = project
+        else:
+            self.tmp = Path(tempfile.mkdtemp(prefix="forktest-bench-"))
+            self.root = self.tmp / project.name
+            shutil.copytree(project, self.root, ignore=shutil.ignore_patterns(".forktest", ".pytest_cache", "__pycache__", ".git"))
+        self.original = (self.root / edit_file).read_text()
         self.toggle = 0
         self.rows: list[tuple[str, str, list[float], str]] = []
 
@@ -112,8 +120,10 @@ class Bench:
             self.measure("one-function edit, warm daemon", "forktest (affected, zygote already rebuilt)", FORKTEST + ["--json", *self.pytest_args], self.forktest_counts, before=lambda: (self.edit(), time.sleep(0.4), self.wait_ready()))
         finally:
             self.sh(FORKTEST + ["daemon", "stop"])
+            (self.root / self.edit_file).write_text(self.original)
         self.report()
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self.tmp is not None:
+            shutil.rmtree(self.tmp, ignore_errors=True)
 
     def wait_ready(self) -> None:
         for _ in range(600):
@@ -134,11 +144,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--project", default=str(HERE.parent / "examples" / "demo"))
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--in-place", action="store_true", help="run in the project dir itself (needed for editable installs)")
     parser.add_argument("--edit-file", default=DEFAULT_EDIT[0], help="file holding the function to edit each round")
     parser.add_argument("--edit-line", default=DEFAULT_EDIT[1], help="exact source line inside that function body")
     parser.add_argument("pytest_args", nargs="*", help="extra arguments passed to both runners")
     args = parser.parse_args()
-    Bench(Path(args.project).resolve(), args.edit_file, args.edit_line, args.runs, args.pytest_args).run()
+    Bench(Path(args.project).resolve(), args.edit_file, args.edit_line, args.runs, args.pytest_args, args.in_place).run()
 
 
 if __name__ == "__main__":

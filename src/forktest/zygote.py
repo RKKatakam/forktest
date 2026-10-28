@@ -6,6 +6,7 @@ holds the collected session; each request forks workers from it.
 
 from __future__ import annotations
 
+import functools
 import gc
 import heapq
 import json
@@ -192,6 +193,7 @@ class Runner:
         view = self.store.view()
         graph = self.graph()
         nodeids = [i.nodeid for i in self.items]
+        current = functools.cache(self.fps.of)
         if req.mode == "all":
             reasons = {n: Reason.ALL for n in nodeids}
             changed: list[str] = []
@@ -202,8 +204,8 @@ class Runner:
                     view = view.rebased(baseline.hash_of)
                 finally:
                     baseline.close()
-            reasons = select(nodeids, view, self.fps.of, graph, fixtures=self.all_fixture_locs())
-            changed = changed_paths(nodeids, view, self.fps.of)
+            reasons = select(nodeids, view, current, graph, fixtures=self.all_fixture_locs())
+            changed = changed_paths(nodeids, view, current)
         selected = [i for i in self.items if i.nodeid in reasons]
         counts = {str(r): n for r, n in sorted(Counter(reasons.values()).items())}
         emit(Selection(changed, len(selected), len(nodeids), counts, _ms(t0)))
@@ -215,7 +217,7 @@ class Runner:
             emit(result)
 
         cancel = (wake_fd, should_cancel)
-        self.execute(selected, view, graph, req, on_result, cancel, nice=False)
+        self.execute(selected, view, graph, req, on_result, cancel, nice=False, current=current)
         emit(Done(tally["passed"], tally["failed"], tally["error"], tally["skipped"], _ms(t0)))
         if not req.verify:
             return
@@ -229,7 +231,7 @@ class Runner:
                 misses += 1
                 emit(Miss(result.nodeid, result.message or ""))
 
-        self.execute(rest, view, graph, req, on_unselected, cancel, nice=req.nice)
+        self.execute(rest, view, graph, req, on_unselected, cancel, nice=req.nice, current=current)
         emit(Verified(len(rest), misses, _ms(t1)))
 
     def execute(
@@ -241,12 +243,13 @@ class Runner:
         on_result: Callable[[TestResult], None],
         cancel: tuple[int | None, Callable[[], bool]],
         nice: bool,
+        current: Callable[[str], dict[str, str] | None],
     ) -> None:
         if not items:
             return
         records: list[Record] = []
         closures: dict[str, set[str]] = {}
-        config_deps = [Dep(p, FILE, self.fps.of(p)[FILE]) for p in config_files(self.root) if self.fps.of(p)]
+        config_deps = [Dep(p, FILE, current(p)[FILE]) for p in config_files(self.root) if current(p)]
         maxfail = self.config.getoption("maxfail") or 0
         stopped = False
         failures = 0
@@ -258,9 +261,8 @@ class Runner:
                 item = self._item(result.nodeid)
                 if worker is not None:
                     worker.pending.discard(result.nodeid)
-                records.append(
-                    Record(result.nodeid, result.outcome, result.duration, self.deps_for(item, msg["hits"], msg["reads"], graph, closures, config_deps))
-                )
+                deps = self.deps_for(item, msg["hits"], msg["reads"], graph, closures, config_deps, current)
+                records.append(Record(result.nodeid, result.outcome, result.duration, deps))
                 on_result(result)
                 if result.outcome in ("failed", "error"):
                     failures += 1
@@ -384,11 +386,12 @@ class Runner:
         graph: ImportGraph,
         closures: dict[str, set[str]],
         config_deps: list[Dep],
+        current: Callable[[str], dict[str, str] | None],
     ) -> list[Dep]:
         deps: set[Dep] = set(config_deps)
 
         def add_function(rel: str, qualname: str) -> None:
-            fp = self.fps.of(rel)
+            fp = current(rel)
             if fp is not None:
                 q = normalize_qualname(qualname, fp)
                 deps.add(Dep(rel, q, fp[q]))
@@ -401,14 +404,14 @@ class Runner:
             add_function(rel, qualname)
         for path in reads:
             rel = self.project.rel(path)
-            fp = self.fps.of(rel) if rel is not None else None
+            fp = current(rel) if rel is not None else None
             if rel is not None and fp is not None:
                 deps.add(Dep(rel, FILE, fp[FILE]))
         test_file = item.nodeid.split("::")[0]
         if test_file not in closures:
             closures[test_file] = graph.closure(test_file)
         for path in closures[test_file]:
-            fp = self.fps.of(path)
+            fp = current(path)
             if fp is not None:
                 deps.add(Dep(path, MODULE, fp[MODULE]))
         return sorted(deps)

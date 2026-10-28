@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal
 
 from billing.invoice import Invoice
@@ -20,5 +21,5 @@ class TestInvoice:
         assert inv.describe() == "1 lines, total 12.00 EUR"
 
 
-def test_ledger_has_opening_invoice(ledger):
-    assert ledger[0].net() == Decimal("100")
+def test_ledger_has_opening_balance(ledger):
+    assert Decimal(json.loads(ledger.read_text())["opening"]) == Decimal("100")

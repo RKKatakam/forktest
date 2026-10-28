@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import NamedTuple
+
+from forktest.fingerprint import FILE, content_hash, fingerprint
 
 
 class Dep(NamedTuple):
@@ -102,3 +105,57 @@ class Store:
 
     def close(self) -> None:
         self.conn.close()
+
+
+class GitBaseline:
+    """Fingerprints of files as they were at a git ref, for ``--since``.
+
+    The ref is resolved to its merge base with HEAD, so ``--since main`` means
+    "since this branch left main" even after main moved on.
+    """
+
+    def __init__(self, root: str, ref: str) -> None:
+        merge_base = subprocess.run(
+            ["git", "merge-base", "HEAD", ref], cwd=root, capture_output=True, text=True
+        )
+        self.sha = merge_base.stdout.strip() if merge_base.returncode == 0 else ref
+        self.proc = subprocess.Popen(
+            ["git", "cat-file", "--batch"], cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE
+        )
+        self._cache: dict[str, dict[str, str] | None] = {}
+
+    def read(self, path: str) -> bytes | None:
+        assert self.proc.stdin and self.proc.stdout
+        self.proc.stdin.write(f"{self.sha}:{path}\n".encode())
+        self.proc.stdin.flush()
+        header = self.proc.stdout.readline().decode().split()
+        if len(header) < 3:
+            return None
+        size = int(header[2])
+        data = self.proc.stdout.read(size)
+        self.proc.stdout.read(1)
+        return data
+
+    def fingerprint(self, path: str) -> dict[str, str] | None:
+        if path not in self._cache:
+            data = self.read(path)
+            if data is None:
+                fp = None
+            elif path.endswith(".py"):
+                try:
+                    fp = fingerprint(data)
+                except (SyntaxError, ValueError):
+                    fp = {}
+            else:
+                fp = {FILE: content_hash(data)}
+            self._cache[path] = fp
+        return self._cache[path]
+
+    def hash_of(self, path: str, qualname: str) -> str | None:
+        fp = self.fingerprint(path)
+        return None if fp is None else fp.get(qualname)
+
+    def close(self) -> None:
+        if self.proc.stdin:
+            self.proc.stdin.close()
+        self.proc.wait()

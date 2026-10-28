@@ -1,14 +1,12 @@
+import json
 import time
-from decimal import Decimal
 
 import pytest
 
-from billing.invoice import Invoice
-
 
 @pytest.fixture(scope="session")
-def ledger():
+def ledger(tmp_path_factory):
     time.sleep(0.02)
-    opening = Invoice()
-    opening.add("opening balance", 1, Decimal("100"))
-    return [opening]
+    path = tmp_path_factory.mktemp("ledger") / "ledger.json"
+    path.write_text(json.dumps({"opening": "100"}))
+    return path

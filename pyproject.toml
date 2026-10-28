@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forktest"
+version = "0.0.1"
+description = "A fast, pytest-compatible test runner: warm zygotes, forked workers, affected-test selection."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["pytest>=8"]
+
+[project.scripts]
+forktest = "forktest.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/forktest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

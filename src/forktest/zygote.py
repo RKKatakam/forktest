@@ -193,7 +193,14 @@ class Runner:
             self._all_fixture_locs = frozenset().union(*(self.fixture_locs(i) for i in self.items))
         return self._all_fixture_locs
 
-    def run(self, req: Request, emit: Emit, cancel_fd: int | None = None) -> None:
+    def run(
+        self,
+        req: Request,
+        emit: Emit,
+        wake_fd: int | None = None,
+        should_cancel: Callable[[], bool] = lambda: True,
+    ) -> None:
+        """Run one request. When ``wake_fd`` turns readable, ``should_cancel`` decides whether to stop."""
         t0 = time.perf_counter()
         for error in self.collect_errors:
             emit(error)
@@ -225,7 +232,8 @@ class Runner:
             tally[result.outcome] += 1
             emit(result)
 
-        self.execute(selected, view, graph, req, on_result, cancel_fd, nice=False)
+        cancel = (wake_fd, should_cancel)
+        self.execute(selected, view, graph, req, on_result, cancel, nice=False)
         emit(Done(tally["passed"], tally["failed"], tally["error"], tally["skipped"], _ms(t0)))
         if not req.verify:
             return
@@ -239,7 +247,7 @@ class Runner:
                 misses += 1
                 emit(Miss(result.nodeid, result.message or ""))
 
-        self.execute(rest, view, graph, req, on_unselected, cancel_fd, nice=req.nice)
+        self.execute(rest, view, graph, req, on_unselected, cancel, nice=req.nice)
         emit(Verified(len(rest), misses, _ms(t1)))
 
     def execute(
@@ -249,7 +257,7 @@ class Runner:
         graph: ImportGraph,
         req: Request,
         on_result: Callable[[TestResult], None],
-        cancel_fd: int | None,
+        cancel: tuple[int | None, Callable[[], bool]],
         nice: bool,
     ) -> None:
         if not items:
@@ -293,7 +301,7 @@ class Runner:
                 workers = req.workers or os.cpu_count() or 2
                 failed = {n for n, row in view.tests.items() if row.outcome in ("failed", "error")}
                 batches = schedule(items, lambda n: view.tests[n].duration if n in view.tests else 0.01, failed, workers)
-                self._run_forked(batches, nice, handle, cancel_fd, lambda: stopped, on_result)
+                self._run_forked(batches, nice, handle, cancel, lambda: stopped, on_result)
         finally:
             self.store.record(records)
             self.store.meta_set("preimport", json.dumps(self.third_party_modules()))
@@ -328,10 +336,11 @@ class Runner:
         batches: list[list[pytest.Item]],
         nice: bool,
         handle: Callable[[dict[str, Any], _Worker], None],
-        cancel_fd: int | None,
+        cancel: tuple[int | None, Callable[[], bool]],
         stopped: Callable[[], bool],
         on_result: Callable[[TestResult], None],
     ) -> None:
+        wake_fd, should_cancel = cancel
         sel = selectors.DefaultSelector()
         workers: dict[int, _Worker] = {}
         gc.freeze()
@@ -350,13 +359,15 @@ class Runner:
                 sel.register(r, selectors.EVENT_READ)
         finally:
             gc.unfreeze()
-        if cancel_fd is not None:
-            sel.register(cancel_fd, selectors.EVENT_READ)
+        if wake_fd is not None:
+            sel.register(wake_fd, selectors.EVENT_READ)
         try:
             while workers:
                 for key, _ in sel.select():
-                    if key.fd == cancel_fd:
-                        raise Cancelled
+                    if key.fd == wake_fd:
+                        if should_cancel():
+                            raise Cancelled
+                        continue
                     worker = workers[key.fd]
                     data = os.read(key.fd, 1 << 16)
                     if data:

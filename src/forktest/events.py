@@ -38,7 +38,14 @@ class TestResult:
     message: str | None = None
     trace: list[Frame] = field(default_factory=list)
 
-    EVENT_NAMES = {"passed": "pass", "failed": "fail", "skipped": "skip", "error": "error"}
+    EVENT_NAMES = {
+        "passed": "pass",
+        "failed": "fail",
+        "skipped": "skip",
+        "error": "error",
+        "xfailed": "xfail",
+        "xpassed": "xpass",
+    }
     __test__ = False
 
     def to_json(self) -> dict[str, Any]:
@@ -82,11 +89,13 @@ class Verified:
 
 @dataclass
 class Done:
-    passed: int
-    failed: int
-    errors: int
-    skipped: int
-    duration_ms: int
+    passed: int = 0
+    failed: int = 0
+    errors: int = 0
+    skipped: int = 0
+    xfailed: int = 0
+    xpassed: int = 0
+    duration_ms: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {"event": "done", **asdict(self)}

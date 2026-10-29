@@ -22,7 +22,7 @@ EVENTS = [
     CollectError("tests/test_broken.py", "ImportError: nope"),
     Miss("tests/test_y.py::test_m", "assert False"),
     Verified(14, 1, 231),
-    Done(13, 1, 0, 1, 231),
+    Done(passed=13, failed=1, skipped=1, duration_ms=231),
 ]
 
 

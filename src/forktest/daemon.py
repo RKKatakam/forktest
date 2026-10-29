@@ -415,7 +415,7 @@ class Daemon:
             client, _ = self.queue.popleft()
             try:
                 client.sendall(dumps(CollectError("<zygote>", message)).encode() + b"\n")
-                client.sendall(dumps(Done(0, 0, 1, 0, 0)).encode() + b"\n")
+                client.sendall(dumps(Done(errors=1)).encode() + b"\n")
             except OSError:
                 pass
             client.close()

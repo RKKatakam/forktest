@@ -134,10 +134,14 @@ def result_of(nodeid: str, reports: Sequence[TestReport], project: ProjectFiles)
             message += f"\n--- {extra.when} ---\n" + failure_details(extra, project)[0]
         return TestResult(nodeid, outcome, duration, file, line, message, trace)
     skipped = [r for r in reports if r.skipped]
+    if skipped and hasattr(skipped[0], "wasxfail"):
+        return TestResult(nodeid, "xfailed", duration, message=skipped[0].wasxfail or "xfail")
     if skipped:
         lr = skipped[0].longrepr
         message = lr[2] if isinstance(lr, tuple) else str(lr)
         return TestResult(nodeid, "skipped", duration, message=message)
+    if any(hasattr(r, "wasxfail") for r in reports):
+        return TestResult(nodeid, "xpassed", duration)
     return TestResult(nodeid, "passed", duration)
 
 

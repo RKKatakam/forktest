@@ -223,7 +223,7 @@ class Runner:
         for error in self.collect_errors:
             emit(error)
         if self.collect_errors and not self.config.getoption("continue_on_collection_errors"):
-            emit(Done(0, 0, len(self.collect_errors), 0, _ms(t0)))
+            emit(Done(errors=len(self.collect_errors), duration_ms=_ms(t0)))
             return
         view = self.store.view()
         graph = self.graph()
@@ -253,7 +253,17 @@ class Runner:
 
         cancel = (wake_fd, should_cancel)
         self.execute(selected, view, graph, req, on_result, cancel, nice=False, current=current)
-        emit(Done(tally["passed"], tally["failed"], tally["error"], tally["skipped"], _ms(t0)))
+        emit(
+            Done(
+                passed=tally["passed"],
+                failed=tally["failed"],
+                errors=tally["error"],
+                skipped=tally["skipped"],
+                xfailed=tally["xfailed"],
+                xpassed=tally["xpassed"],
+                duration_ms=_ms(t0),
+            )
+        )
         if not req.verify:
             return
         t1 = time.perf_counter()

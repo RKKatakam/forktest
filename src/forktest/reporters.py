@@ -103,16 +103,18 @@ class HumanReporter:
             for file, counts in self.per_file.items():
                 if counts.get("failed") or counts.get("error"):
                     continue
-                parts = [f"{counts[k]} {k}" for k in ("passed", "skipped") if counts.get(k)]
+                parts = [f"{counts[k]} {k}" for k in ("passed", "skipped", "xfailed", "xpassed") if counts.get(k)]
                 self._emit(f"  {self._mark(True)} {file.ljust(width)}   {', '.join(parts)}")
         parts = [
             f"{d.failed} failed" if d.failed else "",
             f"{d.errors} error{'s' if d.errors != 1 else ''}" if d.errors else "",
             f"{d.passed} passed",
             f"{d.skipped} skipped" if d.skipped else "",
+            f"{d.xfailed} xfailed" if d.xfailed else "",
+            f"{d.xpassed} xpassed" if d.xpassed else "",
         ]
         summary = ", ".join(p for p in parts if p)
-        if d.passed + d.failed + d.errors + d.skipped == 0:
+        if d.passed + d.failed + d.errors + d.skipped + d.xfailed + d.xpassed == 0:
             summary = "nothing to run"
         tail = " · safety net: running unselected tests" if self.expect_verify else ""
         self._emit(f"{summary} in {d.duration_ms / 1000:.2f}s{tail}")
@@ -144,23 +146,24 @@ class JunitReporter:
             self.done = event
 
     def close(self) -> None:
-        d = self.done or Done(0, 0, 0, 0, 0)
+        d = self.done or Done()
         errors = d.errors + len(self.collect_errors)
         lines = [
             '<?xml version="1.0" encoding="utf-8"?>',
             f'<testsuites><testsuite name="forktest" tests="{len(self.results)}" failures="{d.failed}" '
-            f'errors="{errors}" skipped="{d.skipped}" time="{d.duration_ms / 1000:.3f}">',
+            f'errors="{errors}" skipped="{d.skipped + d.xfailed}" time="{d.duration_ms / 1000:.3f}">',
         ]
         for r in self.results:
             classname, _, name = r.nodeid.rpartition("::")
             classname = classname.replace("/", ".").removesuffix(".py").replace("::", ".")
             head = f"<testcase classname={quoteattr(classname)} name={quoteattr(name)} time=\"{r.duration:.3f}\""
-            if r.outcome == "passed":
+            if r.outcome in ("passed", "xpassed"):
                 lines.append(head + " />")
                 continue
-            tag = {"failed": "failure", "error": "error", "skipped": "skipped"}[r.outcome]
+            tag = {"failed": "failure", "error": "error", "skipped": "skipped", "xfailed": "skipped"}[r.outcome]
+            kind = ' type="pytest.xfail"' if r.outcome == "xfailed" else ""
             msg = (r.message or "").splitlines()[0] if r.message else ""
-            lines.append(f"{head}><{tag} message={quoteattr(msg)}>{escape(r.message or '')}</{tag}></testcase>")
+            lines.append(f"{head}><{tag}{kind} message={quoteattr(msg)}>{escape(r.message or '')}</{tag}></testcase>")
         for ce in self.collect_errors:
             lines.append(
                 f"<testcase classname=\"collection\" name={quoteattr(ce.nodeid)} time=\"0\">"

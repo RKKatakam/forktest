@@ -225,3 +225,31 @@ def test_why_explains_without_running(demo):
         "  file_read: data/rates.json changed",
     ]
     assert not os.path.exists(demo.root / ".pytest_cache") or True
+
+
+def test_xfail_and_xpass_are_reported_like_pytest_and_a_strict_xpass_fails(demo):
+    (demo.root / "tests" / "test_marks.py").write_text(
+        "import pytest\n\n"
+        "@pytest.mark.xfail(reason='known bug')\n"
+        "def test_known_bug():\n    assert False\n\n"
+        "@pytest.mark.xfail(reason='fixed upstream?')\n"
+        "def test_maybe_fixed():\n    assert True\n\n"
+        "@pytest.mark.xfail(reason='must fail', strict=True)\n"
+        "def test_strict():\n    assert True\n"
+    )
+    assert demo.pytest_counts() == {"failed": 1, "passed": 16, "xfailed": 1, "xpassed": 1}
+    events, rc = demo.forktest("--junitxml", "out.xml")
+    assert rc == 1
+    assert (done(events).failed, done(events).passed, done(events).xfailed, done(events).xpassed) == (1, 0, 1, 1)
+    outcomes = {e.nodeid.split("::")[1]: e.outcome for e in events if isinstance(e, TestResult)}
+    assert outcomes == {"test_known_bug": "xfailed", "test_maybe_fixed": "xpassed", "test_strict": "failed"}
+
+    cases = {c.attrib["name"]: c for c in ET.parse(demo.root / "out.xml").getroot().iter("testcase")}
+    assert cases["test_known_bug"].find("skipped").attrib == {"type": "pytest.xfail", "message": "known bug"}
+    assert list(cases["test_maybe_fixed"]) == [] and cases["test_strict"].find("failure") is not None
+
+    demo.edit("tests/test_marks.py", "assert False", "assert 0 == 1")
+    human = subprocess.run(
+        [sys.executable, "-m", "forktest", "--no-daemon"], cwd=demo.root, capture_output=True, text=True
+    ).stdout
+    assert human.splitlines()[-1].startswith("1 failed, 0 passed, 1 xfailed in ")

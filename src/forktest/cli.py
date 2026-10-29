@@ -170,9 +170,17 @@ def _main(argv: list[str] | None) -> int:
     status = ExitStatus()
     reporters.append(status)
 
+    gone: list[Reporter] = []
+
     def emit(event: Event) -> None:
         for r in reporters:
-            r.handle(event)
+            if r in gone:
+                continue
+            try:
+                r.handle(event)
+            except BrokenPipeError:
+                # The reader left (`| head`); the run still finishes so its results get recorded.
+                gone.append(r)
 
     rc = 0
     if opts.no_daemon or not daemon.run_via_daemon(root, request, emit):
@@ -181,5 +189,9 @@ def _main(argv: list[str] | None) -> int:
 
         rc = run_oneshot(request, pytest_args, emit)
     for r in reporters:
-        r.close()
+        if r not in gone:
+            r.close()
+    if gone:
+        # pytest restores the original stdout fd at session end, so silence it only now, before exit flushes.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
     return status.code(rc)

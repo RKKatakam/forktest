@@ -253,3 +253,20 @@ def test_xfail_and_xpass_are_reported_like_pytest_and_a_strict_xpass_fails(demo)
         [sys.executable, "-m", "forktest", "--no-daemon"], cwd=demo.root, capture_output=True, text=True
     ).stdout
     assert human.splitlines()[-1].startswith("1 failed, 0 passed, 1 xfailed in ")
+
+
+def test_a_reader_that_closes_early_gets_no_internal_error_and_the_run_still_records(demo):
+    demo.edit("billing/tax.py", "ROUND_HALF_UP", "ROUND_HALF_EVEN")
+    with subprocess.Popen(
+        [sys.executable, "-m", "forktest", "--no-daemon", "--json"],
+        cwd=demo.root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as proc:
+        proc.stdout.readline()
+        proc.stdout.close()
+        stderr = proc.stderr.read().decode()
+        proc.wait(timeout=120)
+    assert "INTERNALERROR" not in stderr and "BrokenPipeError" not in stderr, stderr
+    events, _ = demo.forktest()
+    assert set(selection(events).reasons) <= {"last_failed"}

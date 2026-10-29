@@ -164,22 +164,38 @@ def failure_details(report: TestReport, project: ProjectFiles) -> tuple[str, str
     return message, None, None, trace
 
 
-def run_items(items: Sequence[Any], send: Callable[[dict[str, Any]], None], recorder: Recorder, project: ProjectFiles) -> None:
-    from _pytest.runner import runtestprotocol
+class _ReportCollector:
+    def __init__(self) -> None:
+        self.reports: list[TestReport] = []
 
-    for i, item in enumerate(items):
-        nextitem = items[i + 1] if i + 1 < len(items) else None
-        recorder.begin()
-        reports = runtestprotocol(item, nextitem=nextitem, log=False)
-        hits, reads = recorder.end()
-        send(
-            {
-                "type": "result",
-                "result": asdict(result_of(item.nodeid, reports, project)),
-                "hits": sorted(hits),
-                "reads": sorted(reads),
-            }
-        )
+    def pytest_runtest_logreport(self, report: TestReport) -> None:
+        self.reports.append(report)
+
+
+def run_items(items: Sequence[Any], send: Callable[[dict[str, Any]], None], recorder: Recorder, project: ProjectFiles) -> None:
+    if not items:
+        return
+    collector = _ReportCollector()
+    pluginmanager = items[0].config.pluginmanager
+    pluginmanager.register(collector)
+    try:
+        for i, item in enumerate(items):
+            nextitem = items[i + 1] if i + 1 < len(items) else None
+            collector.reports = []
+            recorder.begin()
+            # The full hook, not runtestprotocol: plugins such as warnings (filterwarnings marks) wrap it.
+            item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+            hits, reads = recorder.end()
+            send(
+                {
+                    "type": "result",
+                    "result": asdict(result_of(item.nodeid, collector.reports, project)),
+                    "hits": sorted(hits),
+                    "reads": sorted(reads),
+                }
+            )
+    finally:
+        pluginmanager.unregister(collector)
 
 
 def worker_main(

@@ -291,3 +291,29 @@ def test_a_module_without_python_source_is_tracked_by_its_content(demo):
     compile_config(original.replace('CURRENCY = "EUR"', 'CURRENCY = "EURO"'))
     events, rc = demo.forktest()
     assert selection(events).reasons.get("import_graph", 0) > 0 and done(events).failed > 0
+
+
+def test_plugins_that_wrap_the_run_protocol_still_apply(demo):
+    """pytest applies filterwarnings marks inside a pytest_runtest_protocol wrapper; pandas relies on it."""
+    pyproject = demo.root / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text() + 'filterwarnings = ["error"]\n')
+    (demo.root / "tests" / "conftest.py").write_text(
+        "import os\n"
+        "import pytest\n\n\n"
+        "@pytest.hookimpl(wrapper=True)\n"
+        "def pytest_runtest_protocol(item, nextitem):\n"
+        "    os.environ['WRAPPED'] = item.name\n"
+        "    return (yield)\n"
+    )
+    (demo.root / "tests" / "test_protocol.py").write_text(
+        "import os\nimport warnings\n\nimport pytest\n\n\n"
+        "@pytest.mark.filterwarnings('ignore:noisy')\n"
+        "def test_a_mark_silences_its_own_warning():\n"
+        "    warnings.warn('noisy', DeprecationWarning)\n\n\n"
+        "def test_the_wrapper_ran_around_this_test():\n"
+        "    assert os.environ['WRAPPED'] == 'test_the_wrapper_ran_around_this_test'\n"
+    )
+    assert demo.pytest_counts() == {"passed": 18}
+    events, rc = demo.forktest("--all")
+    assert rc == 0 and failed(events) == set() and done(events).passed == 18
+

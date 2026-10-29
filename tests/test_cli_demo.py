@@ -317,3 +317,27 @@ def test_plugins_that_wrap_the_run_protocol_still_apply(demo):
     events, rc = demo.forktest("--all")
     assert rc == 0 and failed(events) == set() and done(events).passed == 18
 
+
+def test_forktest_adds_no_modules_a_test_could_lean_on(demo, tmp_path):
+    """pandas' test_to_records_with_Mapping_type uses email.message without importing it and only passed under forktest."""
+    (demo.root / "tests" / "test_isolation.py").write_text(
+        "import os\nimport sys\n\n\n"
+        "def test_record_loaded_modules():\n"
+        "    watched = ('email.message', 'ssl', 'http.client', 'urllib.request', 'xml.sax')\n"
+        "    with open(os.environ['LOADED_OUT'], 'w') as f:\n"
+        "        f.write(' '.join(m for m in watched if m in sys.modules))\n"
+    )
+    loaded = {}
+    for runner in ("pytest", "forktest"):
+        out = tmp_path / runner
+        os.environ["LOADED_OUT"] = str(out)
+        try:
+            if runner == "pytest":
+                assert demo.pytest_counts("tests/test_isolation.py") == {"passed": 1}
+            else:
+                events, rc = demo.forktest("tests/test_isolation.py")
+                assert rc == 0 and failed(events) == set()
+        finally:
+            del os.environ["LOADED_OUT"]
+        loaded[runner] = out.read_text()
+    assert loaded["forktest"] == loaded["pytest"]

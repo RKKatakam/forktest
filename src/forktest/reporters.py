@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 from collections import defaultdict
 from typing import IO, Protocol
-from xml.sax.saxutils import escape, quoteattr
 
 from forktest.events import (
     CollectError,
@@ -128,6 +127,19 @@ def _indent(text: str, n: int, limit: int | None = None) -> str:
     if limit and len(lines) > limit:
         lines = lines[: limit - 1] + [f"... {len(lines) - limit + 1} more lines"]
     return "\n".join(" " * n + line for line in lines)
+
+
+# Not xml.sax.saxutils: it imports urllib.request, http.client, email and ssl into the process tests run in.
+_TEXT_ESCAPES = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;"})
+_ATTR_ESCAPES = str.maketrans({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "\n": "&#10;", "\r": "&#13;", "\t": "&#9;"})
+
+
+def escape(text: str) -> str:
+    return text.translate(_TEXT_ESCAPES)
+
+
+def quoteattr(value: str) -> str:
+    return '"' + value.translate(_ATTR_ESCAPES) + '"'
 
 
 class JunitReporter:

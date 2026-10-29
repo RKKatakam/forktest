@@ -169,6 +169,7 @@ class Runner:
         return known
 
     def graph(self) -> ImportGraph:
+        # Stands in for known_modules(), which costs a realpath per module and is only needed to resolve.
         files = sorted((name, getattr(mod, "__file__", None) or "") for name, mod in list(sys.modules.items()))
         modules = content_hash(repr(files).encode())
         return ImportGraph.reusing(self.store.meta_get("import_graph"), self.root, self.fps, self.known_modules, modules)

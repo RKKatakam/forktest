@@ -77,6 +77,9 @@ def is_excluded(relpath: str) -> bool:
     return relpath.startswith("..") or any(part in EXCLUDED_DIRS for part in relpath.split("/"))
 
 
+GRAPH_FORMAT = 1
+
+
 class ImportGraph:
     """Static import edges between project files.
 
@@ -130,7 +133,7 @@ class ImportGraph:
     ) -> ImportGraph:
         graph = cls(root, fingerprints, known_modules, modules_digest)
         saved = json.loads(state) if state else None
-        if not saved or saved["modules"] != modules_digest:
+        if not saved or saved.get("format") != GRAPH_FORMAT or saved["modules"] != modules_digest:
             return graph
         for d, digest in saved["dirs"].items():
             graph._listing(d)
@@ -151,7 +154,7 @@ class ImportGraph:
             for path, targets in self._direct.items()
             if (info := self.fps.info(path)) is not None
         }
-        return json.dumps({"modules": self.modules_digest, "dirs": self._dir_digests, "nodes": nodes})
+        return json.dumps({"format": GRAPH_FORMAT, "modules": self.modules_digest, "dirs": self._dir_digests, "nodes": nodes})
 
     @property
     def known(self) -> Mapping[str, str]:

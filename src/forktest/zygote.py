@@ -75,22 +75,24 @@ class ZygotePlugin:
 def schedule(
     items: Sequence[pytest.Item], duration_of: Callable[[str], float], failed: set[str], workers: int
 ) -> list[list[pytest.Item]]:
-    """Split items into per-worker lists: module batches, failed-first, longest-processing-time."""
-    by_module: dict[str, list[pytest.Item]] = {}
-    for item in items:
-        by_module.setdefault(item.nodeid.split("::")[0], []).append(item)
-    batches = list(by_module.values())
+    """Split items into per-worker lists: module batches, failed-first, longest-processing-time.
+
+    A batch that costs more than an even share of the run is split, by class
+    first and then into consecutive runs, so module- and class-scoped
+    fixtures are rebuilt as few times as the share allows.
+    """
 
     def cost(batch: list[pytest.Item]) -> float:
         return sum(duration_of(i.nodeid) for i in batch)
 
-    while 0 < len(batches) < workers:
-        big = max(batches, key=lambda b: (len(b) > 1, cost(b)))
-        if len(big) == 1:
-            break
-        i = batches.index(big)
-        half = len(big) // 2
-        batches[i : i + 1] = [big[:half], big[half:]]
+    share = cost(list(items)) / max(workers, 1)
+    batches: list[list[pytest.Item]] = []
+    for module in _group(items, lambda nodeid: nodeid.split("::")[0]):
+        if cost(module) <= share:
+            batches.append(module)
+            continue
+        for group in _group(module, lambda nodeid: nodeid.rsplit("::", 1)[0]):
+            batches.extend(_chunks(group, duration_of, share))
     batches.sort(key=lambda b: (not any(i.nodeid in failed for i in b), -cost(b)))
     n = min(workers, len(batches))
     assigned: list[list[pytest.Item]] = [[] for _ in range(n)]
@@ -100,6 +102,26 @@ def schedule(
         assigned[k].extend(batch)
         heapq.heappush(loads, (load + cost(batch), k))
     return [a for a in assigned if a]
+
+
+def _group(items: Iterable[pytest.Item], key: Callable[[str], str]) -> list[list[pytest.Item]]:
+    groups: dict[str, list[pytest.Item]] = {}
+    for item in items:
+        groups.setdefault(key(item.nodeid), []).append(item)
+    return list(groups.values())
+
+
+def _chunks(items: list[pytest.Item], duration_of: Callable[[str], float], share: float) -> list[list[pytest.Item]]:
+    out: list[list[pytest.Item]] = [[]]
+    load = 0.0
+    for item in items:
+        d = duration_of(item.nodeid)
+        if out[-1] and load + d > share:
+            out.append([])
+            load = 0.0
+        out[-1].append(item)
+        load += d
+    return out
 
 
 @dataclass

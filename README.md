@@ -95,8 +95,11 @@ carries one reason: `config_change`, `new`, `last_failed`, `coverage`,
 grouped by module, failed-first, assigned to workers by longest processing
 time. A module whose recorded duration is more than an even share of the
 run is split by class first, then into consecutive runs, so module- and
-class-scoped fixtures are rebuilt as rarely as possible. Each worker is an `os.fork()` of the zygote that runs its items
-through pytest's `runtestprotocol` and streams results back over a pipe.
+class-scoped fixtures are rebuilt as rarely as possible. Each worker is an
+`os.fork()` of the zygote. It runs its items through the
+`pytest_runtest_protocol` hook, as pytest's own loop does, so plugins that
+wrap it (the warnings plugin's `filterwarnings` marks, faulthandler,
+pytest-timeout) still apply, and it streams results back over a pipe.
 
 **Daemon.** `forktest daemon start` keeps an L0 process with the
 third-party modules imported and an L1 forked from it that has collected
@@ -137,6 +140,36 @@ Selection itself takes 44 ms (43 to 49 ms) without the daemon and 39 ms
 (30 to 40 ms) in a freshly rebuilt zygote. `--all` is bound by its slowest
 worker: the longest single attrs test takes 0.34 s.
 
+### pandas
+
+[pandas](https://github.com/pandas-dev/pandas) at c32acd3, built from
+source as an editable install (meson and Cython), Python 3.14.6, pytest
+9.2.0, without pyarrow. The slice is `pandas/tests/frame`: 16,876 tests, of
+which 41 fail in this environment (timezone tests that use dateutil). The
+edit adds a line to `describe_ndframe` in `pandas/core/methods/describe.py`.
+forktest selects the 55 tests that run it plus the 41 tests that failed
+last time. Every run reported the same pass and fail counts as pytest, and
+`forktest --all` failed on exactly the same 41 tests as `pytest -n auto`.
+
+| scenario | runs | median | range |
+|---|---|---|---|
+| `pytest`, whole slice | 5, interleaved | 22.65 s | 22.41 to 22.82 s |
+| `pytest -n auto`, whole slice | 5, interleaved | 9.58 s | 9.38 to 10.99 s |
+| `forktest` after the edit, no daemon, 96 of 16,876 tests | 5, interleaved | 5.95 s | 5.85 to 6.08 s |
+| `forktest --all`, no daemon | 5, interleaved | 18.76 s | 18.36 to 19.26 s |
+
+After an edit, forktest is 3.8x faster than plain pytest and 1.6x faster
+than xdist here, but selection is the limiter: it takes 2.96 to 3.02 s of
+the 5.95 s run (see Limitations). Rerun it with
+`bench/bench_interleaved.py`.
+
+Running pandas found four compatibility bugs, all fixed with a test each:
+compiled extensions inside the project crashed recording, `filterwarnings`
+marks were skipped (564 false failures), the JUnit reporter imported
+`email.message` into the test process (a pandas test that forgets that
+import passed under forktest only), and a module skipped at import was not
+counted.
+
 ### The demo
 
 `uv run python bench/bench.py` prints this table for your machine. Each
@@ -169,10 +202,15 @@ pytest` (0.095 s) plus collection.
   so a session fixture runs once per worker rather than once per run, and a
   test that mutates a session fixture does not affect tests in other
   workers. `--strict-pytest` gives exact single-process semantics.
-- **Plugins that wrap `pytest_runtest_protocol`** (pytest-rerunfailures,
-  pytest-timeout's protocol hook, flaky) are bypassed, because workers call
-  `runtestprotocol` directly. Hooks on setup, call, teardown and makereport
-  still run. pytest-xdist is replaced, not supported.
+- **Selection is slow on very large suites.** On pandas' 16,876-test
+  `frame` slice, choosing the affected tests takes about 3 s, because every
+  test's recorded dependency list is loaded and checked in Python. On attrs
+  it takes about 40 ms. An index from dependency to tests, or the Rust core,
+  is the fix.
+- **`--all` records coverage on every run**, which costs more than it saves
+  on pandas (18.8 s against 9.6 s for `pytest -n auto`). On attrs, `--all` is
+  still about 2x faster than xdist.
+- pytest-xdist is replaced, not supported.
 - **Captured output is not shown.** Failure events carry the assertion
   message and the project frames, not the captured stdout of the test.
 - **Hashes are read after the test ran.** An edit saved while a run is in
@@ -197,4 +235,5 @@ pytest` (0.095 s) plus collection.
 uv sync
 uv run pytest tests          # unit tests plus CLI, daemon and watch end-to-end tests on examples/demo
 uv run python bench/bench.py
+python bench/bench_interleaved.py ROOT TESTPATH EDIT_FILE ANCHOR_LINE ROUNDS LOG   # any real project
 ```

@@ -270,3 +270,24 @@ def test_a_reader_that_closes_early_gets_no_internal_error_and_the_run_still_rec
     assert "INTERNALERROR" not in stderr and "BrokenPipeError" not in stderr, stderr
     events, _ = demo.forktest()
     assert set(selection(events).reasons) <= {"last_failed"}
+
+
+def test_a_module_without_python_source_is_tracked_by_its_content(demo):
+    """pandas' editable build imports compiled extensions from inside the project; they have no source to fingerprint."""
+    import py_compile
+
+    def compile_config(source: str) -> None:
+        (demo.root / "config.py").write_text(source)
+        py_compile.compile(str(demo.root / "config.py"), cfile=str(demo.root / "config.pyc"))
+        (demo.root / "config.py").unlink()
+
+    original = (demo.root / "config.py").read_text()
+    compile_config(original)
+    events, rc = demo.forktest()
+    assert rc == 0 and done(events).failed == 0
+    events, rc = demo.forktest()
+    assert rc == 0 and selection(events).selected == 0
+
+    compile_config(original.replace('CURRENCY = "EUR"', 'CURRENCY = "EURO"'))
+    events, rc = demo.forktest()
+    assert selection(events).reasons.get("import_graph", 0) > 0 and done(events).failed > 0

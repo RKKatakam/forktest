@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import fnmatch
+import importlib.machinery
 import os
 import posixpath
 from collections.abc import Callable, Iterable, Mapping
@@ -56,6 +57,9 @@ EXCLUDED_DIRS = frozenset(
         "site-packages",
     }
 )
+
+
+IMPORTABLE_BINARY_SUFFIXES = (*importlib.machinery.EXTENSION_SUFFIXES, *importlib.machinery.BYTECODE_SUFFIXES)
 
 
 def is_config_file(path: str) -> bool:
@@ -194,7 +198,9 @@ def changed_deps(current: FingerprintFn) -> Callable[[Dep], bool]:
 def classify(dep: Dep, fixtures: frozenset[tuple[str, str]]) -> Reason:
     name = posixpath.basename(dep.path)
     if dep.qualname == FILE:
-        return Reason.CONFIG_CHANGE if is_config_file(name) else Reason.FILE_READ
+        if is_config_file(name):
+            return Reason.CONFIG_CHANGE
+        return Reason.IMPORT_GRAPH if name.endswith(IMPORTABLE_BINARY_SUFFIXES) else Reason.FILE_READ
     if dep.qualname == MODULE:
         return Reason.CONFIG_CHANGE if name == "conftest.py" else Reason.IMPORT_GRAPH
     return Reason.FIXTURE if (dep.path, dep.qualname) in fixtures else Reason.COVERAGE
@@ -219,7 +225,7 @@ def reasons_for(
     test_file = nodeid.split("::")[0]
     if test_file not in closure_cache:
         closure_cache[test_file] = graph.closure(test_file)
-    recorded_modules = {d.path for d in deps if d.qualname == MODULE}
+    recorded_modules = {d.path for d in deps if d.qualname in (MODULE, FILE)}
     out.extend(
         (Reason.IMPORT_GRAPH, Dep(p, MODULE, "")) for p in sorted(closure_cache[test_file]) if p not in recorded_modules
     )

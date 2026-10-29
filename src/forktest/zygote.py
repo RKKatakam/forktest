@@ -458,7 +458,8 @@ class Runner:
         for path in closures[test_file]:
             fp = current(path)
             if fp is not None:
-                deps.add(Dep(path, MODULE, fp[MODULE]))
+                key = MODULE if MODULE in fp else FILE
+                deps.add(Dep(path, key, fp[key]))
         return sorted(deps)
 
 

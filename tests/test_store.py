@@ -1,7 +1,7 @@
 import random
 import sqlite3
 
-from forktest.fingerprint import FileInfo, ImportStmt
+from forktest.fingerprint import FileInfo, ImportStmt, Stat
 from forktest.store import Dep, Record, Store
 
 
@@ -104,7 +104,8 @@ def test_rebased_view_replaces_hashes_and_marks_missing_as_changed(tmp_path):
 def test_file_infos_survive_a_reopen_and_replace_by_path(tmp_path):
     path = str(tmp_path / "store.db")
     store = Store(path)
-    old = FileInfo("s1", {"<module>": "m1", "f": "h1"}, [ImportStmt("a.b", 0, ()), ImportStmt("", 1, ("x", "y"))])
+    stat = Stat(1_700_000_000_000_000_001, 1_700_000_000_000_000_002, 42)
+    old = FileInfo("s1", {"<module>": "m1", "f": "h1"}, [ImportStmt("a.b", 0, ()), ImportStmt("", 1, ("x", "y"))], stat)
     new = FileInfo("s2", {"<module>": "m2"}, [])
     store.save_file_infos({"m.py": old, "data.json": FileInfo("s3", {"<file>": "s3"}, [])})
     store.save_file_infos({"m.py": new})

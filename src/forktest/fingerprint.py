@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
+import time
 from collections.abc import Iterator, Mapping
 from typing import NamedTuple
 
@@ -109,10 +110,23 @@ def fingerprint(source: bytes | str) -> dict[str, str]:
     return analyze(source)[0]
 
 
+class Stat(NamedTuple):
+    """What a file's content is trusted by. ``os.utime`` can restore mtime, but any write moves ctime."""
+
+    mtime_ns: int
+    ctime_ns: int
+    size: int
+
+
+UNTRUSTED = Stat(0, 0, -1)
+RACY_NS = 2_000_000_000
+
+
 class FileInfo(NamedTuple):
     sha: str
     fingerprint: dict[str, str]
     imports: list[ImportStmt]
+    stat: Stat = UNTRUSTED
 
 
 class Fingerprints:
@@ -124,36 +138,42 @@ class Fingerprints:
     content, so every dependent function counts as changed.
 
     ``known`` holds infos from an earlier process, keyed by path. One is
-    reused only while the file's content sha still matches, and every info
-    computed here is collected in ``fresh`` so the caller can persist it.
+    reused without reading the file while its stat matches, and after a
+    read while its content sha matches. Every info that changed here is
+    collected in ``fresh`` so the caller can persist it.
+
+    A file read within ``RACY_NS`` of its last change keeps the ``UNTRUSTED``
+    stat, as git does for racily clean entries: on a file system with coarse
+    timestamps, a second write in the same tick would leave the stat as it was.
     """
 
     def __init__(self, root: str, known: Mapping[str, FileInfo] | None = None) -> None:
         self.root = root
         self.known = dict(known or {})
         self.fresh: dict[str, FileInfo] = {}
-        self._by_path: dict[str, tuple[int, int, FileInfo]] = {}
 
     def info(self, path: str) -> FileInfo | None:
         full = os.path.join(self.root, path)
         try:
             st = os.stat(full)
         except OSError:
-            self._by_path.pop(path, None)
             return None
-        cached = self._by_path.get(path)
-        if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-            return cached[2]
+        stat = Stat(st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+        known = self.known.get(path)
+        if known is not None and known.stat == stat:
+            return known
         try:
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
             return None
         sha = content_hash(data)
-        info = self.known.get(path)
-        if info is None or info.sha != sha:
-            info = self.known[path] = self.fresh[path] = _compute(path, data, sha)
-        self._by_path[path] = (st.st_mtime_ns, st.st_size, info)
+        info = known if known is not None and known.sha == sha else _compute(path, data, sha)
+        if time.time_ns() - max(stat.mtime_ns, stat.ctime_ns) < RACY_NS:
+            stat = UNTRUSTED
+        info = info._replace(stat=stat)
+        if info != known:
+            self.known[path] = self.fresh[path] = info
         return info
 
     def sha(self, path: str) -> str | None:

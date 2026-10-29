@@ -14,7 +14,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from forktest.fingerprint import FILE, MODULE, FileInfo, ImportStmt, content_hash, fingerprint
+from forktest.fingerprint import FILE, MODULE, FileInfo, ImportStmt, Stat, content_hash, fingerprint
 
 
 class Dep(NamedTuple):
@@ -84,7 +84,7 @@ class StoreView:
         return dataclasses.replace(self, keys=keys)
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tests(
     id INTEGER PRIMARY KEY, nodeid TEXT NOT NULL UNIQUE, outcome TEXT NOT NULL, duration REAL NOT NULL,
@@ -97,7 +97,8 @@ CREATE TABLE IF NOT EXISTS key_tests(key_id INTEGER PRIMARY KEY, tests BLOB NOT 
 CREATE TABLE IF NOT EXISTS module_sets(id INTEGER PRIMARY KEY, paths TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
-    path TEXT PRIMARY KEY, sha TEXT NOT NULL, fingerprint TEXT NOT NULL, imports TEXT NOT NULL);
+    path TEXT PRIMARY KEY, sha TEXT NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL,
+    size INTEGER NOT NULL, fingerprint TEXT NOT NULL, imports TEXT NOT NULL);
 """
 TABLES = ("tests", "deps", "test_deps", "dep_keys", "key_tests", "module_sets", "files")
 
@@ -245,8 +246,15 @@ class Store:
 
     def file_infos(self) -> dict[str, FileInfo]:
         return {
-            path: FileInfo(sha, json.loads(fp), [ImportStmt(m, level, tuple(names)) for m, level, names in json.loads(imps)])
-            for path, sha, fp, imps in self.conn.execute("SELECT path, sha, fingerprint, imports FROM files")
+            path: FileInfo(
+                sha,
+                json.loads(fp),
+                [ImportStmt(m, level, tuple(names)) for m, level, names in json.loads(imps)],
+                Stat(mtime_ns, ctime_ns, size),
+            )
+            for path, sha, mtime_ns, ctime_ns, size, fp, imps in self.conn.execute(
+                "SELECT path, sha, mtime_ns, ctime_ns, size, fingerprint, imports FROM files"
+            )
         }
 
     def save_file_infos(self, infos: Mapping[str, FileInfo]) -> None:
@@ -254,8 +262,8 @@ class Store:
             return
         with self.conn:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)",
-                [(path, i.sha, json.dumps(i.fingerprint), json.dumps(i.imports)) for path, i in infos.items()],
+                "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(path, i.sha, *i.stat, json.dumps(i.fingerprint), json.dumps(i.imports)) for path, i in infos.items()],
             )
 
     def meta_get(self, key: str) -> str | None:

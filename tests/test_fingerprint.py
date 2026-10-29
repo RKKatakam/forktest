@@ -1,7 +1,10 @@
+import os
 import textwrap
+import time
 
 import pytest
 
+import forktest.fingerprint as fingerprint_module
 from forktest.fingerprint import (
     FILE,
     MODULE,
@@ -154,3 +157,30 @@ def test_known_infos_are_reused_only_while_the_content_matches(tmp_path):
     stale = Fingerprints(str(tmp_path), {"m.py": planted})
     assert set(stale.of("m.py")) == {MODULE, "f"} and stale.imports_of("m.py") == []
     assert stale.fresh["m.py"].sha != info.sha
+
+
+def test_a_later_process_trusts_an_unchanged_stat_and_rereads_after_any_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(fingerprint_module, "RACY_NS", 0)
+    m = tmp_path / "m.py"
+    m.write_text("def f():\n    return 1\n")
+    info = Fingerprints(str(tmp_path)).info("m.py")
+    planted = info._replace(fingerprint={MODULE: "planted"})
+    assert Fingerprints(str(tmp_path), {"m.py": planted}).of("m.py") == {MODULE: "planted"}, "same stat, not read"
+
+    before = os.stat(m)
+    time.sleep(0.05)  # Linux stamps ctime at timer-tick granularity
+    m.write_text("def f():\n    return 2\n")
+    os.utime(m, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = os.stat(m)
+    assert (after.st_mtime_ns, after.st_size) == (before.st_mtime_ns, before.st_size)
+    assert Fingerprints(str(tmp_path), {"m.py": planted}).of("m.py")["f"] != info.fingerprint["f"]
+
+
+def test_a_file_read_in_the_tick_it_was_written_is_reread_even_if_its_stat_repeats(tmp_path, monkeypatch):
+    m = tmp_path / "m.py"
+    m.write_text("def f():\n    return 1\n")
+    real_stat, frozen = os.stat, os.stat(m)
+    monkeypatch.setattr(os, "stat", lambda p, *a, **k: frozen if p == str(m) else real_stat(p, *a, **k))
+    first = Fingerprints(str(tmp_path)).info("m.py")
+    m.write_text("def f():\n    return 2\n")
+    assert Fingerprints(str(tmp_path), {"m.py": first}).of("m.py")["f"] != first.fingerprint["f"]

@@ -106,16 +106,15 @@ def reexec_for_fork_safety(argv: list[str]) -> None:
 
 def why_command(root: str, nodeid: str) -> int:
     from forktest.fingerprint import Fingerprints
-    from forktest.selection import PRIORITY, ImportGraph, changed_deps, reasons_for
+    from forktest.selection import PRIORITY, ImportGraph, explain
     from forktest.store import Store
 
     store = Store(os.path.join(root, ".forktest", "store.db"))
     try:
-        view = store.view()
         fps = Fingerprints(root, store.file_infos())
+        reasons = explain(nodeid, store.view(), fps.of, ImportGraph(root, fps))
     finally:
         store.close()
-    reasons = reasons_for(nodeid, view, changed_deps(fps.of), ImportGraph(root, fps), frozenset())
     if not reasons:
         print(f"{nodeid}: not selected (no recorded dependency changed)")
         return 0

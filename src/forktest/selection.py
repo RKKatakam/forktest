@@ -8,6 +8,7 @@ import importlib.machinery
 import os
 import posixpath
 from collections.abc import Callable, Iterable, Mapping
+from typing import NamedTuple
 
 from forktest.fingerprint import FILE, MODULE, Fingerprints, ImportStmt, normalize_qualname
 from forktest.store import Dep, StoreView
@@ -201,19 +202,6 @@ def dep_changed(dep: Dep, current: FingerprintFn) -> bool:
     return fp.get(qualname) != dep.hash
 
 
-def changed_deps(current: FingerprintFn) -> Callable[[Dep], bool]:
-    """``dep_changed`` memoized per dep; tests share most of their deps."""
-    memo: dict[Dep, bool] = {}
-
-    def changed(dep: Dep) -> bool:
-        hit = memo.get(dep)
-        if hit is None:
-            hit = memo[dep] = dep_changed(dep, current)
-        return hit
-
-    return changed
-
-
 def classify(dep: Dep, fixtures: frozenset[tuple[str, str]]) -> Reason:
     name = posixpath.basename(dep.path)
     if dep.qualname == FILE:
@@ -225,28 +213,12 @@ def classify(dep: Dep, fixtures: frozenset[tuple[str, str]]) -> Reason:
     return Reason.FIXTURE if (dep.path, dep.qualname) in fixtures else Reason.COVERAGE
 
 
-def reasons_for(
-    nodeid: str,
-    view: StoreView,
-    is_changed: Callable[[Dep], bool],
-    graph: ImportGraph,
-    fixtures: frozenset[tuple[str, str]],
-) -> list[tuple[Reason, Dep | None]]:
-    row = view.tests.get(nodeid)
-    if row is None:
-        return [(Reason.NEW, None)]
-    out: list[tuple[Reason, Dep | None]] = []
-    if row.outcome in ("failed", "error"):
-        out.append((Reason.LAST_FAILED, None))
-    deps = view.deps.get(nodeid, [])
-    out.extend((classify(d, fixtures), d) for d in deps if is_changed(d))
-    recorded_modules = {d.path for d in deps if d.qualname in (MODULE, FILE)}
-    out.extend(
-        (Reason.IMPORT_GRAPH, Dep(p, MODULE, ""))
-        for p in sorted(graph.closure(nodeid.split("::")[0]))
-        if p not in recorded_modules
-    )
-    return out
+class Affected(NamedTuple):
+    reasons: dict[str, Reason]
+    changed: list[str]
+
+
+RANK = {reason: rank for rank, reason in enumerate(PRIORITY)}
 
 
 def select(
@@ -256,18 +228,64 @@ def select(
     graph: ImportGraph,
     *,
     fixtures: frozenset[tuple[str, str]] = frozenset(),
-) -> dict[str, Reason]:
-    """Map each affected nodeid to the highest-priority reason it is selected."""
-    is_changed = changed_deps(current)
-    out: dict[str, Reason] = {}
-    for nodeid in nodeids:
-        reasons = reasons_for(nodeid, view, is_changed, graph, fixtures)
-        if reasons:
-            out[nodeid] = min((r for r, _ in reasons), key=PRIORITY.index)
+) -> Affected:
+    """Each affected nodeid with its highest-priority reason, and the changed paths that affect them.
+
+    Every distinct key is checked once, and only the changed keys' rows of the
+    index are read. The import-graph rule depends only on a test's file and
+    its recorded module set, so it runs once per distinct pair.
+    """
+    wanted = list(nodeids)
+    changed_keys = {i: d for i, d in view.keys.items() if dep_changed(d, current)}
+    by_id = {row.id: nodeid for nodeid in wanted if (row := view.tests.get(nodeid)) is not None}
+    reasons: dict[str, Reason] = {}
+
+    def offer(nodeid: str, reason: Reason) -> None:
+        held = reasons.get(nodeid)
+        if held is None or RANK[reason] < RANK[held]:
+            reasons[nodeid] = reason
+
+    paths: set[str] = set()
+    for key_id, test_ids in view.tests_using(changed_keys).items():
+        dep = changed_keys[key_id]
+        reason = classify(dep, fixtures)
+        for test_id in test_ids:
+            nodeid = by_id.get(test_id)
+            if nodeid is not None:
+                offer(nodeid, reason)
+                paths.add(dep.path)
+    groups: dict[tuple[str, int], list[str]] = {}
+    for nodeid in wanted:
+        row = view.tests.get(nodeid)
+        if row is None:
+            offer(nodeid, Reason.NEW)
+            continue
+        if row.outcome in ("failed", "error"):
+            offer(nodeid, Reason.LAST_FAILED)
+        groups.setdefault((nodeid.split("::")[0], row.modules), []).append(nodeid)
+    for (test_file, modules), members in groups.items():
+        if not graph.closure(test_file) <= view.module_sets[modules]:
+            for nodeid in members:
+                offer(nodeid, Reason.IMPORT_GRAPH)
+    return Affected(reasons, sorted(paths))
+
+
+def explain(
+    nodeid: str,
+    view: StoreView,
+    current: FingerprintFn,
+    graph: ImportGraph,
+    fixtures: frozenset[tuple[str, str]] = frozenset(),
+) -> list[tuple[Reason, Dep | None]]:
+    """Every reason ``select`` would have for one test, read from that test's own key list."""
+    row = view.tests.get(nodeid)
+    if row is None:
+        return [(Reason.NEW, None)]
+    out: list[tuple[Reason, Dep | None]] = []
+    if row.outcome in ("failed", "error"):
+        out.append((Reason.LAST_FAILED, None))
+    deps = [view.keys[k] for k in view.key_ids_of(nodeid)]
+    out.extend((classify(d, fixtures), d) for d in deps if dep_changed(d, current))
+    unrecorded = graph.closure(nodeid.split("::")[0]) - view.module_sets[row.modules]
+    out.extend((Reason.IMPORT_GRAPH, Dep(p, MODULE, "")) for p in sorted(unrecorded))
     return out
-
-
-def changed_paths(nodeids: Iterable[str], view: StoreView, current: FingerprintFn) -> list[str]:
-    is_changed = changed_deps(current)
-    paths = {d.path for n in nodeids for d in view.deps.get(n, []) if is_changed(d)}
-    return sorted(paths)

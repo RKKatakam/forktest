@@ -1,8 +1,8 @@
 import pytest
 
 from forktest.fingerprint import FILE, MODULE, Fingerprints
-from forktest.selection import ImportGraph, Reason, changed_paths, config_files, is_config_file, select
-from forktest.store import Dep, StoreView, TestRow
+from forktest.selection import PRIORITY, ImportGraph, Reason, config_files, explain, is_config_file, select
+from forktest.store import Dep, Record, Store
 
 FILES = {
     "pyproject.toml": "[tool.pytest.ini_options]\n",
@@ -69,10 +69,11 @@ def test_config_file_detection(project):
 
 NODE = "tests/test_core.py::test_f"
 DEEP = "tests/sub/test_deep.py::test_deep"
+DEEP2 = "tests/sub/test_deep.py::test_deep2"
 
 
-def recorded_view(root, outcome="passed"):
-    """A baseline in which every dep hash matches the files as they are now."""
+def baseline(root, extra=()):
+    """Records in which every dep hash matches the files as they are now."""
     fps = Fingerprints(str(root))
     graph = graph_for(root)
 
@@ -81,18 +82,28 @@ def recorded_view(root, outcome="passed"):
 
     deps = [dep("pkg/core.py", "f"), dep("pkg/util.py", "g"), dep("conftest.py", "fx"), dep("data.json", FILE)]
     deps += [dep(p, MODULE) for p in graph.closure("tests/test_core.py")]
-    deps += [dep("pyproject.toml", FILE)]
+    deps += [dep("pyproject.toml", FILE), *extra]
     deep = [dep(p, MODULE) for p in graph.closure("tests/sub/test_deep.py")]
-    return StoreView(
-        {NODE: TestRow(outcome, 0.1, 0), DEEP: TestRow("passed", 0.1, 0)},
-        {NODE: deps, DEEP: deep},
-    )
+    return {NODE: deps, DEEP: deep, DEEP2: deep}
+
+
+def recorded_view(root, outcome="passed", only=None, extra=()):
+    store = Store(str(root / ".forktest" / "store.db"))
+    deps = baseline(root, extra)
+    store.record(Record(n, outcome if n == NODE else "passed", 0.1, ds) for n, ds in deps.items() if only is None or n in only)
+    return store.view()
 
 
 def run_select(root, view, fixtures=frozenset()):
     fps = Fingerprints(str(root))
     graph = ImportGraph(str(root), fps)
-    return select([NODE, DEEP, "tests/test_core.py::test_new"], view, fps.of, graph, fixtures=fixtures)
+    nodeids = [NODE, DEEP, DEEP2, "tests/test_core.py::test_new"]
+    affected = select(nodeids, view, fps.of, graph, fixtures=fixtures)
+    for nodeid in nodeids:
+        reasons = explain(nodeid, view, fps.of, ImportGraph(str(root), fps), fixtures)
+        top = min((r for r, _ in reasons), key=PRIORITY.index) if reasons else None
+        assert affected.reasons.get(nodeid) == top, f"--why disagrees with selection for {nodeid}"
+    return affected
 
 
 def edit(root, rel, old, new):
@@ -101,11 +112,11 @@ def edit(root, rel, old, new):
 
 
 def test_unchanged_selects_only_new_tests(project):
-    assert run_select(project, recorded_view(project)) == {"tests/test_core.py::test_new": Reason.NEW}
+    assert run_select(project, recorded_view(project)) == ({"tests/test_core.py::test_new": Reason.NEW}, [])
 
 
 def test_last_failed_reruns(project):
-    assert run_select(project, recorded_view(project, outcome="failed"))[NODE] == Reason.LAST_FAILED
+    assert run_select(project, recorded_view(project, outcome="failed")).reasons[NODE] == Reason.LAST_FAILED
 
 
 @pytest.mark.parametrize(
@@ -123,53 +134,69 @@ def test_last_failed_reruns(project):
 def test_each_kind_of_change_selects_with_its_reason(project, rel, old, new, reason):
     view = recorded_view(project)
     edit(project, rel, old, new)
-    result = run_select(project, view, fixtures=frozenset({("conftest.py", "fx")}))
-    assert result[NODE] == reason
-    assert changed_paths([NODE], view, Fingerprints(str(project)).of) == [rel]
+    affected = run_select(project, view, fixtures=frozenset({("conftest.py", "fx")}))
+    assert affected.reasons[NODE] == reason
+    assert affected.changed == [rel]
 
 
 def test_docstring_and_unrelated_body_edits_select_nothing(project):
     view = recorded_view(project)
     edit(project, "pkg/util.py", "def g():\n", 'def g():\n    """Doc."""\n')
     edit(project, "tests/sub/local_helper.py", "return 4", "return 40")
-    assert NODE not in run_select(project, view)
+    assert NODE not in run_select(project, view).reasons
 
 
 def test_removed_function_and_deleted_file_count_as_changed(project):
     view = recorded_view(project)
     (project / "data.json").unlink()
-    assert run_select(project, view)[NODE] == Reason.FILE_READ
+    assert run_select(project, view).reasons[NODE] == Reason.FILE_READ
     (project / "data.json").write_text("{}")
     view = recorded_view(project)
     edit(project, "pkg/util.py", "def g():", "def g2():")
-    assert run_select(project, view)[NODE] == Reason.COVERAGE
+    assert run_select(project, view).reasons[NODE] == Reason.COVERAGE
 
 
 def test_raw_lambda_qualname_is_normalized_before_comparison(project):
     fps = Fingerprints(str(project))
-    view = recorded_view(project)
-    view.deps[NODE].append(Dep("pkg/util.py", "g.<locals>.<lambda>", fps.of("pkg/util.py")["g"]))
-    assert NODE not in run_select(project, view)
+    view = recorded_view(project, extra=[Dep("pkg/util.py", "g.<locals>.<lambda>", fps.of("pkg/util.py")["g"])])
+    assert NODE not in run_select(project, view).reasons
 
 
 def test_newly_created_module_that_an_import_now_resolves_to_selects(project):
     view = recorded_view(project)
     (project / "tests/sub/newmod.py").write_text("Y = 1\n")
-    assert run_select(project, view)[DEEP] == Reason.IMPORT_GRAPH
+    assert run_select(project, view).reasons[DEEP] == Reason.IMPORT_GRAPH
+
+
+def test_a_new_import_reaches_every_test_of_the_file_that_did_not_rerun(project):
+    """A -k run re-records one test of the file; its sibling still has the old module set."""
+    recorded_view(project)
+    (project / "tests/sub/newmod.py").write_text("Y = 1\n")
+    view = recorded_view(project, only={DEEP})
+    affected = run_select(project, view)
+    assert DEEP not in affected.reasons
+    assert affected.reasons[DEEP2] == Reason.IMPORT_GRAPH
 
 
 def test_priority_puts_config_before_last_failed_before_coverage(project):
     view = recorded_view(project, outcome="failed")
     edit(project, "pkg/util.py", "return 2", "return 20")
-    assert run_select(project, view)[NODE] == Reason.LAST_FAILED
+    assert run_select(project, view).reasons[NODE] == Reason.LAST_FAILED
     edit(project, "pyproject.toml", "ini_options", "ini_options2")
-    assert run_select(project, view)[NODE] == Reason.CONFIG_CHANGE
+    assert run_select(project, view).reasons[NODE] == Reason.CONFIG_CHANGE
+
+
+def test_changed_paths_name_only_changes_that_reach_the_given_tests(project):
+    view = recorded_view(project)
+    edit(project, "pkg/util.py", "return 2", "return 20")
+    fps = Fingerprints(str(project))
+    assert select([DEEP], view, fps.of, ImportGraph(str(project), fps)) == ({}, [])
 
 
 def test_since_rebased_baseline(project):
     view = recorded_view(project)
     fps = Fingerprints(str(project))
-    old_core = Fingerprints(str(project))
     rebased = view.rebased(lambda path, q: "older" if (path, q) == ("pkg/util.py", "g") else (fps.of(path) or {}).get(q))
-    assert run_select(project, rebased)[NODE] == Reason.COVERAGE
-    assert old_core.of("pkg/util.py")["g"] == fps.of("pkg/util.py")["g"]
+    affected = run_select(project, rebased)
+    assert affected.reasons[NODE] == Reason.COVERAGE and affected.changed == ["pkg/util.py"]
+    assert NODE not in run_select(project, view).reasons

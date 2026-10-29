@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sqlite3
 import subprocess
 import time
-from collections.abc import Callable, Iterable, Mapping
+from array import array
+from collections import defaultdict
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from forktest.fingerprint import FILE, FileInfo, ImportStmt, content_hash, fingerprint
+from forktest.fingerprint import FILE, MODULE, FileInfo, ImportStmt, content_hash, fingerprint
 
 
 class Dep(NamedTuple):
@@ -30,15 +33,46 @@ class Record(NamedTuple):
 @dataclass(frozen=True)
 class TestRow:
     __test__ = False
+    id: int
     outcome: str
     duration: float
     last_run: float
+    modules: int
+
+
+def _ids(blob: bytes) -> array[int]:
+    out = array("I")
+    out.frombytes(blob)
+    return out
+
+
+def _json_ids(ids: Iterable[int]) -> str:
+    return json.dumps(list(ids))
 
 
 @dataclass
 class StoreView:
+    """What selection reads up front: every test's row, every distinct
+    dependency (``keys``), and the distinct sets of ``<module>`` and
+    ``<file>`` paths tests recorded (``module_sets``, which a row's
+    ``modules`` points into). The key to tests index and each test's own key
+    list are the bulk of the store, so they are read on demand.
+    """
+
     tests: dict[str, TestRow]
-    deps: dict[str, list[Dep]]
+    keys: dict[int, Dep]
+    module_sets: dict[int, frozenset[str]]
+    conn: sqlite3.Connection
+
+    def tests_using(self, key_ids: Iterable[int]) -> dict[int, array[int]]:
+        rows = self.conn.execute(
+            "SELECT key_id, tests FROM key_tests WHERE key_id IN (SELECT value FROM json_each(?))", (_json_ids(key_ids),)
+        )
+        return {k: _ids(blob) for k, blob in rows}
+
+    def key_ids_of(self, nodeid: str) -> array[int]:
+        row = self.conn.execute("SELECT deps FROM tests WHERE nodeid = ?", (nodeid,)).fetchone()
+        return _ids(row[0]) if row else array("I")
 
     def rebased(self, hash_of: Callable[[str, str], str | None]) -> StoreView:
         """The same dependency sets with hashes taken from another baseline.
@@ -46,33 +80,49 @@ class StoreView:
         ``hash_of(path, qualname)`` returning ``None`` means the function or
         file did not exist there, which counts as changed.
         """
-        deps = {
-            nodeid: [Dep(d.path, d.qualname, hash_of(d.path, d.qualname) or "") for d in ds]
-            for nodeid, ds in self.deps.items()
-        }
-        return StoreView(self.tests, deps)
+        keys = {i: Dep(d.path, d.qualname, hash_of(d.path, d.qualname) or "") for i, d in self.keys.items()}
+        return dataclasses.replace(self, keys=keys)
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tests(
-    nodeid TEXT PRIMARY KEY, outcome TEXT NOT NULL, duration REAL NOT NULL, last_run REAL NOT NULL,
-    deps TEXT NOT NULL);
+    id INTEGER PRIMARY KEY, nodeid TEXT NOT NULL UNIQUE, outcome TEXT NOT NULL, duration REAL NOT NULL,
+    last_run REAL NOT NULL, deps BLOB NOT NULL, modules INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS dep_keys(
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL, hash TEXT NOT NULL,
     UNIQUE(path, qualname, hash));
+CREATE TABLE IF NOT EXISTS key_tests(key_id INTEGER PRIMARY KEY, tests BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS module_sets(id INTEGER PRIMARY KEY, paths TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
     path TEXT PRIMARY KEY, sha TEXT NOT NULL, fingerprint TEXT NOT NULL, imports TEXT NOT NULL);
 """
+TABLES = ("tests", "deps", "dep_keys", "key_tests", "module_sets", "files")
+
+
+class _IndexDelta:
+    """Per key, the test ids to add to and remove from ``key_tests``."""
+
+    def __init__(self) -> None:
+        self.added: defaultdict[int, list[int]] = defaultdict(list)
+        self.removed: defaultdict[int, set[int]] = defaultdict(set)
+
+    def replace(self, test_id: int, previous: array[int], current: array[int]) -> None:
+        if previous == current:
+            return
+        before, after = set(previous), set(current)
+        for k in after - before:
+            self.added[k].append(test_id)
+        for k in before - after:
+            self.removed[k].add(test_id)
 
 
 class Store:
-    """``tests.deps`` is a JSON list of ``dep_keys`` ids.
-
-    Most tests share most of their dependencies (the import closure, the
-    config files), so each distinct ``Dep`` is stored once and loading the
-    store builds one ``Dep`` object per key instead of one per test.
+    """Each distinct ``Dep`` is a ``dep_keys`` row, and ``tests.deps`` is a
+    packed uint32 array of key ids. ``key_tests`` is the inverse, a packed
+    array of test ids per key, kept exact on every write: a key goes away
+    with the last test that uses it, so every key in the store is live.
     """
 
     def __init__(self, path: str) -> None:
@@ -82,42 +132,110 @@ class Store:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         with self.conn:
             if self.conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-                for table in ("tests", "deps", "dep_keys", "files"):
+                for table in TABLES:
                     self.conn.execute(f"DROP TABLE IF EXISTS {table}")
                 self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self.conn.executescript(SCHEMA)
 
     def view(self) -> StoreView:
         keys = {i: Dep(p, q, h) for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
-        tests: dict[str, TestRow] = {}
-        deps: dict[str, list[Dep]] = {}
-        for nodeid, outcome, duration, last_run, ids in self.conn.execute(
-            "SELECT nodeid, outcome, duration, last_run, deps FROM tests"
-        ):
-            tests[nodeid] = TestRow(outcome, duration, last_run)
-            deps[nodeid] = [keys[i] for i in json.loads(ids)]
-        return StoreView(tests, deps)
+        sets = {i: frozenset(json.loads(paths)) for i, paths in self.conn.execute("SELECT id, paths FROM module_sets")}
+        tests = {
+            nodeid: TestRow(i, outcome, duration, last_run, modules)
+            for i, nodeid, outcome, duration, last_run, modules in self.conn.execute(
+                "SELECT id, nodeid, outcome, duration, last_run, modules FROM tests"
+            )
+        }
+        return StoreView(tests, keys, sets, self.conn)
 
     def record(self, records: Iterable[Record]) -> None:
+        latest = {r.nodeid: r for r in records}
+        if not latest:
+            return
         now = time.time()
         with self.conn:
-            ids = {Dep(p, q, h): i for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
-            for r in records:
-                row = []
-                for d in sorted(set(r.deps)):
-                    if d not in ids:
-                        ids[d] = self.conn.execute("INSERT INTO dep_keys(path, qualname, hash) VALUES (?, ?, ?)", d).lastrowid
-                    row.append(ids[d])
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO tests VALUES (?, ?, ?, ?, ?)",
-                    (r.nodeid, r.outcome, r.duration, now, json.dumps(row)),
-                )
-            if len(ids) > 2 * int(self.meta_get("live_keys") or 0) + 256:
-                self.conn.execute(
-                    "DELETE FROM dep_keys WHERE id NOT IN (SELECT j.value FROM tests, json_each(tests.deps) AS j)"
-                )
-                count = self.conn.execute("SELECT count(*) FROM dep_keys").fetchone()[0]
-                self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('live_keys', ?)", (str(count),))
+            # The index is read, patched and written back, so take the write lock before the first read.
+            self.conn.execute("BEGIN IMMEDIATE")
+            key_ids = {Dep(p, q, h): i for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
+            set_ids = {paths: i for i, paths in self.conn.execute("SELECT id, paths FROM module_sets")}
+            old = self._rows(latest)
+            delta = _IndexDelta()
+            for r in latest.values():
+                ids = []
+                for d in set(r.deps):
+                    i = key_ids.get(d)
+                    if i is None:
+                        i = key_ids[d] = self.conn.execute(
+                            "INSERT INTO dep_keys(path, qualname, hash) VALUES (?, ?, ?)", d
+                        ).lastrowid
+                    ids.append(i)
+                packed = array("I", sorted(ids))
+                paths = json.dumps(sorted({d.path for d in r.deps if d.qualname in (MODULE, FILE)}))
+                modules = set_ids.get(paths)
+                if modules is None:
+                    modules = set_ids[paths] = self.conn.execute(
+                        "INSERT INTO module_sets(paths) VALUES (?)", (paths,)
+                    ).lastrowid
+                row = (r.outcome, r.duration, now, packed.tobytes(), modules)
+                if r.nodeid in old:
+                    test_id, previous = old[r.nodeid]
+                    self.conn.execute(
+                        "UPDATE tests SET outcome = ?, duration = ?, last_run = ?, deps = ?, modules = ? WHERE id = ?",
+                        (*row, test_id),
+                    )
+                else:
+                    test_id = self.conn.execute(
+                        "INSERT INTO tests(outcome, duration, last_run, deps, modules, nodeid) VALUES (?, ?, ?, ?, ?, ?)",
+                        (*row, r.nodeid),
+                    ).lastrowid
+                    previous = array("I")
+                delta.replace(test_id, previous, packed)
+            self._apply(delta)
+
+    def forget(self, nodeids: Collection[str]) -> None:
+        """Drop tests that no longer exist, and every key only they used."""
+        if not nodeids:
+            return
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            delta = _IndexDelta()
+            for test_id, previous in self._rows(nodeids).values():
+                delta.replace(test_id, previous, array("I"))
+            self.conn.execute(
+                "DELETE FROM tests WHERE nodeid IN (SELECT value FROM json_each(?))", (json.dumps(list(nodeids)),)
+            )
+            self._apply(delta)
+
+    def _rows(self, nodeids: Iterable[str]) -> dict[str, tuple[int, array[int]]]:
+        rows = self.conn.execute(
+            "SELECT nodeid, id, deps FROM tests WHERE nodeid IN (SELECT value FROM json_each(?))",
+            (json.dumps(list(nodeids)),),
+        )
+        return {nodeid: (i, _ids(blob)) for nodeid, i, blob in rows}
+
+    def _apply(self, delta: _IndexDelta) -> None:
+        touched = delta.added.keys() | delta.removed.keys()
+        current = {
+            k: _ids(blob)
+            for k, blob in self.conn.execute(
+                "SELECT key_id, tests FROM key_tests WHERE key_id IN (SELECT value FROM json_each(?))", (_json_ids(touched),)
+            )
+        }
+        keep, drop = [], []
+        for k in touched:
+            tests = current.get(k, array("I"))
+            removed = delta.removed.get(k)
+            if removed:
+                tests = array("I", (t for t in tests if t not in removed))
+            tests.extend(delta.added.get(k, ()))
+            if tests:
+                keep.append((k, tests.tobytes()))
+            else:
+                drop.append((k,))
+        self.conn.executemany("INSERT OR REPLACE INTO key_tests VALUES (?, ?)", keep)
+        self.conn.executemany("DELETE FROM key_tests WHERE key_id = ?", drop)
+        self.conn.executemany("DELETE FROM dep_keys WHERE id = ?", drop)
+        self.conn.execute("DELETE FROM module_sets WHERE id NOT IN (SELECT modules FROM tests)")
 
     def file_infos(self) -> dict[str, FileInfo]:
         return {

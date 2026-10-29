@@ -25,7 +25,7 @@ import pytest
 
 from forktest.events import CollectError, Done, Event, Miss, Request, Selection, TestResult, Verified
 from forktest.fingerprint import FILE, MODULE, Fingerprints, normalize_qualname
-from forktest.selection import ImportGraph, Reason, changed_paths, config_files, select
+from forktest.selection import ImportGraph, Reason, config_files, select
 from forktest.store import Dep, GitBaseline, Record, Store, StoreView
 from forktest.worker import ProjectFiles, Recorder, run_items, worker_main
 
@@ -180,26 +180,31 @@ class Runner:
                 out.append(name)
         return sorted(out)
 
+    def _fixture_loc(self, fixturedef: Any) -> tuple[str, str] | None:
+        func = getattr(fixturedef.func, "__func__", fixturedef.func)
+        while hasattr(func, "__wrapped__"):
+            func = func.__wrapped__
+        code = getattr(func, "__code__", None)
+        rel = self.project.rel(code.co_filename) if code else None
+        return None if rel is None else (rel, code.co_qualname)
+
     def fixture_locs(self, item: pytest.Item) -> frozenset[tuple[str, str]]:
         if item.nodeid in self._fixture_locs:
             return self._fixture_locs[item.nodeid]
-        out: set[tuple[str, str]] = set()
         info = getattr(item, "_fixtureinfo", None)
-        for defs in (info.name2fixturedefs.values() if info else ()):
-            for fixturedef in defs:
-                func = getattr(fixturedef.func, "__func__", fixturedef.func)
-                while hasattr(func, "__wrapped__"):
-                    func = func.__wrapped__
-                code = getattr(func, "__code__", None)
-                rel = self.project.rel(code.co_filename) if code else None
-                if rel is not None:
-                    out.add((rel, code.co_qualname))
-        self._fixture_locs[item.nodeid] = frozenset(out)
+        defs = (d for ds in (info.name2fixturedefs.values() if info else ()) for d in ds)
+        self._fixture_locs[item.nodeid] = frozenset(loc for d in defs if (loc := self._fixture_loc(d)))
         return self._fixture_locs[item.nodeid]
 
     def all_fixture_locs(self) -> frozenset[tuple[str, str]]:
+        """Items share their fixture definitions, so each distinct one is located once."""
         if self._all_fixture_locs is None:
-            self._all_fixture_locs = frozenset().union(*(self.fixture_locs(i) for i in self.items))
+            defs: dict[int, Any] = {}
+            for item in self.items:
+                info = getattr(item, "_fixtureinfo", None)
+                for ds in info.name2fixturedefs.values() if info else ():
+                    defs.update((id(d), d) for d in ds)
+            self._all_fixture_locs = frozenset(loc for d in defs.values() if (loc := self._fixture_loc(d)))
         return self._all_fixture_locs
 
     def run(
@@ -230,6 +235,7 @@ class Runner:
             emit(Done(errors=len(self.collect_errors), duration_ms=_ms(t0)))
             return
         view = self.store.view()
+        self._forget_deleted(view)
         graph = self.graph()
         nodeids = [i.nodeid for i in self.items]
         current = functools.cache(self.fps.of)
@@ -243,8 +249,7 @@ class Runner:
                     view = view.rebased(baseline.hash_of)
                 finally:
                     baseline.close()
-            reasons = select(nodeids, view, current, graph, fixtures=self.all_fixture_locs())
-            changed = changed_paths(nodeids, view, current)
+            reasons, changed = select(nodeids, view, current, graph, fixtures=self.all_fixture_locs())
         selected = [i for i in self.items if i.nodeid in reasons]
         counts = {str(r): n for r, n in sorted(Counter(reasons.values()).items())}
         emit(Selection(changed, len(selected), len(nodeids), counts, _ms(t0)))
@@ -338,6 +343,17 @@ class Runner:
         finally:
             self.store.record(records)
             self.store.meta_set("preimport", json.dumps(self.third_party_modules()))
+
+    def _forget_deleted(self, view: StoreView) -> None:
+        exists: dict[str, bool] = {}
+        gone = []
+        for nodeid in view.tests:
+            test_file = nodeid.split("::")[0]
+            if test_file not in exists:
+                exists[test_file] = os.path.exists(os.path.join(self.root, test_file))
+            if not exists[test_file]:
+                gone.append(nodeid)
+        self.store.forget(gone)
 
     def _threads_block_fork(self) -> bool:
         extra = threading.active_count() - 1

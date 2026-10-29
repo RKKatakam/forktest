@@ -132,3 +132,22 @@ def test_watch_reruns_affected_tests_on_save_and_exits_clean(demo):
     assert "zygote ready" in err and "stale" in err
     wait_for(lambda: not alive(proc.pid) and not alive(l1), what="watch processes to exit")
     assert processes_in_group(proc.pid) == []
+
+
+def test_a_zygote_stopped_right_after_its_fork_exits_and_leaves_the_daemon_files(tmp_path, monkeypatch):
+    from forktest.daemon import Daemon
+
+    monkeypatch.setattr(pytest, "main", lambda *a, **k: time.sleep(10))
+    daemon = Daemon(str(tmp_path), [], listen=True, watch=False)
+    os.makedirs(daemon.paths.dir)
+    daemon._bind()
+    daemon.build_l1(())
+    pid = daemon.l1.pid
+    assert os.getpgid(pid) == pid, "the zygote has its own process group as soon as build_l1 returns"
+    daemon.kill_l1("test")
+    deadline = time.monotonic() + 5
+    while os.waitpid(pid, os.WNOHANG) == (0, 0):
+        assert time.monotonic() < deadline, "zygote ignored SIGTERM sent right after its fork"
+        time.sleep(0.01)
+    assert os.path.exists(daemon.paths.sock) and os.path.exists(daemon.paths.pid)
+    daemon.listener.close()

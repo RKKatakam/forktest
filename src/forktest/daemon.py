@@ -95,6 +95,7 @@ def log(msg: str) -> None:
 
 
 _runner: Any = None
+L0_SIGNALS = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
 
 
 def _l1_sigterm(signum: int, frame: Any) -> NoReturn:
@@ -107,6 +108,8 @@ def l1_main(control: socket.socket, pytest_args: list[str]) -> NoReturn:
     os.setpgid(0, 0)
     signal.signal(signal.SIGTERM, _l1_sigterm)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, L0_SIGNALS)
     import pytest
 
     from forktest.zygote import ZygotePlugin
@@ -254,7 +257,7 @@ class Daemon:
 
     def run(self) -> None:
         os.makedirs(self.paths.dir, exist_ok=True)
-        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        for sig in L0_SIGNALS:
             signal.signal(sig, self._on_signal)
         if self.listen:
             self._bind()
@@ -306,6 +309,7 @@ class Daemon:
         import gc
 
         gc.freeze()
+        signal.pthread_sigmask(signal.SIG_BLOCK, L0_SIGNALS)
         pid = os.fork()
         gc.unfreeze()
         if pid == 0:
@@ -314,6 +318,11 @@ class Daemon:
                 if sock is not None:
                     sock.close()
             l1_main(child, list(args))
+        try:
+            os.setpgid(pid, pid)
+        except OSError:  # the child got there first, or already exited
+            pass
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, L0_SIGNALS)
         child.close()
         self.l1 = L1(L1State.BUILDING, pid, parent, args, failures=self.l1.failures)
         self.sel.register(parent, selectors.EVENT_READ, self._read_l1)

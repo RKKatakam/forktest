@@ -341,3 +341,14 @@ def test_forktest_adds_no_modules_a_test_could_lean_on(demo, tmp_path):
             del os.environ["LOADED_OUT"]
         loaded[runner] = out.read_text()
     assert loaded["forktest"] == loaded["pytest"]
+
+
+def test_a_module_skipped_at_import_counts_like_pytest_in_a_full_run(demo):
+    """pandas' test_arrow_interface.py skips itself with importorskip when pyarrow is missing."""
+    (demo.root / "tests" / "test_optional.py").write_text(
+        "import pytest\n\npytest.importorskip('a_module_that_is_not_installed')\n\n\n"
+        "def test_never_collected():\n    pass\n"
+    )
+    assert demo.pytest_counts() == {"passed": 16, "skipped": 1}
+    events, rc = demo.forktest("--all")
+    assert rc == 0 and done(events).passed == 16 and done(events).skipped == 1

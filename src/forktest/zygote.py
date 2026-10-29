@@ -44,6 +44,7 @@ class ZygotePlugin:
     def __init__(self, loop: Callable[[Runner], None]) -> None:
         self.loop = loop
         self.collect_errors: list[CollectError] = []
+        self.collect_skips: list[str] = []
 
     @pytest.hookimpl(trylast=True)
     def pytest_configure(self, config: pytest.Config) -> None:
@@ -54,6 +55,8 @@ class ZygotePlugin:
     def pytest_collectreport(self, report: pytest.CollectReport) -> None:
         if report.failed:
             self.collect_errors.append(CollectError(report.nodeid, str(report.longrepr)))
+        elif report.skipped:
+            self.collect_skips.append(report.nodeid)
 
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_makereport(self, item: pytest.Item, call: pytest.CallInfo[None]) -> Any:
@@ -64,7 +67,7 @@ class ZygotePlugin:
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtestloop(self, session: pytest.Session) -> bool:
-        runner = Runner(session, self.collect_errors)
+        runner = Runner(session, self.collect_errors, self.collect_skips)
         try:
             self.loop(runner)
         finally:
@@ -137,11 +140,12 @@ class _Worker:
 class Runner:
     """Selection, scheduling, forking and recording for one collected session."""
 
-    def __init__(self, session: pytest.Session, collect_errors: list[CollectError]) -> None:
+    def __init__(self, session: pytest.Session, collect_errors: list[CollectError], collect_skips: list[str]) -> None:
         self.session = session
         self.config = session.config
         self.items: list[pytest.Item] = list(session.items)
         self.collect_errors = collect_errors
+        self.collect_skips = collect_skips
         self.root = os.path.realpath(str(self.config.rootpath))
         self.project = ProjectFiles(self.root)
         self.store = Store(os.path.join(self.root, ".forktest", "store.db"))
@@ -258,7 +262,8 @@ class Runner:
                 passed=tally["passed"],
                 failed=tally["failed"],
                 errors=tally["error"],
-                skipped=tally["skipped"],
+                # pytest counts a module that skips itself at import; only a full run is comparable.
+                skipped=tally["skipped"] + (len(self.collect_skips) if req.mode == "all" else 0),
                 xfailed=tally["xfailed"],
                 xpassed=tally["xpassed"],
                 duration_ms=_ms(t0),

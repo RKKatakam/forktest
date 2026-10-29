@@ -55,11 +55,12 @@ JSON output (`--json`):
 ```json
 {"event":"selection","changed":["billing/tax.py"],"selected":7,"total":16,"reasons":{"coverage":7},"duration_ms":5}
 {"event":"fail","test":"tests/test_tax.py::test_round_vat[10.005-10.01]","duration_ms":0.4,"file":"tests/test_tax.py","line":14,"message":"assert Decimal('11.01') == Decimal('10.01')\n +  where ...","trace":[{"file":"tests/test_tax.py","line":14,"fn":"test_round_vat"}]}
-{"event":"done","passed":6,"failed":1,"errors":0,"skipped":0,"duration_ms":52}
+{"event":"done","passed":6,"failed":1,"errors":0,"skipped":0,"xfailed":0,"xpassed":0,"duration_ms":52}
 ```
 
 Passing tests are not emitted as JSON lines; `done` carries their count.
-Other events are `collect_error`, `skip`, `error`, `miss` and `verified`.
+Other events are `collect_error`, `skip`, `xfail`, `xpass`, `error`, `miss`
+and `verified`. A strict xpass is reported as `fail`, as pytest does.
 
 Exit codes: 0 all selected tests passed, 1 a test failed or a miss was
 found, 2 collection failed, 5 nothing was collected at all.
@@ -70,7 +71,10 @@ found, 2 collection failed, 5 nothing was collected at all.
 function qualname to a hash of its definition with docstrings removed, plus
 a `<module>` hash of the file with every function body replaced by `...`.
 Moving or reformatting code changes nothing. Editing a constant, a
-signature, an import or a decorator changes the `<module>` hash.
+signature, an import or a decorator changes the `<module>` hash. Each
+file's fingerprint and imports are kept in the store by path and reused
+while the file's content hash matches, so a new zygote or a cold run only
+parses the files that changed.
 
 **Recording.** While a test runs, a `sys.monitoring` `PY_START` hook
 records which project functions executed, and an `open` audit hook records
@@ -79,7 +83,8 @@ depends on are added statically, since a session fixture only executes for
 the first test in a batch. The static import closure of the test file and
 its `conftest.py` files is added as `<module>` dependencies, and so are the
 pytest config and lock files. All of it goes into `.forktest/store.db`, one
-baseline per test.
+baseline per test. Each distinct dependency is stored once and a test's
+baseline is a list of their ids, because most tests share most of them.
 
 **Selection.** A test runs when it is new, failed last time, or any
 recorded dependency hash differs from the current one. Each selected test
@@ -88,7 +93,9 @@ carries one reason: `config_change`, `new`, `last_failed`, `coverage`,
 
 **Execution.** The collecting process is the zygote. Selected tests are
 grouped by module, failed-first, assigned to workers by longest processing
-time, and each worker is an `os.fork()` of the zygote that runs its items
+time. A module whose recorded duration is more than an even share of the
+run is split by class first, then into consecutive runs, so module- and
+class-scoped fixtures are rebuilt as rarely as possible. Each worker is an `os.fork()` of the zygote that runs its items
 through pytest's `runtestprotocol` and streams results back over a pipe.
 
 **Daemon.** `forktest daemon start` keeps an L0 process with the
@@ -100,21 +107,51 @@ foreground, driven by file changes, with a niced run of the unselected
 tests after each affected run so a selection miss is reported rather than
 hidden.
 
-## Measured on the demo
+## Measured
 
-`uv run python bench/bench.py` prints the table for your machine. On a
-12-core Apple Silicon laptop with Python 3.12, median of 5 runs each:
+All numbers below were measured on a 12-core Apple Silicon laptop with
+Python 3.14.6 and pytest 9.1.1, on 2026-10-28, while other work kept the
+load average between 1.5 and 3.5. Each is the median wall-clock time of
+one CLI invocation, with the range of the runs after it.
+
+### attrs
+
+A shallow clone of [attrs](https://github.com/python-attrs/attrs) at
+c8bb9bf: 1,413 tests, of which 2 fail in a shallow clone
+(`test_packaging.py::TestLegacyMetadataHack::test_version_info`). The edit
+adds a line to `_InstanceOfValidator.__repr__` in `src/attr/validators.py`.
+forktest selects the 12 tests that run it plus the 2 failing tests. Every
+run reported the same pass and fail counts as pytest.
+
+| scenario | runs | median | range |
+|---|---|---|---|
+| `pytest -q`, whole suite | 5, interleaved | 4.82 s | 4.70 to 5.05 s |
+| `pytest -n auto`, whole suite | 5, interleaved | 2.36 s | 2.23 to 2.80 s |
+| `forktest` after the edit, no daemon | 5, interleaved | 0.52 s | 0.48 to 0.53 s |
+| `forktest` after the edit, daemon, waits for the zygote to rebuild | 5 | 0.29 s | 0.29 to 0.29 s |
+| `forktest` after the edit, daemon, zygote already rebuilt | 5 | 0.14 s | 0.12 to 0.14 s |
+| `forktest --all`, no daemon | 5, interleaved with `pytest -n auto` | 1.25 s | 1.15 to 1.31 s |
+| `pytest -n auto` in those same rounds | 5 | 2.39 s | 2.24 to 2.58 s |
+
+Selection itself takes 44 ms (43 to 49 ms) without the daemon and 39 ms
+(30 to 40 ms) in a freshly rebuilt zygote. `--all` is bound by its slowest
+worker: the longest single attrs test takes 0.34 s.
+
+### The demo
+
+`uv run python bench/bench.py` prints this table for your machine. Each
+side ran 5 times in a row, not interleaved.
 
 | scenario | pytest | forktest |
 |---|---|---|
-| cold full run | 1.19 s | 0.44 s (`--all`) |
-| one-function edit, cold process | 1.18 s (whole suite) | 0.17 s (7 of 16 selected) |
-| one-function edit, warm daemon, zygote already rebuilt | | 0.058 s |
-| one-function edit, warm daemon, waits for the zygote to rebuild | | 0.086 s |
+| cold full run | 1.24 s (1.23 to 1.24) | 0.52 s (0.51 to 0.53), `--all` |
+| one-function edit, cold process | 1.23 s (1.23 to 1.25), whole suite | 0.23 s (0.23 to 0.24), 7 of 16 selected |
+| one-function edit, warm daemon, waits for the zygote to rebuild | | 0.105 s (0.103 to 0.109) |
+| one-function edit, warm daemon, zygote already rebuilt | | 0.075 s (0.073 to 0.076) |
 
 The demo's slow module sleeps 0.25 s per test, which is what bounds both
 full runs. The cold forktest floor is interpreter start plus `import
-pytest` (0.08 s) plus collection.
+pytest` (0.095 s) plus collection.
 
 ## What works
 

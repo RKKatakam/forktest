@@ -188,7 +188,10 @@ def test_exit_first_stops_scheduling_after_the_first_failure(demo):
 def test_verify_selection_reports_a_miss_when_a_baseline_is_wrong(demo):
     db = sqlite3.connect(demo.root / ".forktest" / "store.db")
     with db:
-        db.execute("DELETE FROM deps WHERE path = 'data/rates.json'")
+        db.execute(
+            "UPDATE tests SET deps = (SELECT json_group_array(j.value) FROM json_each(tests.deps) AS j"
+            " WHERE j.value NOT IN (SELECT id FROM dep_keys WHERE path = 'data/rates.json'))"
+        )
     db.close()
     demo.edit("data/rates.json", '"SE": "0.25"', '"SE": "0.255"')
     events, rc = demo.forktest("--verify-selection")

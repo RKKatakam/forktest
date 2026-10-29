@@ -7,7 +7,6 @@ import os
 import sqlite3
 import subprocess
 import time
-from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -54,12 +53,14 @@ class StoreView:
         return StoreView(self.tests, deps)
 
 
+SCHEMA_VERSION = 2
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tests(
-    nodeid TEXT PRIMARY KEY, outcome TEXT NOT NULL, duration REAL NOT NULL, last_run REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS deps(
-    nodeid TEXT NOT NULL, path TEXT NOT NULL, qualname TEXT NOT NULL, hash TEXT NOT NULL);
-CREATE INDEX IF NOT EXISTS deps_nodeid ON deps(nodeid);
+    nodeid TEXT PRIMARY KEY, outcome TEXT NOT NULL, duration REAL NOT NULL, last_run REAL NOT NULL,
+    deps TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS dep_keys(
+    id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL, hash TEXT NOT NULL,
+    UNIQUE(path, qualname, hash));
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
     path TEXT PRIMARY KEY, sha TEXT NOT NULL, fingerprint TEXT NOT NULL, imports TEXT NOT NULL);
@@ -67,36 +68,56 @@ CREATE TABLE IF NOT EXISTS files(
 
 
 class Store:
+    """``tests.deps`` is a JSON list of ``dep_keys`` ids.
+
+    Most tests share most of their dependencies (the import closure, the
+    config files), so each distinct ``Dep`` is stored once and loading the
+    store builds one ``Dep`` object per key instead of one per test.
+    """
+
     def __init__(self, path: str) -> None:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.conn = sqlite3.connect(path, timeout=5)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(SCHEMA)
+        with self.conn:
+            if self.conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                for table in ("tests", "deps", "dep_keys", "files"):
+                    self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+                self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.conn.executescript(SCHEMA)
 
     def view(self) -> StoreView:
-        tests = {
-            nodeid: TestRow(outcome, duration, last_run)
-            for nodeid, outcome, duration, last_run in self.conn.execute(
-                "SELECT nodeid, outcome, duration, last_run FROM tests"
-            )
-        }
-        deps: dict[str, list[Dep]] = defaultdict(list)
-        for nodeid, path, qualname, h in self.conn.execute("SELECT nodeid, path, qualname, hash FROM deps"):
-            deps[nodeid].append(Dep(path, qualname, h))
-        return StoreView(tests, dict(deps))
+        keys = {i: Dep(p, q, h) for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
+        tests: dict[str, TestRow] = {}
+        deps: dict[str, list[Dep]] = {}
+        for nodeid, outcome, duration, last_run, ids in self.conn.execute(
+            "SELECT nodeid, outcome, duration, last_run, deps FROM tests"
+        ):
+            tests[nodeid] = TestRow(outcome, duration, last_run)
+            deps[nodeid] = [keys[i] for i in json.loads(ids)]
+        return StoreView(tests, deps)
 
     def record(self, records: Iterable[Record]) -> None:
         now = time.time()
         with self.conn:
+            ids = {Dep(p, q, h): i for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
             for r in records:
-                self.conn.execute("DELETE FROM deps WHERE nodeid = ?", (r.nodeid,))
+                row = []
+                for d in sorted(set(r.deps)):
+                    if d not in ids:
+                        ids[d] = self.conn.execute("INSERT INTO dep_keys(path, qualname, hash) VALUES (?, ?, ?)", d).lastrowid
+                    row.append(ids[d])
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO tests VALUES (?, ?, ?, ?)", (r.nodeid, r.outcome, r.duration, now)
+                    "INSERT OR REPLACE INTO tests VALUES (?, ?, ?, ?, ?)",
+                    (r.nodeid, r.outcome, r.duration, now, json.dumps(row)),
                 )
-                self.conn.executemany(
-                    "INSERT INTO deps VALUES (?, ?, ?, ?)", [(r.nodeid, *d) for d in set(r.deps)]
+            if len(ids) > 2 * int(self.meta_get("live_keys") or 0) + 256:
+                self.conn.execute(
+                    "DELETE FROM dep_keys WHERE id NOT IN (SELECT j.value FROM tests, json_each(tests.deps) AS j)"
                 )
+                count = self.conn.execute("SELECT count(*) FROM dep_keys").fetchone()[0]
+                self.conn.execute("INSERT OR REPLACE INTO meta VALUES ('live_keys', ?)", (str(count),))
 
     def file_infos(self) -> dict[str, FileInfo]:
         return {

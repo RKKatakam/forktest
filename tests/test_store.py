@@ -1,3 +1,5 @@
+import sqlite3
+
 from forktest.fingerprint import FileInfo, ImportStmt
 from forktest.store import Dep, Record, Store, StoreView, TestRow
 
@@ -51,3 +53,31 @@ def test_file_infos_survive_a_reopen_and_replace_by_path(tmp_path):
     reopened = Store(path)
     reopened.save_file_infos({"m.py": old})
     assert reopened.file_infos()["m.py"] == old
+
+
+def test_superseded_dependency_keys_are_collected(tmp_path):
+    path = str(tmp_path / "store.db")
+    store = Store(path)
+    for version in range(20):
+        deps = [Dep(f"m{k}.py", "f", f"v{version}") for k in range(100)] + [Dep("shared.py", "g", "h")]
+        store.record([Record("t.py::a", "passed", 0.1, deps), Record("t.py::b", "passed", 0.1, deps[-2:])])
+    assert sorted(store.view().deps["t.py::a"]) == sorted(deps)
+    assert store.view().deps["t.py::b"] == sorted(deps[-2:])
+    keys = sqlite3.connect(path).execute("SELECT count(*) FROM dep_keys").fetchone()[0]
+    assert keys <= 2 * 101 + 256
+
+
+def test_a_store_from_the_old_layout_starts_empty(tmp_path):
+    path = tmp_path / "store.db"
+    old = sqlite3.connect(path)
+    old.executescript(
+        "CREATE TABLE tests(nodeid TEXT PRIMARY KEY, outcome TEXT, duration REAL, last_run REAL);"
+        "CREATE TABLE deps(nodeid TEXT, path TEXT, qualname TEXT, hash TEXT);"
+        "INSERT INTO tests VALUES ('t.py::a', 'passed', 0.1, 0); INSERT INTO deps VALUES ('t.py::a', 'a.py', 'f', 'h');"
+    )
+    old.commit()
+    old.close()
+    store = Store(str(path))
+    assert store.view().tests == {}
+    store.record([Record("t.py::a", "failed", 0.2, [Dep("a.py", "f", "h2")])])
+    assert store.view().deps == {"t.py::a": [Dep("a.py", "f", "h2")]}

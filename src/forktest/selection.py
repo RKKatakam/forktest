@@ -178,6 +178,19 @@ def dep_changed(dep: Dep, current: FingerprintFn) -> bool:
     return fp.get(qualname) != dep.hash
 
 
+def changed_deps(current: FingerprintFn) -> Callable[[Dep], bool]:
+    """``dep_changed`` memoized per dep; tests share most of their deps."""
+    memo: dict[Dep, bool] = {}
+
+    def changed(dep: Dep) -> bool:
+        hit = memo.get(dep)
+        if hit is None:
+            hit = memo[dep] = dep_changed(dep, current)
+        return hit
+
+    return changed
+
+
 def classify(dep: Dep, fixtures: frozenset[tuple[str, str]]) -> Reason:
     name = posixpath.basename(dep.path)
     if dep.qualname == FILE:
@@ -190,7 +203,7 @@ def classify(dep: Dep, fixtures: frozenset[tuple[str, str]]) -> Reason:
 def reasons_for(
     nodeid: str,
     view: StoreView,
-    current: FingerprintFn,
+    is_changed: Callable[[Dep], bool],
     graph: ImportGraph,
     fixtures: frozenset[tuple[str, str]],
     closure_cache: dict[str, set[str]],
@@ -202,7 +215,7 @@ def reasons_for(
     if row.outcome in ("failed", "error"):
         out.append((Reason.LAST_FAILED, None))
     deps = view.deps.get(nodeid, [])
-    out.extend((classify(d, fixtures), d) for d in deps if dep_changed(d, current))
+    out.extend((classify(d, fixtures), d) for d in deps if is_changed(d))
     test_file = nodeid.split("::")[0]
     if test_file not in closure_cache:
         closure_cache[test_file] = graph.closure(test_file)
@@ -223,14 +236,16 @@ def select(
 ) -> dict[str, Reason]:
     """Map each affected nodeid to the highest-priority reason it is selected."""
     closures: dict[str, set[str]] = {}
+    is_changed = changed_deps(current)
     out: dict[str, Reason] = {}
     for nodeid in nodeids:
-        reasons = reasons_for(nodeid, view, current, graph, fixtures, closures)
+        reasons = reasons_for(nodeid, view, is_changed, graph, fixtures, closures)
         if reasons:
             out[nodeid] = min((r for r, _ in reasons), key=PRIORITY.index)
     return out
 
 
 def changed_paths(nodeids: Iterable[str], view: StoreView, current: FingerprintFn) -> list[str]:
-    paths = {d.path for n in nodeids for d in view.deps.get(n, []) if dep_changed(d, current)}
+    is_changed = changed_deps(current)
+    paths = {d.path for n in nodeids for d in view.deps.get(n, []) if is_changed(d)}
     return sorted(paths)

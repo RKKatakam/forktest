@@ -5,12 +5,13 @@ from __future__ import annotations
 import enum
 import fnmatch
 import importlib.machinery
+import json
 import os
 import posixpath
 from collections.abc import Callable, Iterable, Mapping
 from typing import NamedTuple
 
-from forktest.fingerprint import FILE, MODULE, Fingerprints, ImportStmt, normalize_qualname
+from forktest.fingerprint import FILE, MODULE, Fingerprints, ImportStmt, content_hash, normalize_qualname
 from forktest.store import Dep, StoreView
 
 FingerprintFn = Callable[[str], "dict[str, str] | None"]
@@ -88,18 +89,76 @@ class ImportGraph:
     Directory listings, edges and closures are memoized for the life of the
     instance, so it describes the tree as it was when first asked. Build a
     new one per run.
+
+    A file's edges depend on its imports, on which files exist in the
+    directories its resolution scanned, and on ``known_modules``. ``export``
+    persists the edges with those inputs, each directory by a digest of its
+    listing, and ``reusing`` takes back the edges whose inputs still match. A
+    directory's mtime would be cheaper to check but is too coarse: build
+    trees inside the project are rewritten on every import.
     """
 
-    def __init__(self, root: str, fingerprints: Fingerprints, known_modules: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        root: str,
+        fingerprints: Fingerprints,
+        known_modules: Mapping[str, str] | Callable[[], Mapping[str, str]] | None = None,
+        modules_digest: str = "",
+    ) -> None:
         self.root = root
         self.fps = fingerprints
-        self.known = known_modules or {}
+        self._known_source = known_modules
+        self._known: Mapping[str, str] | None = None
+        self.modules_digest = modules_digest
+        self._dir_digests: dict[str, str] = {}
+        self._resolved: set[str] = set()
         self._listings: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
         self._basedirs: dict[str, str] = {}
         self._targets: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
         self._direct: dict[str, frozenset[str]] = {}
         self._reach: dict[str, frozenset[str]] = {}
         self._closure: dict[str, frozenset[str]] = {}
+
+    @classmethod
+    def reusing(
+        cls,
+        state: str | None,
+        root: str,
+        fingerprints: Fingerprints,
+        known_modules: Mapping[str, str] | Callable[[], Mapping[str, str]],
+        modules_digest: str,
+    ) -> ImportGraph:
+        graph = cls(root, fingerprints, known_modules, modules_digest)
+        saved = json.loads(state) if state else None
+        if not saved or saved["modules"] != modules_digest:
+            return graph
+        for d, digest in saved["dirs"].items():
+            graph._listing(d)
+            if graph._dir_digests.get(d) != digest:
+                return graph
+        for path, (sha, imports, targets) in saved["nodes"].items():
+            info = fingerprints.info(path)
+            if info is not None and (info.sha == sha or _imports_digest(info.imports) == imports):
+                graph._direct[path] = frozenset(targets)
+        return graph
+
+    def export(self) -> str | None:
+        """The edges for ``reusing``, or ``None`` when this instance resolved nothing new."""
+        if not self._resolved:
+            return None
+        nodes = {
+            path: [info.sha, _imports_digest(info.imports), sorted(targets)]
+            for path, targets in self._direct.items()
+            if (info := self.fps.info(path)) is not None
+        }
+        return json.dumps({"modules": self.modules_digest, "dirs": self._dir_digests, "nodes": nodes})
+
+    @property
+    def known(self) -> Mapping[str, str]:
+        if self._known is None:
+            source = self._known_source
+            self._known = (source() if callable(source) else source) or {}
+        return self._known
 
     def _listing(self, d: str) -> tuple[frozenset[str], frozenset[str]]:
         """The files and subdirectories of ``d``. A directory its parent does not list is never scanned."""
@@ -108,7 +167,8 @@ class ImportGraph:
             cached = (frozenset(), frozenset())
             parent, _, name = d.rpartition("/")
             if not d or (not is_excluded(d) and name in self._listing(parent)[1]):
-                files, dirs = [], []
+                files: list[str] = []
+                dirs: list[str] = []
                 try:
                     with os.scandir(os.path.join(self.root, d)) as it:
                         for e in it:
@@ -116,6 +176,7 @@ class ImportGraph:
                 except OSError:
                     pass
                 cached = (frozenset(files), frozenset(dirs))
+                self._dir_digests[d] = content_hash(json.dumps([sorted(files), sorted(dirs)]).encode())
             self._listings[d] = cached
         return cached
 
@@ -187,6 +248,7 @@ class ImportGraph:
                 edges |= self.resolve(stmt, path)
         edges.discard(path)
         result = self._direct[path] = frozenset(edges)
+        self._resolved.add(path)
         return result
 
     def conftests_for(self, path: str) -> list[str]:
@@ -259,6 +321,10 @@ class ImportGraph:
                 for m in members:
                     done[m] = frozen
         return done[start]
+
+
+def _imports_digest(imports: list[ImportStmt]) -> str:
+    return content_hash(json.dumps(imports).encode())
 
 
 def dep_changed(dep: Dep, current: FingerprintFn) -> bool:

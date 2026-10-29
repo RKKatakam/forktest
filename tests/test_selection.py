@@ -1,3 +1,4 @@
+import json
 import random
 
 import pytest
@@ -90,6 +91,32 @@ def test_reachable_matches_a_plain_walk_on_graphs_with_cycles():
                     seen.add(n)
                     stack.extend(edges[n])
             assert graph.reachable(start) == seen, (trial, start, edges)
+
+
+def test_a_persisted_graph_is_reused_until_its_directories_imports_or_modules_change(project):
+    deep = "tests/sub/test_deep.py"
+
+    def planted_state():
+        graph = graph_for(project)
+        graph.closure(deep)
+        state = json.loads(graph.export())
+        state["nodes"][deep][2].append("planted.py")
+        return json.dumps(state)
+
+    def reused(state, modules=""):
+        return ImportGraph.reusing(state, str(project), Fingerprints(str(project)), {}, modules).closure(deep)
+
+    state = planted_state()
+    assert "planted.py" in reused(state), "a matching state is reused"
+    assert "planted.py" not in reused(state, "other modules")
+    edit(project, "tests/sub/local_helper.py", "def lh():", "import helpers\n\ndef lh():")
+    assert {"planted.py", "helpers.py"} <= reused(state), "only the file whose imports changed is resolved again"
+    (project / "tests/sub/newmod.py").write_text("Y = 1\n")
+    assert reused(state) == graph_for(project).closure(deep) and "tests/sub/newmod.py" in reused(state)
+
+    state = planted_state()
+    edit(project, deep, "import newmod", "import newmod, config")
+    assert "planted.py" not in reused(state) and "config.py" in reused(state)
 
 
 def test_config_file_detection(project):

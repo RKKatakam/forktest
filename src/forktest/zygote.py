@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 
 from forktest.events import CollectError, Done, Event, Miss, Request, Selection, TestResult, Verified
-from forktest.fingerprint import FILE, MODULE, Fingerprints, normalize_qualname
+from forktest.fingerprint import FILE, MODULE, Fingerprints, content_hash, normalize_qualname
 from forktest.selection import ImportGraph, Reason, config_files, select
 from forktest.store import Dep, GitBaseline, Record, Store, StoreView
 from forktest.worker import DepDecoder, DepEncoder, ProjectFiles, Recorder, run_items, worker_main
@@ -160,16 +160,21 @@ class Runner:
     def close(self) -> None:
         self.store.close()
 
-    def graph(self) -> ImportGraph:
+    def known_modules(self) -> dict[str, str]:
         known = {}
         for name, mod in list(sys.modules.items()):
             rel = self.project.rel(getattr(mod, "__file__", None) or "")
             if rel is not None:
                 known[name] = rel
-        return ImportGraph(self.root, self.fps, known)
+        return known
+
+    def graph(self) -> ImportGraph:
+        files = sorted((name, getattr(mod, "__file__", None) or "") for name, mod in list(sys.modules.items()))
+        modules = content_hash(repr(files).encode())
+        return ImportGraph.reusing(self.store.meta_get("import_graph"), self.root, self.fps, self.known_modules, modules)
 
     def imported_files(self) -> list[str]:
-        return sorted(set(self.graph().known.values()))
+        return sorted(set(self.known_modules().values()))
 
     def third_party_modules(self) -> list[str]:
         out = []
@@ -238,6 +243,22 @@ class Runner:
         view = self.store.view()
         self._forget_deleted(view)
         graph = self.graph()
+        try:
+            self._select_and_run(req, emit, view, graph, t0, (wake_fd, should_cancel))
+        finally:
+            state = graph.export()
+            if state is not None:
+                self.store.meta_set("import_graph", state)
+
+    def _select_and_run(
+        self,
+        req: Request,
+        emit: Emit,
+        view: StoreView,
+        graph: ImportGraph,
+        t0: float,
+        cancel: tuple[int | None, Callable[[], bool]],
+    ) -> None:
         nodeids = [i.nodeid for i in self.items]
         current = functools.cache(self.fps.of)
         if req.mode == "all":
@@ -261,7 +282,6 @@ class Runner:
             tally[result.outcome] += 1
             emit(result)
 
-        cancel = (wake_fd, should_cancel)
         self.execute(selected, view, graph, req, on_result, cancel, nice=False, current=current)
         emit(
             Done(

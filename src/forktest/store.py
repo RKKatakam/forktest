@@ -30,9 +30,7 @@ class Record(NamedTuple):
     deps: list[Dep]
 
 
-@dataclass(frozen=True)
-class TestRow:
-    __test__ = False
+class TestRow(NamedTuple):
     id: int
     outcome: str
     duration: float
@@ -71,7 +69,9 @@ class StoreView:
         return {k: _ids(blob) for k, blob in rows}
 
     def key_ids_of(self, nodeid: str) -> array[int]:
-        row = self.conn.execute("SELECT deps FROM tests WHERE nodeid = ?", (nodeid,)).fetchone()
+        row = self.conn.execute(
+            "SELECT deps FROM test_deps JOIN tests ON tests.id = test_id WHERE nodeid = ?", (nodeid,)
+        ).fetchone()
         return _ids(row[0]) if row else array("I")
 
     def rebased(self, hash_of: Callable[[str, str], str | None]) -> StoreView:
@@ -84,11 +84,12 @@ class StoreView:
         return dataclasses.replace(self, keys=keys)
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tests(
     id INTEGER PRIMARY KEY, nodeid TEXT NOT NULL UNIQUE, outcome TEXT NOT NULL, duration REAL NOT NULL,
-    last_run REAL NOT NULL, deps BLOB NOT NULL, modules INTEGER NOT NULL);
+    last_run REAL NOT NULL, modules INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS test_deps(test_id INTEGER PRIMARY KEY, deps BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS dep_keys(
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL, hash TEXT NOT NULL,
     UNIQUE(path, qualname, hash));
@@ -98,7 +99,7 @@ CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(
     path TEXT PRIMARY KEY, sha TEXT NOT NULL, fingerprint TEXT NOT NULL, imports TEXT NOT NULL);
 """
-TABLES = ("tests", "deps", "dep_keys", "key_tests", "module_sets", "files")
+TABLES = ("tests", "deps", "test_deps", "dep_keys", "key_tests", "module_sets", "files")
 
 
 class _IndexDelta:
@@ -119,10 +120,12 @@ class _IndexDelta:
 
 
 class Store:
-    """Each distinct ``Dep`` is a ``dep_keys`` row, and ``tests.deps`` is a
-    packed uint32 array of key ids. ``key_tests`` is the inverse, a packed
-    array of test ids per key, kept exact on every write: a key goes away
-    with the last test that uses it, so every key in the store is live.
+    """Each distinct ``Dep`` is a ``dep_keys`` row, and ``test_deps`` holds a
+    packed uint32 array of key ids per test, apart from ``tests`` so that
+    loading every test's row stays a narrow scan. ``key_tests`` is the
+    inverse, a packed array of test ids per key, kept exact on every write:
+    a key goes away with the last test that uses it, so every key in the
+    store is live.
     """
 
     def __init__(self, path: str) -> None:
@@ -176,20 +179,21 @@ class Store:
                     modules = set_ids[paths] = self.conn.execute(
                         "INSERT INTO module_sets(paths) VALUES (?)", (paths,)
                     ).lastrowid
-                row = (r.outcome, r.duration, now, packed.tobytes(), modules)
+                row = (r.outcome, r.duration, now, modules)
                 if r.nodeid in old:
                     test_id, previous = old[r.nodeid]
                     self.conn.execute(
-                        "UPDATE tests SET outcome = ?, duration = ?, last_run = ?, deps = ?, modules = ? WHERE id = ?",
-                        (*row, test_id),
+                        "UPDATE tests SET outcome = ?, duration = ?, last_run = ?, modules = ? WHERE id = ?", (*row, test_id)
                     )
                 else:
                     test_id = self.conn.execute(
-                        "INSERT INTO tests(outcome, duration, last_run, deps, modules, nodeid) VALUES (?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO tests(outcome, duration, last_run, modules, nodeid) VALUES (?, ?, ?, ?, ?)",
                         (*row, r.nodeid),
                     ).lastrowid
-                    previous = array("I")
-                delta.replace(test_id, previous, packed)
+                    previous = None
+                if previous != packed:
+                    self.conn.execute("INSERT OR REPLACE INTO test_deps VALUES (?, ?)", (test_id, packed.tobytes()))
+                delta.replace(test_id, previous or array("I"), packed)
             self._apply(delta)
 
     def forget(self, nodeids: Collection[str]) -> None:
@@ -199,16 +203,18 @@ class Store:
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
             delta = _IndexDelta()
-            for test_id, previous in self._rows(nodeids).values():
+            rows = self._rows(nodeids).values()
+            for test_id, previous in rows:
                 delta.replace(test_id, previous, array("I"))
-            self.conn.execute(
-                "DELETE FROM tests WHERE nodeid IN (SELECT value FROM json_each(?))", (json.dumps(list(nodeids)),)
-            )
+            ids = [(test_id,) for test_id, _ in rows]
+            self.conn.executemany("DELETE FROM tests WHERE id = ?", ids)
+            self.conn.executemany("DELETE FROM test_deps WHERE test_id = ?", ids)
             self._apply(delta)
 
     def _rows(self, nodeids: Iterable[str]) -> dict[str, tuple[int, array[int]]]:
         rows = self.conn.execute(
-            "SELECT nodeid, id, deps FROM tests WHERE nodeid IN (SELECT value FROM json_each(?))",
+            "SELECT nodeid, id, deps FROM tests JOIN test_deps ON test_id = id"
+            " WHERE nodeid IN (SELECT value FROM json_each(?))",
             (json.dumps(list(nodeids)),),
         )
         return {nodeid: (i, _ids(blob)) for nodeid, i, blob in rows}

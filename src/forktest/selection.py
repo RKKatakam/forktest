@@ -94,37 +94,59 @@ class ImportGraph:
         self.root = root
         self.fps = fingerprints
         self.known = known_modules or {}
-        self._files: dict[str, frozenset[str]] = {}
+        self._listings: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+        self._basedirs: dict[str, str] = {}
+        self._targets: dict[tuple[str, tuple[str, ...]], frozenset[str]] = {}
         self._direct: dict[str, frozenset[str]] = {}
+        self._reach: dict[str, frozenset[str]] = {}
         self._closure: dict[str, frozenset[str]] = {}
 
-    def _exists(self, relpath: str) -> bool:
-        d, name = posixpath.split(relpath)
-        files = self._files.get(d)
-        if files is None:
-            files = frozenset()
-            if not is_excluded(d):
+    def _listing(self, d: str) -> tuple[frozenset[str], frozenset[str]]:
+        """The files and subdirectories of ``d``. A directory its parent does not list is never scanned."""
+        cached = self._listings.get(d)
+        if cached is None:
+            cached = (frozenset(), frozenset())
+            parent, _, name = d.rpartition("/")
+            if not d or (not is_excluded(d) and name in self._listing(parent)[1]):
+                files, dirs = [], []
                 try:
                     with os.scandir(os.path.join(self.root, d)) as it:
-                        files = frozenset(e.name for e in it if e.is_file())
+                        for e in it:
+                            (files if e.is_file() else dirs if e.is_dir() else []).append(e.name)
                 except OSError:
                     pass
-            self._files[d] = files
-        return name in files
+                cached = (frozenset(files), frozenset(dirs))
+            self._listings[d] = cached
+        return cached
+
+    def _exists(self, relpath: str) -> bool:
+        d, _, name = relpath.rpartition("/")
+        return name in self._listing(d)[0]
 
     def _basedir(self, importer: str) -> str:
-        d = posixpath.dirname(importer)
-        while d and os.path.isfile(os.path.join(self.root, d, "__init__.py")):
+        start = d = posixpath.dirname(importer)
+        cached = self._basedirs.get(start)
+        if cached is not None:
+            return cached
+        while d and self._exists(f"{d}/__init__.py"):
             d = posixpath.dirname(d)
+        self._basedirs[start] = d
         return d
 
-    def _files_for(self, dotted: str, search_dirs: Iterable[str]) -> set[str]:
-        out: set[str] = set()
+    def _files_for(self, dotted: str, search_dirs: tuple[str, ...]) -> frozenset[str]:
+        """Most imports name things, not modules (``from m import a, b``), and many files import the same ones."""
+        key = (dotted, search_dirs)
+        cached = self._targets.get(key)
+        if cached is not None:
+            return cached
         rel = dotted.replace(".", "/")
-        for d in search_dirs:
-            for cand in (posixpath.join(d, rel + ".py"), posixpath.join(d, rel, "__init__.py")):
-                if self._exists(cand):
-                    out.add(cand)
+        out = frozenset(
+            cand
+            for d in search_dirs
+            for cand in ((f"{d}/{rel}.py", f"{d}/{rel}/__init__.py") if d else (f"{rel}.py", f"{rel}/__init__.py"))
+            if self._exists(cand)
+        )
+        self._targets[key] = out
         return out
 
     def resolve(self, stmt: ImportStmt, importer: str) -> set[str]:
@@ -139,14 +161,14 @@ class ImportGraph:
                 parts = stmt.module.split(".")
                 targets += [".".join(parts[:i]) for i in range(1, len(parts))]
             for t in targets:
-                out |= self._files_for(t, [base])
+                out |= self._files_for(t, (base,))
             if self._exists(posixpath.join(base, "__init__.py")):
                 out.add(posixpath.join(base, "__init__.py"))
             return out
         targets = [stmt.module] + [f"{stmt.module}.{n}" for n in stmt.names]
         parts = stmt.module.split(".")
         targets += [".".join(parts[:i]) for i in range(1, len(parts))]
-        search_dirs = ["", "src", self._basedir(importer)]
+        search_dirs = ("", "src", self._basedir(importer))
         for t in targets:
             known = self.known.get(t)
             if known is not None and self._exists(known):
@@ -182,16 +204,61 @@ class ImportGraph:
         cached = self._closure.get(path)
         if cached is not None:
             return cached
-        seen: set[str] = set()
-        stack = [path, *self.conftests_for(path)]
-        while stack:
-            p = stack.pop()
-            if p in seen or not self._exists(p):
-                continue
-            seen.add(p)
-            stack.extend(self.direct(p))
-        result = self._closure[path] = frozenset(seen)
+        roots = [p for p in (path, *self.conftests_for(path)) if self._exists(p)]
+        result = self._closure[path] = frozenset().union(*map(self.reachable, roots))
         return result
+
+    def reachable(self, start: str) -> frozenset[str]:
+        """``start`` and every file it imports, transitively.
+
+        Tarjan's algorithm, iteratively: every member of an import cycle gets
+        the same set, so a project whose package ``__init__`` imports most of
+        it computes that set once rather than once per test file.
+        """
+        done = self._reach
+        if start in done:
+            return done[start]
+        index = {start: 0}
+        low = {start: 0}
+        open_ = [start]
+        on_open = {start}
+        calls = [(start, iter(self.direct(start)))]
+        while calls:
+            node, edges = calls[-1]
+            for nxt in edges:
+                if nxt in done:
+                    continue
+                if nxt not in index:
+                    index[nxt] = low[nxt] = len(index)
+                    open_.append(nxt)
+                    on_open.add(nxt)
+                    calls.append((nxt, iter(self.direct(nxt))))
+                    break
+                if nxt in on_open:
+                    low[node] = min(low[node], index[nxt])
+            else:
+                calls.pop()
+                if calls:
+                    parent = calls[-1][0]
+                    low[parent] = min(low[parent], low[node])
+                if low[node] != index[node]:
+                    continue
+                members = set()
+                while True:
+                    m = open_.pop()
+                    on_open.discard(m)
+                    members.add(m)
+                    if m == node:
+                        break
+                reach = set(members)
+                for m in members:
+                    for nxt in self.direct(m):
+                        if nxt not in members:
+                            reach |= done[nxt]
+                frozen = frozenset(reach)
+                for m in members:
+                    done[m] = frozen
+        return done[start]
 
 
 def dep_changed(dep: Dep, current: FingerprintFn) -> bool:

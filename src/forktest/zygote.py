@@ -197,12 +197,12 @@ class Runner:
         return self._fixture_locs[item.nodeid]
 
     def all_fixture_locs(self) -> frozenset[tuple[str, str]]:
-        """Items share their fixture definitions, so each distinct one is located once."""
+        """Parametrized items share one fixture info, and infos share definitions, so each is visited once."""
         if self._all_fixture_locs is None:
+            infos = {id(info): info for i in self.items if (info := getattr(i, "_fixtureinfo", None)) is not None}
             defs: dict[int, Any] = {}
-            for item in self.items:
-                info = getattr(item, "_fixtureinfo", None)
-                for ds in info.name2fixturedefs.values() if info else ():
+            for info in infos.values():
+                for ds in info.name2fixturedefs.values():
                     defs.update((id(d), d) for d in ds)
             self._all_fixture_locs = frozenset(loc for d in defs.values() if (loc := self._fixture_loc(d)))
         return self._all_fixture_locs

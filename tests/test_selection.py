@@ -1,3 +1,5 @@
+import random
+
 import pytest
 
 from forktest.fingerprint import FILE, MODULE, Fingerprints
@@ -59,6 +61,31 @@ def test_closure_resolves_through_the_test_directory_and_known_modules(project):
     assert not any(p.startswith("pkg/") for p in closure)
     known = ImportGraph(str(project), Fingerprints(str(project)), {"newmod": "src/lib/thing.py"})
     assert "src/lib/thing.py" in known.closure("tests/sub/test_deep.py")
+
+
+class FixedGraph(ImportGraph):
+    def __init__(self, edges):
+        super().__init__("", Fingerprints(""))
+        self.edges = edges
+
+    def direct(self, path):
+        return frozenset(self.edges.get(path, ()))
+
+
+def test_reachable_matches_a_plain_walk_on_graphs_with_cycles():
+    rng = random.Random(3)
+    for trial in range(200):
+        nodes = [f"m{k}.py" for k in range(rng.randint(1, 25))]
+        edges = {n: set(rng.sample(nodes, k=rng.randint(0, min(4, len(nodes))))) - {n} for n in nodes}
+        graph = FixedGraph(edges)
+        for start in rng.sample(nodes, k=len(nodes)):
+            seen, stack = set(), [start]
+            while stack:
+                n = stack.pop()
+                if n not in seen:
+                    seen.add(n)
+                    stack.extend(edges[n])
+            assert graph.reachable(start) == seen, (trial, start, edges)
 
 
 def test_config_file_detection(project):

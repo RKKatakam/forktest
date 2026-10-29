@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, NoReturn
@@ -233,12 +234,17 @@ def run_items(
         for i, item in enumerate(items):
             nextitem = items[i + 1] if i + 1 < len(items) else None
             collector.reports = []
+            started = time.perf_counter()
             recorder.begin()
             # The full hook, not runtestprotocol: plugins such as warnings (filterwarnings marks) wrap it.
             item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
             hits, reads = recorder.end()
             result = asdict(result_of(item.nodeid, collector.reports, project))
-            send({"type": "result", "result": result, **encode(item, hits, reads)})
+            deps = encode(item, hits, reads)
+            # What the scheduler should plan with: the reports' durations leave out building them, which
+            # for a failure or an xfail (formatting the traceback) can be 100 times the test itself.
+            cost = time.perf_counter() - started
+            send({"type": "result", "result": result, "cost": cost, **deps})
     finally:
         pluginmanager.unregister(collector)
 

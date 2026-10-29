@@ -334,7 +334,7 @@ class Runner:
                 if worker is not None:
                     worker.pending.discard(result.nodeid)
                 decoder = in_process if worker is None else worker.decoder
-                records.append(Record(result.nodeid, result.outcome, result.duration, decoder.decode(msg)))
+                records.append(Record(result.nodeid, result.outcome, msg["cost"], decoder.decode(msg)))
                 on_result(result)
                 if result.outcome in ("failed", "error"):
                     failures += 1

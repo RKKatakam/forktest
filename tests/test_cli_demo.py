@@ -191,6 +191,26 @@ def test_json_lines_all_parse_and_junit_is_valid_xml(demo):
     assert len(suite.findall("testcase")) == 12
 
 
+def test_the_schedule_plans_with_what_a_test_cost_and_reports_keep_pytest_durations(demo):
+    with open(demo.root / "conftest.py", "a") as f:
+        f.write(
+            "\n\ndef pytest_runtest_logreport(report):\n"
+            "    if report.when == 'call' and report.nodeid.endswith('test_currency'):\n"
+            "        time.sleep(0.3)\n"
+        )
+    proc = subprocess.run(
+        [sys.executable, "-m", "forktest", "--no-daemon", "--json", "--junitxml", "out.xml", "--all"],
+        cwd=demo.root, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    cases = {c.attrib["name"]: c for c in ET.parse(demo.root / "out.xml").getroot().iter("testcase")}
+    assert float(cases["test_currency"].attrib["time"]) < 0.3
+    db = sqlite3.connect(demo.root / ".forktest" / "store.db")
+    planned = db.execute("SELECT duration FROM tests WHERE nodeid = 'tests/test_config.py::test_currency'").fetchone()[0]
+    db.close()
+    assert planned >= 0.3
+
+
 def test_all_matches_plain_pytest_and_honours_passthrough_args(demo):
     demo.edit("billing/tax.py", "return amount.quantize(quantum, rounding=ROUND_HALF_UP)",
               "return amount.quantize(quantum, rounding=ROUND_HALF_UP) + 1")

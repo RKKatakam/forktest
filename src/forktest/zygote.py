@@ -298,7 +298,6 @@ class Runner:
         if not items:
             return
         records: list[Record] = []
-        closures: dict[str, set[str]] = {}
         config_deps = [Dep(p, FILE, current(p)[FILE]) for p in config_files(self.root) if current(p)]
         maxfail = self.config.getoption("maxfail") or 0
         stopped = False
@@ -311,7 +310,7 @@ class Runner:
                 item = self._item(result.nodeid)
                 if worker is not None:
                     worker.pending.discard(result.nodeid)
-                deps = self.deps_for(item, msg["hits"], msg["reads"], graph, closures, config_deps, current)
+                deps = self.deps_for(item, msg["hits"], msg["reads"], graph, config_deps, current)
                 records.append(Record(result.nodeid, result.outcome, result.duration, deps))
                 on_result(result)
                 if result.outcome in ("failed", "error"):
@@ -434,7 +433,6 @@ class Runner:
         hits: Iterable[Sequence[str]],
         reads: Iterable[str],
         graph: ImportGraph,
-        closures: dict[str, set[str]],
         config_deps: list[Dep],
         current: Callable[[str], dict[str, str] | None],
     ) -> list[Dep]:
@@ -457,10 +455,7 @@ class Runner:
             fp = current(rel) if rel is not None else None
             if rel is not None and fp is not None:
                 deps.add(Dep(rel, FILE, fp[FILE]))
-        test_file = item.nodeid.split("::")[0]
-        if test_file not in closures:
-            closures[test_file] = graph.closure(test_file)
-        for path in closures[test_file]:
+        for path in graph.closure(item.nodeid.split("::")[0]):
             fp = current(path)
             if fp is not None:
                 key = MODULE if MODULE in fp else FILE

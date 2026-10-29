@@ -115,7 +115,7 @@ def why_command(root: str, nodeid: str) -> int:
         fps = Fingerprints(root, store.file_infos())
     finally:
         store.close()
-    reasons = reasons_for(nodeid, view, changed_deps(fps.of), ImportGraph(root, fps), frozenset(), {})
+    reasons = reasons_for(nodeid, view, changed_deps(fps.of), ImportGraph(root, fps), frozenset())
     if not reasons:
         print(f"{nodeid}: not selected (no recorded dependency changed)")
         return 0

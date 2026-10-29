@@ -83,16 +83,33 @@ class ImportGraph:
     system under the project root, ``src/``, and the importing file's own
     top-level directory, which is where pytest's default import mode puts a
     test directory without ``__init__.py``.
+
+    Directory listings, edges and closures are memoized for the life of the
+    instance, so it describes the tree as it was when first asked. Build a
+    new one per run.
     """
 
     def __init__(self, root: str, fingerprints: Fingerprints, known_modules: Mapping[str, str] | None = None) -> None:
         self.root = root
         self.fps = fingerprints
         self.known = known_modules or {}
-        self._direct: dict[str, tuple[str | None, frozenset[str]]] = {}
+        self._files: dict[str, frozenset[str]] = {}
+        self._direct: dict[str, frozenset[str]] = {}
+        self._closure: dict[str, frozenset[str]] = {}
 
     def _exists(self, relpath: str) -> bool:
-        return not is_excluded(relpath) and os.path.isfile(os.path.join(self.root, relpath))
+        d, name = posixpath.split(relpath)
+        files = self._files.get(d)
+        if files is None:
+            files = frozenset()
+            if not is_excluded(d):
+                try:
+                    with os.scandir(os.path.join(self.root, d)) as it:
+                        files = frozenset(e.name for e in it if e.is_file())
+                except OSError:
+                    pass
+            self._files[d] = files
+        return name in files
 
     def _basedir(self, importer: str) -> str:
         d = posixpath.dirname(importer)
@@ -138,17 +155,15 @@ class ImportGraph:
         return out
 
     def direct(self, path: str) -> frozenset[str]:
-        sha = self.fps.sha(path)
         cached = self._direct.get(path)
-        if cached and cached[0] == sha:
-            return cached[1]
+        if cached is not None:
+            return cached
         edges: set[str] = set()
-        if sha is not None and path.endswith(".py"):
+        if path.endswith(".py"):
             for stmt in self.fps.imports_of(path):
                 edges |= self.resolve(stmt, path)
         edges.discard(path)
-        result = frozenset(edges)
-        self._direct[path] = (sha, result)
+        result = self._direct[path] = frozenset(edges)
         return result
 
     def conftests_for(self, path: str) -> list[str]:
@@ -161,8 +176,11 @@ class ImportGraph:
                 out.append(cand)
         return out
 
-    def closure(self, path: str) -> set[str]:
+    def closure(self, path: str) -> frozenset[str]:
         """Every project file the test file's execution can touch at import time."""
+        cached = self._closure.get(path)
+        if cached is not None:
+            return cached
         seen: set[str] = set()
         stack = [path, *self.conftests_for(path)]
         while stack:
@@ -171,7 +189,8 @@ class ImportGraph:
                 continue
             seen.add(p)
             stack.extend(self.direct(p))
-        return seen
+        result = self._closure[path] = frozenset(seen)
+        return result
 
 
 def dep_changed(dep: Dep, current: FingerprintFn) -> bool:
@@ -212,7 +231,6 @@ def reasons_for(
     is_changed: Callable[[Dep], bool],
     graph: ImportGraph,
     fixtures: frozenset[tuple[str, str]],
-    closure_cache: dict[str, set[str]],
 ) -> list[tuple[Reason, Dep | None]]:
     row = view.tests.get(nodeid)
     if row is None:
@@ -222,12 +240,11 @@ def reasons_for(
         out.append((Reason.LAST_FAILED, None))
     deps = view.deps.get(nodeid, [])
     out.extend((classify(d, fixtures), d) for d in deps if is_changed(d))
-    test_file = nodeid.split("::")[0]
-    if test_file not in closure_cache:
-        closure_cache[test_file] = graph.closure(test_file)
     recorded_modules = {d.path for d in deps if d.qualname in (MODULE, FILE)}
     out.extend(
-        (Reason.IMPORT_GRAPH, Dep(p, MODULE, "")) for p in sorted(closure_cache[test_file]) if p not in recorded_modules
+        (Reason.IMPORT_GRAPH, Dep(p, MODULE, ""))
+        for p in sorted(graph.closure(nodeid.split("::")[0]))
+        if p not in recorded_modules
     )
     return out
 
@@ -241,11 +258,10 @@ def select(
     fixtures: frozenset[tuple[str, str]] = frozenset(),
 ) -> dict[str, Reason]:
     """Map each affected nodeid to the highest-priority reason it is selected."""
-    closures: dict[str, set[str]] = {}
     is_changed = changed_deps(current)
     out: dict[str, Reason] = {}
     for nodeid in nodeids:
-        reasons = reasons_for(nodeid, view, is_changed, graph, fixtures, closures)
+        reasons = reasons_for(nodeid, view, is_changed, graph, fixtures)
         if reasons:
             out[nodeid] = min((r for r, _ in reasons), key=PRIORITY.index)
     return out

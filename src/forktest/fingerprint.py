@@ -10,7 +10,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import NamedTuple
 
 MODULE = "<module>"
@@ -54,15 +54,6 @@ def _defs(node: ast.AST, prefix: str) -> Iterator[tuple[str, ast.AST]]:
             yield from _defs(child, prefix)
 
 
-def fingerprint(source: bytes | str) -> dict[str, str]:
-    tree = ast.parse(source)
-    _strip_docstrings(tree)
-    out = {qualname: _hash_node(node) for qualname, node in _defs(tree, "")}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            node.body = [ast.Expr(ast.Constant(...))]
-    out[MODULE] = _hash_node(tree)
-    return out
 
 
 def normalize_qualname(qualname: str, fp: dict[str, str]) -> str:
@@ -87,8 +78,12 @@ class ImportStmt(NamedTuple):
 
 
 def imports(source: bytes | str) -> list[ImportStmt]:
+    return _imports(ast.parse(source))
+
+
+def _imports(tree: ast.AST) -> list[ImportStmt]:
     out: list[ImportStmt] = []
-    for node in ast.walk(ast.parse(source)):
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             out.extend(ImportStmt(alias.name, 0, ()) for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -97,22 +92,49 @@ def imports(source: bytes | str) -> list[ImportStmt]:
     return out
 
 
+def analyze(source: bytes | str) -> tuple[dict[str, str], list[ImportStmt]]:
+    """The fingerprint and the import statements of one source, from a single parse."""
+    tree = ast.parse(source)
+    found = _imports(tree)
+    _strip_docstrings(tree)
+    out = {qualname: _hash_node(node) for qualname, node in _defs(tree, "")}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            node.body = [ast.Expr(ast.Constant(...))]
+    out[MODULE] = _hash_node(tree)
+    return out, found
+
+
+def fingerprint(source: bytes | str) -> dict[str, str]:
+    return analyze(source)[0]
+
+
+class FileInfo(NamedTuple):
+    sha: str
+    fingerprint: dict[str, str]
+    imports: list[ImportStmt]
+
+
 class Fingerprints:
-    """Current fingerprints of files under ``root``, cached by content hash.
+    """Current fingerprints of files under ``root``.
 
     ``of(path)`` returns ``None`` for a missing file, the function map for a
     ``.py`` file, and ``{"<file>": sha}`` for anything else. A ``.py`` file
     that does not parse gets a single ``<module>`` entry derived from its
     content, so every dependent function counts as changed.
+
+    ``known`` holds infos from an earlier process, keyed by path. One is
+    reused only while the file's content sha still matches, and every info
+    computed here is collected in ``fresh`` so the caller can persist it.
     """
 
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str, known: Mapping[str, FileInfo] | None = None) -> None:
         self.root = root
-        self._by_sha: dict[str, dict[str, str]] = {}
-        self._imports_by_sha: dict[str, list[ImportStmt]] = {}
-        self._by_path: dict[str, tuple[int, int, str]] = {}
+        self.known = dict(known or {})
+        self.fresh: dict[str, FileInfo] = {}
+        self._by_path: dict[str, tuple[int, int, FileInfo]] = {}
 
-    def sha(self, path: str) -> str | None:
+    def info(self, path: str) -> FileInfo | None:
         full = os.path.join(self.root, path)
         try:
             st = os.stat(full)
@@ -128,35 +150,29 @@ class Fingerprints:
         except OSError:
             return None
         sha = content_hash(data)
-        self._by_path[path] = (st.st_mtime_ns, st.st_size, sha)
-        if sha not in self._by_sha:
-            self._by_sha[sha] = self._compute(path, data, sha)
-        return sha
+        info = self.known.get(path)
+        if info is None or info.sha != sha:
+            info = self.known[path] = self.fresh[path] = _compute(path, data, sha)
+        self._by_path[path] = (st.st_mtime_ns, st.st_size, info)
+        return info
+
+    def sha(self, path: str) -> str | None:
+        info = self.info(path)
+        return None if info is None else info.sha
 
     def of(self, path: str) -> dict[str, str] | None:
-        sha = self.sha(path)
-        return None if sha is None else self._by_sha[sha]
+        info = self.info(path)
+        return None if info is None else info.fingerprint
 
     def imports_of(self, path: str) -> list[ImportStmt]:
-        sha = self.sha(path)
-        if sha is None or not path.endswith(".py"):
-            return []
-        if sha not in self._imports_by_sha:
-            try:
-                self._imports_by_sha[sha] = imports(self.read(path))
-            except (SyntaxError, ValueError):
-                self._imports_by_sha[sha] = []
-        return self._imports_by_sha[sha]
+        info = self.info(path)
+        return [] if info is None else info.imports
 
-    def read(self, path: str) -> bytes:
-        with open(os.path.join(self.root, path), "rb") as f:
-            return f.read()
 
-    @staticmethod
-    def _compute(path: str, data: bytes, sha: str) -> dict[str, str]:
-        if not path.endswith(".py"):
-            return {FILE: sha}
-        try:
-            return fingerprint(data)
-        except (SyntaxError, ValueError):
-            return {MODULE: "unparseable:" + sha}
+def _compute(path: str, data: bytes, sha: str) -> FileInfo:
+    if not path.endswith(".py"):
+        return FileInfo(sha, {FILE: sha}, [])
+    try:
+        return FileInfo(sha, *analyze(data))
+    except (SyntaxError, ValueError):
+        return FileInfo(sha, {MODULE: "unparseable:" + sha}, [])

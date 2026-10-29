@@ -140,3 +140,17 @@ def test_fingerprints_cache_tracks_edits_and_non_python_files(tmp_path):
     (tmp_path / "broken.py").write_text("def (:\n")
     assert set(fps.of("broken.py")) == {MODULE}
     assert fps.imports_of("m.py") == []
+
+
+def test_known_infos_are_reused_only_while_the_content_matches(tmp_path):
+    (tmp_path / "m.py").write_text("import os\n\ndef f():\n    return 1\n")
+    cold = Fingerprints(str(tmp_path))
+    info = cold.info("m.py")
+    assert cold.fresh == {"m.py": info} and info.imports == [ImportStmt("os", 0, ())]
+    planted = info._replace(fingerprint={MODULE: "from the store"})
+    warm = Fingerprints(str(tmp_path), {"m.py": planted})
+    assert warm.of("m.py") == {MODULE: "from the store"} and warm.fresh == {}
+    (tmp_path / "m.py").write_text("def f():\n    return 2\n")
+    stale = Fingerprints(str(tmp_path), {"m.py": planted})
+    assert set(stale.of("m.py")) == {MODULE, "f"} and stale.imports_of("m.py") == []
+    assert stale.fresh["m.py"].sha != info.sha

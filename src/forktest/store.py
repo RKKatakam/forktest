@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import subprocess
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from forktest.fingerprint import FILE, content_hash, fingerprint
+from forktest.fingerprint import FILE, FileInfo, ImportStmt, content_hash, fingerprint
 
 
 class Dep(NamedTuple):
@@ -60,6 +61,8 @@ CREATE TABLE IF NOT EXISTS deps(
     nodeid TEXT NOT NULL, path TEXT NOT NULL, qualname TEXT NOT NULL, hash TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS deps_nodeid ON deps(nodeid);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS files(
+    path TEXT PRIMARY KEY, sha TEXT NOT NULL, fingerprint TEXT NOT NULL, imports TEXT NOT NULL);
 """
 
 
@@ -94,6 +97,21 @@ class Store:
                 self.conn.executemany(
                     "INSERT INTO deps VALUES (?, ?, ?, ?)", [(r.nodeid, *d) for d in set(r.deps)]
                 )
+
+    def file_infos(self) -> dict[str, FileInfo]:
+        return {
+            path: FileInfo(sha, json.loads(fp), [ImportStmt(m, level, tuple(names)) for m, level, names in json.loads(imps)])
+            for path, sha, fp, imps in self.conn.execute("SELECT path, sha, fingerprint, imports FROM files")
+        }
+
+    def save_file_infos(self, infos: Mapping[str, FileInfo]) -> None:
+        if not infos:
+            return
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)",
+                [(path, i.sha, json.dumps(i.fingerprint), json.dumps(i.imports)) for path, i in infos.items()],
+            )
 
     def meta_get(self, key: str) -> str | None:
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()

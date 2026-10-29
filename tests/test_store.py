@@ -1,3 +1,4 @@
+from forktest.fingerprint import FileInfo, ImportStmt
 from forktest.store import Dep, Record, Store, StoreView, TestRow
 
 
@@ -36,3 +37,17 @@ def test_rebased_view_replaces_hashes_and_marks_missing_as_changed():
     rebased = view.rebased(lambda path, q: "old" if path == "a.py" else None)
     assert rebased.deps["t::x"] == [Dep("a.py", "f", "old"), Dep("b.py", "g", "")]
     assert view.deps["t::x"][0].hash == "cur"
+
+
+def test_file_infos_survive_a_reopen_and_replace_by_path(tmp_path):
+    path = str(tmp_path / "store.db")
+    store = Store(path)
+    old = FileInfo("s1", {"<module>": "m1", "f": "h1"}, [ImportStmt("a.b", 0, ()), ImportStmt("", 1, ("x", "y"))])
+    new = FileInfo("s2", {"<module>": "m2"}, [])
+    store.save_file_infos({"m.py": old, "data.json": FileInfo("s3", {"<file>": "s3"}, [])})
+    store.save_file_infos({"m.py": new})
+    store.close()
+    assert Store(path).file_infos() == {"m.py": new, "data.json": FileInfo("s3", {"<file>": "s3"}, [])}
+    reopened = Store(path)
+    reopened.save_file_infos({"m.py": old})
+    assert reopened.file_infos()["m.py"] == old

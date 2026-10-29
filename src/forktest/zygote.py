@@ -122,8 +122,8 @@ class Runner:
         self.collect_errors = collect_errors
         self.root = os.path.realpath(str(self.config.rootpath))
         self.project = ProjectFiles(self.root)
-        self.fps = Fingerprints(self.root)
         self.store = Store(os.path.join(self.root, ".forktest", "store.db"))
+        self.fps = Fingerprints(self.root, self.store.file_infos())
         self.recorder = Recorder(self.project)
         self.recorder.install_audit_hook()
         self.worker_pids: set[int] = set()
@@ -184,6 +184,19 @@ class Runner:
         should_cancel: Callable[[], bool] = lambda: True,
     ) -> None:
         """Run one request. When ``wake_fd`` turns readable, ``should_cancel`` decides whether to stop."""
+        try:
+            self._run(req, emit, wake_fd, should_cancel)
+        finally:
+            self.store.save_file_infos(self.fps.fresh)
+            self.fps.fresh = {}
+
+    def _run(
+        self,
+        req: Request,
+        emit: Emit,
+        wake_fd: int | None,
+        should_cancel: Callable[[], bool],
+    ) -> None:
         t0 = time.perf_counter()
         for error in self.collect_errors:
             emit(error)

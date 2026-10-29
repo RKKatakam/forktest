@@ -112,9 +112,9 @@ def why_command(root: str, nodeid: str) -> int:
     store = Store(os.path.join(root, ".forktest", "store.db"))
     try:
         view = store.view()
+        fps = Fingerprints(root, store.file_infos())
     finally:
         store.close()
-    fps = Fingerprints(root)
     reasons = reasons_for(nodeid, view, fps.of, ImportGraph(root, fps), frozenset(), {})
     if not reasons:
         print(f"{nodeid}: not selected (no recorded dependency changed)")

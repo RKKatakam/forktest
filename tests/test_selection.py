@@ -4,7 +4,7 @@ import pytest
 
 from forktest.fingerprint import FILE, MODULE, Fingerprints
 from forktest.selection import PRIORITY, ImportGraph, Reason, config_files, explain, is_config_file, select
-from forktest.store import Dep, Record, Store
+from forktest.store import Dep, Deps, Record, Store
 
 FILES = {
     "pyproject.toml": "[tool.pytest.ini_options]\n",
@@ -31,6 +31,10 @@ def project(tmp_path):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text)
     return tmp_path
+
+
+def rec(nodeid, outcome, duration, deps):
+    return Record(nodeid, outcome, duration, Deps.of(deps))
 
 
 def graph_for(root):
@@ -117,7 +121,7 @@ def baseline(root, extra=()):
 def recorded_view(root, outcome="passed", only=None, extra=()):
     store = Store(str(root / ".forktest" / "store.db"))
     deps = baseline(root, extra)
-    store.record(Record(n, outcome if n == NODE else "passed", 0.1, ds) for n, ds in deps.items() if only is None or n in only)
+    store.record(rec(n, outcome if n == NODE else "passed", 0.1, ds) for n, ds in deps.items() if only is None or n in only)
     return store.view()
 
 

@@ -18,7 +18,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
@@ -27,7 +27,7 @@ from forktest.events import CollectError, Done, Event, Miss, Request, Selection,
 from forktest.fingerprint import FILE, MODULE, Fingerprints, normalize_qualname
 from forktest.selection import ImportGraph, Reason, config_files, select
 from forktest.store import Dep, GitBaseline, Record, Store, StoreView
-from forktest.worker import ProjectFiles, Recorder, run_items, worker_main
+from forktest.worker import DepDecoder, DepEncoder, ProjectFiles, Recorder, run_items, worker_main
 
 Emit = Callable[[Event], None]
 
@@ -135,6 +135,7 @@ class _Worker:
     buf: bytes = b""
     done: bool = False
     crash: str | None = None
+    decoder: DepDecoder = field(default_factory=DepDecoder)
 
 
 class Runner:
@@ -303,7 +304,25 @@ class Runner:
         if not items:
             return
         records: list[Record] = []
-        config_deps = [Dep(p, FILE, current(p)[FILE]) for p in config_files(self.root) if current(p)]
+        config_deps = frozenset(Dep(p, FILE, fp[FILE]) for p in config_files(self.root) if (fp := current(p)))
+        base: dict[str, frozenset[Dep]] = {}
+
+        def base_for(test_file: str) -> frozenset[Dep]:
+            if test_file not in base:
+                base[test_file] = config_deps | self.module_deps(graph.closure(test_file), current)
+            return base[test_file]
+
+        def deps_of(item: pytest.Item, hits: Iterable[Sequence[str]], reads: Iterable[str]) -> list[Dep]:
+            return self.deps_for(item, hits, reads, base_for(item.nodeid.split("::")[0]), current)
+
+        # Workers are forks: what is fingerprinted here is done once and persisted, not once per worker and lost.
+        for test_file in {item.nodeid.split("::")[0] for item in items}:
+            base_for(test_file)
+        for path in {d.path for d in view.keys.values()}:
+            current(path)
+
+        encoder = DepEncoder(deps_of, {nodeid: row.digest for nodeid, row in view.tests.items()})
+        in_process = DepDecoder()
         maxfail = self.config.getoption("maxfail") or 0
         stopped = False
         failures = 0
@@ -312,11 +331,10 @@ class Runner:
             nonlocal failures, stopped
             if msg["type"] == "result":
                 result = TestResult(**msg["result"])
-                item = self._item(result.nodeid)
                 if worker is not None:
                     worker.pending.discard(result.nodeid)
-                deps = self.deps_for(item, msg["hits"], msg["reads"], graph, config_deps, current)
-                records.append(Record(result.nodeid, result.outcome, result.duration, deps))
+                decoder = in_process if worker is None else worker.decoder
+                records.append(Record(result.nodeid, result.outcome, result.duration, decoder.decode(msg)))
                 on_result(result)
                 if result.outcome in ("failed", "error"):
                     failures += 1
@@ -332,14 +350,14 @@ class Runner:
             if req.strict or self._threads_block_fork():
                 self.recorder.start()
                 try:
-                    run_items(items, lambda msg: handle(msg, None), self.recorder, self.project)
+                    run_items(items, lambda msg: handle(msg, None), self.recorder, self.project, encoder.encode)
                 finally:
                     self.recorder.stop()
             else:
                 workers = req.workers or os.cpu_count() or 2
                 failed = {n for n, row in view.tests.items() if row.outcome in ("failed", "error")}
                 batches = schedule(items, lambda n: view.tests[n].duration if n in view.tests else 0.01, failed, workers)
-                self._run_forked(batches, nice, handle, cancel, lambda: stopped, on_result)
+                self._run_forked(batches, nice, handle, cancel, lambda: stopped, on_result, encoder.encode)
         finally:
             self.store.record(records)
             self.store.meta_set("preimport", json.dumps(self.third_party_modules()))
@@ -360,11 +378,6 @@ class Runner:
         if extra > 0:
             sys.stderr.write(f"forktest: {extra} extra thread(s) alive in the zygote; running in-process instead of forking\n")
         return extra > 0
-
-    def _item(self, nodeid: str) -> pytest.Item:
-        if not hasattr(self, "_by_nodeid"):
-            self._by_nodeid = {i.nodeid: i for i in self.items}
-        return self._by_nodeid[nodeid]
 
     def _reinit_capture(self) -> None:
         capman = self.config.pluginmanager.getplugin("capturemanager")
@@ -388,6 +401,7 @@ class Runner:
         cancel: tuple[int | None, Callable[[], bool]],
         stopped: Callable[[], bool],
         on_result: Callable[[TestResult], None],
+        encode: Callable[[pytest.Item, set[tuple[str, str]], set[str]], dict[str, Any]],
     ) -> None:
         wake_fd, should_cancel = cancel
         sel = selectors.DefaultSelector()
@@ -401,7 +415,7 @@ class Runner:
                     os.close(r)
                     for other in workers:
                         os.close(other)
-                    worker_main(batch, w, self.recorder, self.project, self._reinit_capture, nice)
+                    worker_main(batch, w, self.recorder, self.project, self._reinit_capture, nice, encode)
                 os.close(w)
                 workers[r] = _Worker(pid, batch, {i.nodeid for i in batch})
                 self.worker_pids.add(pid)
@@ -443,16 +457,25 @@ class Runner:
                 os.waitpid(worker.pid, 0)
                 self.worker_pids.discard(worker.pid)
 
+    def module_deps(self, paths: Iterable[str], current: Callable[[str], dict[str, str] | None]) -> frozenset[Dep]:
+        out = set()
+        for path in paths:
+            fp = current(path)
+            if fp is not None:
+                key = MODULE if MODULE in fp else FILE
+                out.add(Dep(path, key, fp[key]))
+        return frozenset(out)
+
     def deps_for(
         self,
         item: pytest.Item,
         hits: Iterable[Sequence[str]],
         reads: Iterable[str],
-        graph: ImportGraph,
-        config_deps: list[Dep],
+        base: frozenset[Dep],
         current: Callable[[str], dict[str, str] | None],
     ) -> list[Dep]:
-        deps: set[Dep] = set(config_deps)
+        """``base`` holds what every test of the file shares: the config files and the import closure."""
+        deps: set[Dep] = set(base)
 
         def add_function(rel: str, qualname: str) -> None:
             fp = current(rel)
@@ -471,12 +494,7 @@ class Runner:
             fp = current(rel) if rel is not None else None
             if rel is not None and fp is not None:
                 deps.add(Dep(rel, FILE, fp[FILE]))
-        for path in graph.closure(item.nodeid.split("::")[0]):
-            fp = current(path)
-            if fp is not None:
-                key = MODULE if MODULE in fp else FILE
-                deps.add(Dep(path, key, fp[key]))
-        return sorted(deps)
+        return list(deps)
 
 
 def _ms(t0: float) -> int:

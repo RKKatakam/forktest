@@ -109,6 +109,30 @@ def test_function_body_edit_selects_exactly_the_tests_that_execute_it(demo):
     assert demo.pytest_counts() == {"failed": 7, "passed": 9}
 
 
+def test_full_runs_update_every_row_and_re_record_only_tests_whose_deps_changed(demo):
+    def last_runs():
+        db = sqlite3.connect(demo.root / ".forktest" / "store.db")
+        try:
+            return dict(db.execute("SELECT nodeid, last_run FROM tests"))
+        finally:
+            db.close()
+
+    body = "return amount.quantize(quantum, rounding=ROUND_HALF_UP)"
+    before = last_runs()
+    demo.edit("billing/tax.py", body, body + " + 0")
+    for args in (("--all",), ("--all", "--strict-pytest")):
+        events, rc = demo.forktest(*args)
+        assert rc == 0 and done(events).passed == 16, args
+        after = last_runs()
+        assert after.keys() == before.keys() and all(after[n] > before[n] for n in before), args
+        before = after
+    events, _ = demo.forktest()
+    assert selection(events).selected == 0
+    demo.edit("billing/tax.py", body + " + 0", body)
+    events, _ = demo.forktest()
+    assert selection(events).reasons == {"coverage": len(ROUND_VAT_EXECUTORS)}
+
+
 def test_docstring_edit_selects_nothing(demo):
     demo.edit("billing/tax.py", '"""Round to the configured number of places, half up."""', '"""Rounds half up."""')
     events, rc = demo.forktest("--verify-selection")

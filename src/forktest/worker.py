@@ -6,7 +6,7 @@ import json
 import os
 import signal
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, NoReturn
 
@@ -15,6 +15,7 @@ from _pytest.reports import TestReport
 import forktest
 from forktest.events import Frame, TestResult
 from forktest.selection import is_excluded
+from forktest.store import Dep, Deps, dep_hash, deps_digest
 
 
 class ProjectFiles:
@@ -172,7 +173,57 @@ class _ReportCollector:
         self.reports.append(report)
 
 
-def run_items(items: Sequence[Any], send: Callable[[dict[str, Any]], None], recorder: Recorder, project: ProjectFiles) -> None:
+class DepEncoder:
+    """Worker side of the dependency wire format.
+
+    A test whose dependency set has the digest the store already holds sends
+    nothing. Otherwise each dependency goes over the pipe once per worker, as
+    ``keys``, and a test's set is a list of those keys' positions.
+    """
+
+    def __init__(self, deps_of: Callable[[Any, set[tuple[str, str]], set[str]], list[Dep]], previous: Mapping[str, str]) -> None:
+        self.deps_of = deps_of
+        self.previous = previous
+        self.ids: dict[Dep, int] = {}
+        self.hashes = _Hashes()
+
+    def encode(self, item: Any, hits: set[tuple[str, str]], reads: set[str]) -> dict[str, Any]:
+        deps = self.deps_of(item, hits, reads)
+        digest = deps_digest(deps, self.hashes.__getitem__)
+        if self.previous.get(item.nodeid) == digest:
+            return {}
+        new = [d for d in deps if d not in self.ids]
+        for d in new:
+            self.ids[d] = len(self.ids)
+        return {"digest": digest, "keys": new, "deps": [self.ids[d] for d in deps]}
+
+
+class _Hashes(dict[Dep, int]):
+    def __missing__(self, dep: Dep) -> int:
+        h = self[dep] = dep_hash(dep)
+        return h
+
+
+class DepDecoder:
+    """Parent side of ``DepEncoder``, one per worker."""
+
+    def __init__(self) -> None:
+        self.keys: list[Dep] = []
+
+    def decode(self, msg: Mapping[str, Any]) -> Deps | None:
+        if "digest" not in msg:
+            return None
+        self.keys.extend(Dep(*k) for k in msg["keys"])
+        return Deps([self.keys[i] for i in msg["deps"]], msg["digest"])
+
+
+def run_items(
+    items: Sequence[Any],
+    send: Callable[[dict[str, Any]], None],
+    recorder: Recorder,
+    project: ProjectFiles,
+    encode: Callable[[Any, set[tuple[str, str]], set[str]], dict[str, Any]],
+) -> None:
     if not items:
         return
     collector = _ReportCollector()
@@ -186,14 +237,8 @@ def run_items(items: Sequence[Any], send: Callable[[dict[str, Any]], None], reco
             # The full hook, not runtestprotocol: plugins such as warnings (filterwarnings marks) wrap it.
             item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
             hits, reads = recorder.end()
-            send(
-                {
-                    "type": "result",
-                    "result": asdict(result_of(item.nodeid, collector.reports, project)),
-                    "hits": sorted(hits),
-                    "reads": sorted(reads),
-                }
-            )
+            result = asdict(result_of(item.nodeid, collector.reports, project))
+            send({"type": "result", "result": result, **encode(item, hits, reads)})
     finally:
         pluginmanager.unregister(collector)
 
@@ -205,6 +250,7 @@ def worker_main(
     project: ProjectFiles,
     reinit_capture: Callable[[], None],
     nice: bool,
+    encode: Callable[[Any, set[tuple[str, str]], set[str]], dict[str, Any]],
 ) -> NoReturn:
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -219,7 +265,7 @@ def worker_main(
             os.nice(10)
         reinit_capture()
         recorder.start()
-        run_items(items, send, recorder, project)
+        run_items(items, send, recorder, project, encode)
         send({"type": "done"})
     except BaseException as exc:
         try:

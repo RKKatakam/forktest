@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import sqlite3
@@ -23,11 +24,31 @@ class Dep(NamedTuple):
     hash: str
 
 
+class Deps(NamedTuple):
+    keys: list[Dep]
+    digest: str
+
+    @classmethod
+    def of(cls, deps: Iterable[Dep]) -> Deps:
+        keys = sorted(set(deps))
+        return cls(keys, deps_digest(keys))
+
+
+def dep_hash(dep: Dep) -> int:
+    return int.from_bytes(hashlib.blake2b("\0".join(dep).encode(), digest_size=16).digest())
+
+
+def deps_digest(deps: Collection[Dep], hash_of: Callable[[Dep], int] = dep_hash) -> str:
+    """The sum of the distinct deps' hashes mod 2**128, which needs no sort, so workers can cache each dep's hash."""
+    return format(sum(map(hash_of, deps)) & ((1 << 128) - 1), "032x")
+
+
 class Record(NamedTuple):
     nodeid: str
     outcome: str
     duration: float
-    deps: list[Dep]
+    deps: Deps | None
+    """``None`` when the test's dependency set has the digest stored for it."""
 
 
 class TestRow(NamedTuple):
@@ -36,6 +57,7 @@ class TestRow(NamedTuple):
     duration: float
     last_run: float
     modules: int
+    digest: str
 
 
 def _ids(blob: bytes) -> array[int]:
@@ -84,11 +106,11 @@ class StoreView:
         return dataclasses.replace(self, keys=keys)
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tests(
     id INTEGER PRIMARY KEY, nodeid TEXT NOT NULL UNIQUE, outcome TEXT NOT NULL, duration REAL NOT NULL,
-    last_run REAL NOT NULL, modules INTEGER NOT NULL);
+    last_run REAL NOT NULL, modules INTEGER NOT NULL, digest TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS test_deps(test_id INTEGER PRIMARY KEY, deps BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS dep_keys(
     id INTEGER PRIMARY KEY, path TEXT NOT NULL, qualname TEXT NOT NULL, hash TEXT NOT NULL,
@@ -145,9 +167,9 @@ class Store:
         keys = {i: Dep(p, q, h) for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
         sets = {i: frozenset(json.loads(paths)) for i, paths in self.conn.execute("SELECT id, paths FROM module_sets")}
         tests = {
-            nodeid: TestRow(i, outcome, duration, last_run, modules)
-            for i, nodeid, outcome, duration, last_run, modules in self.conn.execute(
-                "SELECT id, nodeid, outcome, duration, last_run, modules FROM tests"
+            nodeid: TestRow(i, outcome, duration, last_run, modules, digest)
+            for i, nodeid, outcome, duration, last_run, modules, digest in self.conn.execute(
+                "SELECT id, nodeid, outcome, duration, last_run, modules, digest FROM tests"
             )
         }
         return StoreView(tests, keys, sets, self.conn)
@@ -160,42 +182,50 @@ class Store:
         with self.conn:
             # The index is read, patched and written back, so take the write lock before the first read.
             self.conn.execute("BEGIN IMMEDIATE")
-            key_ids = {Dep(p, q, h): i for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
-            set_ids = {paths: i for i, paths in self.conn.execute("SELECT id, paths FROM module_sets")}
-            old = self._rows(latest)
-            delta = _IndexDelta()
-            for r in latest.values():
-                ids = []
-                for d in set(r.deps):
-                    i = key_ids.get(d)
-                    if i is None:
-                        i = key_ids[d] = self.conn.execute(
-                            "INSERT INTO dep_keys(path, qualname, hash) VALUES (?, ?, ?)", d
-                        ).lastrowid
-                    ids.append(i)
-                packed = array("I", sorted(ids))
-                paths = json.dumps(sorted({d.path for d in r.deps if d.qualname in (MODULE, FILE)}))
-                modules = set_ids.get(paths)
-                if modules is None:
-                    modules = set_ids[paths] = self.conn.execute(
-                        "INSERT INTO module_sets(paths) VALUES (?)", (paths,)
+            self.conn.executemany(
+                "UPDATE tests SET outcome = ?, duration = ?, last_run = ? WHERE nodeid = ?",
+                [(r.outcome, r.duration, now, r.nodeid) for r in latest.values() if r.deps is None],
+            )
+            changed = [r for r in latest.values() if r.deps is not None]
+            if changed:
+                self._record_deps(changed, now)
+
+    def _record_deps(self, records: list[Record], now: float) -> None:
+        key_ids = {Dep(p, q, h): i for i, p, q, h in self.conn.execute("SELECT id, path, qualname, hash FROM dep_keys")}
+        set_ids = {paths: i for i, paths in self.conn.execute("SELECT id, paths FROM module_sets")}
+        old = self._rows(r.nodeid for r in records)
+        delta = _IndexDelta()
+        for r in records:
+            ids = []
+            for d in r.deps.keys:
+                i = key_ids.get(d)
+                if i is None:
+                    i = key_ids[d] = self.conn.execute(
+                        "INSERT INTO dep_keys(path, qualname, hash) VALUES (?, ?, ?)", d
                     ).lastrowid
-                row = (r.outcome, r.duration, now, modules)
-                if r.nodeid in old:
-                    test_id, previous = old[r.nodeid]
-                    self.conn.execute(
-                        "UPDATE tests SET outcome = ?, duration = ?, last_run = ?, modules = ? WHERE id = ?", (*row, test_id)
-                    )
-                else:
-                    test_id = self.conn.execute(
-                        "INSERT INTO tests(outcome, duration, last_run, modules, nodeid) VALUES (?, ?, ?, ?, ?)",
-                        (*row, r.nodeid),
-                    ).lastrowid
-                    previous = None
-                if previous != packed:
-                    self.conn.execute("INSERT OR REPLACE INTO test_deps VALUES (?, ?)", (test_id, packed.tobytes()))
-                delta.replace(test_id, previous or array("I"), packed)
-            self._apply(delta)
+                ids.append(i)
+            packed = array("I", sorted(ids))
+            paths = json.dumps(sorted({d.path for d in r.deps.keys if d.qualname in (MODULE, FILE)}))
+            modules = set_ids.get(paths)
+            if modules is None:
+                modules = set_ids[paths] = self.conn.execute("INSERT INTO module_sets(paths) VALUES (?)", (paths,)).lastrowid
+            row = (r.outcome, r.duration, now, modules, r.deps.digest)
+            previous = None
+            if r.nodeid in old:
+                test_id, previous = old[r.nodeid]
+                self.conn.execute(
+                    "UPDATE tests SET outcome = ?, duration = ?, last_run = ?, modules = ?, digest = ? WHERE id = ?",
+                    (*row, test_id),
+                )
+            else:
+                test_id = self.conn.execute(
+                    "INSERT INTO tests(outcome, duration, last_run, modules, digest, nodeid) VALUES (?, ?, ?, ?, ?, ?)",
+                    (*row, r.nodeid),
+                ).lastrowid
+            if previous != packed:
+                self.conn.execute("INSERT OR REPLACE INTO test_deps VALUES (?, ?)", (test_id, packed.tobytes()))
+            delta.replace(test_id, previous or array("I"), packed)
+        self._apply(delta)
 
     def forget(self, nodeids: Collection[str]) -> None:
         """Drop tests that no longer exist, and every key only they used."""

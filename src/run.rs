@@ -589,22 +589,23 @@ impl Project {
                 if let Some(p) = &partial {
                     log(|| format!("collecting {} files: {}", p.files.len(), p.files.join(" ")));
                 }
-                let policy = match (req.fork_from, full, args_meta.fork_point.as_deref()) {
-                    (Some(p), _, _) => ForkPolicy::Force(p),
-                    // A partial run trusts where the last run of these args could fork from; a full one checks again.
-                    (None, None, Some("imported")) => ForkPolicy::Force(ForkPoint::Imported),
-                    (None, None, Some("spawn")) => ForkPolicy::Force(ForkPoint::Spawn),
-                    _ => ForkPolicy::Auto,
+                // Where the last full collection of these args could fork from. A partial run that needs no L1 trusts
+                // it; any L1 is still thread-checked, and only a full collection records a new answer.
+                let known_fork_point = match (req.fork_from, full, args_meta.fork_point.as_deref()) {
+                    (Some(p), _, _) => Some(p),
+                    (None, None, Some("imported")) => Some(ForkPoint::Imported),
+                    (None, None, Some("spawn")) => Some(ForkPoint::Spawn),
+                    _ => None,
                 };
                 self.warm = None;
                 let seen = if partial.is_none() { self.content_hashes(&project) } else { HashMap::new() };
                 // Workers that collect their own files need no L1 when the inventory already names every test to run.
-                let no_l1 = matches!(policy, ForkPolicy::Force(ForkPoint::Imported | ForkPoint::Spawn))
-                    && !req.strict
-                    && partial.as_ref().is_some_and(|p| p.files.iter().all(|f| narrowed.contains(f)));
-                let session = self.session_for(req, policy, &project)?;
-                let collected = if no_l1 {
+                let no_l1 = known_fork_point.filter(|p| matches!(p, ForkPoint::Imported | ForkPoint::Spawn))
+                    .filter(|_| !req.strict && partial.as_ref().is_some_and(|p| p.files.iter().all(|f| narrowed.contains(f))));
+                let session = self.session_for(req, full_policy(req), &project)?;
+                let collected = if let Some(fork_point) = no_l1 {
                     session.drop_l1();
+                    session.assume_fork_point(fork_point);
                     let only = &partial.as_ref().expect("checked above").only;
                     let path_of: HashMap<&str, &str> =
                         inventory.iter().flat_map(|r| r.nodeids.iter().map(|n| (n.as_str(), &*r.path))).collect();
@@ -712,7 +713,7 @@ impl Project {
         let session = &mut self.session.as_mut().expect("started above").1;
         let mut tally = Tally::default();
         let executed = run.execute(session, &selected, req.nice, learned, emit, &mut |r| tally.add(r.outcome));
-        if let Some(args) = &mut learned.args {
+        if !partial && let Some(args) = &mut learned.args {
             args.fork_point = Some(fork_point_name(session.fork_point()).into());
         }
         executed?;

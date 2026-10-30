@@ -651,6 +651,16 @@ impl Session {
         self.fork_point
     }
 
+    /// Workers fork from `point` with no collection first, because an earlier full collection of these args found
+    /// L1 unsafe. The usual thread check of L0 still runs before each fork.
+    pub fn assume_fork_point(&mut self, point: ForkPoint) {
+        self.fork_point = match point {
+            ForkPoint::Collected => return,
+            ForkPoint::Imported if self.l0.is_some() => ForkPoint::Imported,
+            _ => ForkPoint::Spawn,
+        };
+    }
+
     pub fn l1_pid(&self) -> Option<i32> {
         self.l1.as_ref().map(|l1| l1.pid)
     }

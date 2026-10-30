@@ -40,6 +40,14 @@ def zygote(project: Project) -> tuple[str, str] | None:
     return st and (st["zygote"], st["zygote_pid"])
 
 
+def base_interpreters(project: Project) -> set[int]:
+    """Pids of the daemon's L0 processes: shim processes in role l0 whose parent is the daemon itself."""
+    daemon = int(status(project)["pid"])
+    ps = subprocess.run(["ps", "-axww", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    rows = [line.split(None, 2) for line in ps.splitlines()]
+    return {int(pid) for pid, ppid, cmd in rows if int(ppid) == daemon and "forktest_shim" in cmd and cmd.endswith(" l0")}
+
+
 def wait_ready(project: Project, other_than: str | None = None, what="zygote ready") -> str:
     def ready():
         z = zygote(project)
@@ -381,6 +389,8 @@ def test_the_jax_demo_under_the_daemon_serves_edit_runs_without_forking_threads(
         assert st["fork_point"] == "imported", st
         events, rc = client(jaxdemo, "-n", "4")
         assert rc == 0 and done(events).passed == 8 and failed(events) == set(), events
+        l0 = base_interpreters(jaxdemo)
+        assert len(l0) == 1, l0
         layers = "return jnp.tanh(w @ x)"
         for n, (old, new) in enumerate([(layers, layers + " + 0.0"), (layers + " + 0.0", layers + " * 1.00")]):
             l1 = zygote(jaxdemo)[1]
@@ -391,6 +401,7 @@ def test_the_jax_demo_under_the_daemon_serves_edit_runs_without_forking_threads(
             assert rc == 0 and selection(events).changed == ["model/layers.py"], (n, events, jaxdemo.stderr)
             assert set(selection(events).reasons) == {"coverage"}, n
             assert failed(events) == set() and done(events).passed == selection(events).selected > 0, n
+        assert base_interpreters(jaxdemo) == l0, "edit runs restarted the daemon's base interpreter"
         log = daemon_log(jaxdemo)
         assert FORK_WARNING not in log and FORK_WARNING not in jaxdemo.stderr, log
         stop_and_check_nothing_survives(jaxdemo)

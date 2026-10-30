@@ -581,3 +581,63 @@ pub(crate) mod tests {
         assert_eq!(g.export(), None, "nothing resolved, nothing to persist");
     }
 }
+
+#[cfg(test)]
+mod parity {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    const PYTHON: &str = "/Users/katakam/repos/faster_pytest/.venv/bin/python";
+    const ROOT: &str = "/tmp/forktest-pandas/pandas";
+    const SCRIPT: &str = r#"
+import json, sys
+from forktest.fingerprint import Fingerprints
+from forktest.selection import ImportGraph
+root = sys.argv[1]
+graph = ImportGraph(root, Fingerprints(root))
+print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlines()}))
+"#;
+
+    /// Closures of pandas' frame tests against the Python `ImportGraph`.
+    #[test]
+    fn closures_match_the_python_reference() {
+        let tests_dir = Path::new(ROOT).join("pandas/tests/frame");
+        if !Path::new(PYTHON).exists() || !tests_dir.exists() {
+            return;
+        }
+        let mut files = Vec::new();
+        let mut stack = vec![tests_dir];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if name.starts_with("test_") && name.ends_with(".py") {
+                    files.push(p.strip_prefix(ROOT).unwrap().to_string_lossy().to_string());
+                }
+            }
+        }
+        let mut child = Command::new(PYTHON)
+            .args(["-c", SCRIPT, ROOT])
+            .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(files.join("\n").as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let expected: HashMap<String, Vec<String>> = serde_json::from_slice(&output.stdout).unwrap();
+        let graph = ImportGraph::new(Path::new(ROOT), Arc::new(Fingerprints::new(Path::new(ROOT), HashMap::new())), HashMap::new());
+        let mut sizes = 0;
+        for f in &files {
+            let mut got: Vec<String> = graph.closure(f).iter().map(|p| p.to_string()).collect();
+            got.sort();
+            assert_eq!(&got, &expected[f], "{f}");
+            sizes += got.len();
+        }
+        eprintln!("graph parity: {} test files, {} closure entries, all equal", files.len(), sizes);
+    }
+}

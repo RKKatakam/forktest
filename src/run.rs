@@ -510,7 +510,9 @@ impl Project {
             args.fork_point = Some(fork_point_name(session.fork_point()).into());
         }
         executed?;
-        let collect_skips = if matches!(req.mode, Mode::All) { collected.skips.len() as u64 } else { 0 };
+        // A run that collected and ran everything reports what plain pytest would, module-level skips included.
+        let ran_everything = matches!(req.mode, Mode::All) || (!partial && selected.len() == universe.len());
+        let collect_skips = if ran_everything { collected.skips.len() as u64 } else { 0 };
         emit(&Event::Done(Done {
             passed: tally.passed,
             failed: tally.failed,

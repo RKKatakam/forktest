@@ -126,7 +126,7 @@ struct SessionKey {
     stdout_to_stderr: bool,
 }
 
-fn log(msg: impl FnOnce() -> String) {
+pub fn log(msg: impl FnOnce() -> String) {
     if std::env::var_os("FORKTEST_LOG").is_some_and(|v| !v.is_empty() && v != "0") {
         eprintln!("forktest: {}", msg());
     }

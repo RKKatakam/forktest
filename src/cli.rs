@@ -89,17 +89,6 @@ impl Opts {
 }
 
 pub fn main(argv: Vec<String>) -> i32 {
-    if let Some(cmd @ ("watch" | "daemon")) = argv.first().map(String::as_str) {
-        eprintln!("forktest: {cmd} is not available yet");
-        return 2;
-    }
-    let opts = match Opts::parse(&argv) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("{USAGE}\nforktest: error: {e}");
-            return 2;
-        }
-    };
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -108,7 +97,21 @@ pub fn main(argv: Vec<String>) -> i32 {
         }
     };
     let root = crate::root::find_root(&cwd);
-    match dispatch(opts, root) {
+    match argv.first().map(String::as_str) {
+        Some("daemon") => return crate::daemon::daemon_command(&root, &argv[1..]),
+        Some("watch") => return crate::daemon::watch_command(&root, &argv[1..]),
+        _ => {}
+    }
+    let opts = match Opts::parse(&argv) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{USAGE}\nforktest: error: {e}");
+            return 2;
+        }
+    };
+    // The daemon's interpreters run in the root, so relative pytest args only mean the same there.
+    let from_root = std::fs::canonicalize(&cwd).is_ok_and(|c| c == root);
+    match dispatch(opts, root, from_root) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("forktest: error: {e:#}");
@@ -117,7 +120,7 @@ pub fn main(argv: Vec<String>) -> i32 {
     }
 }
 
-fn dispatch(opts: Opts, root: PathBuf) -> anyhow::Result<i32> {
+fn dispatch(opts: Opts, root: PathBuf, from_root: bool) -> anyhow::Result<i32> {
     if let Some(nodeid) = &opts.why {
         return why(&root, nodeid);
     }
@@ -128,16 +131,18 @@ fn dispatch(opts: Opts, root: PathBuf) -> anyhow::Result<i32> {
     if opts.pytest_only() {
         return plain_pytest(&python, &opts.pytest_args);
     }
-    let mut live: Vec<Box<dyn Reporter>> = vec![if opts.json {
-        Box::new(JsonlReporter::new(std::io::stdout()))
-    } else {
-        let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
-        Box::new(HumanReporter::new(std::io::stdout(), tty, opts.verify))
-    }];
-    if let Some(path) = &opts.junitxml {
-        live.push(Box::new(JunitReporter::new(path.clone())));
-    }
-    let mut reporters = Reporters::new(live);
+    let mut reporters = || {
+        let mut live: Vec<Box<dyn Reporter>> = vec![if opts.json {
+            Box::new(JsonlReporter::new(std::io::stdout()))
+        } else {
+            let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+            Box::new(HumanReporter::new(std::io::stdout(), tty, opts.verify))
+        }];
+        if let Some(path) = &opts.junitxml {
+            live.push(Box::new(JunitReporter::new(path.clone())));
+        }
+        Reporters::new(live)
+    };
     let request = Request {
         mode: match (&opts.since, opts.all) {
             (_, true) => Mode::All,
@@ -148,10 +153,17 @@ fn dispatch(opts: Opts, root: PathBuf) -> anyhow::Result<i32> {
         workers: opts.workers,
         strict: opts.strict,
         nice: false,
-        pytest_args: opts.pytest_args,
+        pytest_args: opts.pytest_args.clone(),
         fork_from: opts.fork_from,
         stdout_to_stderr: opts.json,
     };
+    if !opts.no_daemon
+        && from_root
+        && let Some(code) = crate::daemon::run_via_daemon(&root, &python, &request, &mut reporters)
+    {
+        return Ok(code);
+    }
+    let mut reporters = reporters();
     let mut project = Project::open(&root, python.clone())?;
     let result = project.run(&request, &mut |e: &Event| reporters.emit(e));
     if let Err(e) = &result

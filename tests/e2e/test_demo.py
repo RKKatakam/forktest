@@ -411,12 +411,6 @@ def test_modes_forktest_cannot_serve_are_plain_pytest(fresh):
     assert not (fresh.root / ".forktest").exists()
 
 
-def test_subcommands_of_later_units_say_so(fresh):
-    for cmd in ("watch", "daemon"):
-        proc = fresh.run(cmd)
-        assert proc.returncode == 2 and proc.stderr == f"forktest: {cmd} is not available yet\n"
-
-
 def test_collection_errors_stop_the_run_like_pytest(demo):
     demo.write("tests/test_broken.py", "import nothing_here\n\ndef test_x():\n    pass\n")
     events, rc = demo.forktest()

@@ -626,10 +626,10 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod parity {
     use super::*;
+    use crate::fingerprint::parity::{PYTHON, python_reference};
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    const PYTHON: &str = "/Users/katakam/repos/faster_pytest/.venv/bin/python";
     const ROOT: &str = "/tmp/forktest-pandas/pandas";
     const SCRIPT: &str = r#"
 import json, sys
@@ -644,7 +644,8 @@ print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlin
     #[test]
     fn closures_match_the_python_reference() {
         let tests_dir = Path::new(ROOT).join("pandas/tests/frame");
-        if !Path::new(PYTHON).exists() || !tests_dir.exists() {
+        let Some(reference) = python_reference() else { return };
+        if !tests_dir.exists() {
             return;
         }
         let mut files = Vec::new();
@@ -662,7 +663,7 @@ print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlin
         }
         let mut child = Command::new(PYTHON)
             .args(["-c", SCRIPT, ROOT])
-            .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .env("PYTHONPATH", &reference)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

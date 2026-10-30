@@ -1,11 +1,11 @@
 //! One request from selection to events: decide what to collect, collect it, select, run, record.
 
 use crate::events::{Done, Event, Outcome, TestResult};
-use crate::fingerprint::{Dep, FILE, Fingerprints, MODULE, RelPath};
+use crate::fingerprint::{Dep, FILE, Fingerprints, Hash128, MODULE, RelPath};
 use crate::graph::ImportGraph;
 use crate::root::{config_files, is_excluded};
 use crate::select::{self, Affected, Current, Reason, SinceBaseline, WorkingTree};
-use crate::store::{DepSet, GitBaseline, InventoryRow, Record, Store, StoreView};
+use crate::store::{DepSet, GitBaseline, InventoryRow, Record, Store, StoreView, dep_hash};
 use crate::zygote::{Batch, Collected, Control, ForkPoint, ForkPolicy, Names, Session, SessionConfig, WorkerEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -208,15 +208,28 @@ fn full_collection_reason(
     None
 }
 
-/// Turns a test's recorded names and reads into dependencies. Each distinct name is resolved once per run.
+/// Turns a test's recorded names and reads into dependencies. Each distinct name is resolved and hashed once per
+/// run, and a test whose digest matches the stored one never has its full set built.
 struct Deps<'a> {
     fps: &'a Fingerprints,
     graph: &'a ImportGraph,
     config: Vec<Dep>,
-    /// Config files plus the `<module>` of everything the test file's import closure reaches.
-    base: HashMap<String, Arc<Vec<Dep>>>,
-    names: Vec<Option<Option<Dep>>>,
-    reads: HashMap<String, Option<Dep>>,
+    base: HashMap<String, Arc<Base>>,
+    names: Vec<Option<Option<(Dep, Hash128)>>>,
+    reads: HashMap<String, Option<(Dep, Hash128)>>,
+}
+
+/// What every test of one file depends on: the config files and the `<module>` of its whole import closure.
+struct Base {
+    deps: HashSet<Dep>,
+    digest: Hash128,
+}
+
+fn hashed(dep: Option<Dep>) -> Option<(Dep, Hash128)> {
+    dep.map(|d| {
+        let h = dep_hash(&d);
+        (d, h)
+    })
 }
 
 impl<'a> Deps<'a> {
@@ -225,36 +238,47 @@ impl<'a> Deps<'a> {
         Deps { fps, graph, config, base: HashMap::new(), names: Vec::new(), reads: HashMap::new() }
     }
 
-    fn base(&mut self, test_file: &str) -> Arc<Vec<Dep>> {
+    fn base(&mut self, test_file: &str) -> Arc<Base> {
         if let Some(b) = self.base.get(test_file) {
             return b.clone();
         }
-        let mut deps = self.config.clone();
+        let mut deps: HashSet<Dep> = self.config.iter().cloned().collect();
         deps.extend(self.graph.closure(test_file).iter().filter_map(|p| self.fps.dep(p, MODULE)));
-        let deps = Arc::new(deps);
-        self.base.insert(test_file.to_string(), deps.clone());
-        deps
+        let digest = deps.iter().fold(0u128, |acc, d| acc.wrapping_add(dep_hash(d)));
+        let base = Arc::new(Base { deps, digest });
+        self.base.insert(test_file.to_string(), base.clone());
+        base
     }
 
-    fn of(&mut self, test_file: &str, hits: &[u32], reads: &[String], names: &Names) -> DepSet {
-        let mut deps = Vec::clone(&self.base(test_file));
+    /// `None` when the test's dependency set has the `stored` digest.
+    fn of(&mut self, test_file: &str, hits: &[u32], reads: &[String], names: &Names, stored: Option<Hash128>) -> Option<DepSet> {
+        let base = self.base(test_file);
+        let fps = self.fps;
+        let mut extra: HashMap<&Dep, Hash128> = HashMap::new();
         for &id in hits {
             let i = id as usize;
             if self.names.len() <= i {
                 self.names.resize(i + 1, None);
             }
-            let fps = self.fps;
-            let dep = self.names[i].get_or_insert_with(|| {
+            self.names[i].get_or_insert_with(|| {
                 let (path, qual) = &names.list[i];
-                fps.dep(path, qual)
+                hashed(fps.dep(path, qual))
             });
-            deps.extend(dep.clone());
         }
         for path in reads {
-            let fps = self.fps;
-            deps.extend(self.reads.entry(path.clone()).or_insert_with(|| fps.dep(path, FILE)).clone());
+            self.reads.entry(path.clone()).or_insert_with(|| hashed(fps.dep(path, FILE)));
         }
-        DepSet::of(deps)
+        let resolved = hits.iter().filter_map(|&id| self.names[id as usize].as_ref().and_then(Option::as_ref));
+        for (dep, h) in resolved.chain(reads.iter().filter_map(|p| self.reads[p].as_ref())) {
+            if !base.deps.contains(dep) {
+                extra.insert(dep, *h);
+            }
+        }
+        let digest = extra.values().fold(base.digest, |acc, h| acc.wrapping_add(*h));
+        if stored == Some(digest) {
+            return None;
+        }
+        Some(DepSet::of(base.deps.iter().cloned().chain(extra.into_keys().cloned()).collect()))
     }
 }
 
@@ -689,9 +713,9 @@ impl Execution<'_> {
             match event {
                 WorkerEvent::Result { result, cost, hits, reads, .. } => {
                     let file = path_of.get(result.nodeid.as_str()).copied().unwrap_or(test_file(&result.nodeid));
-                    let set = deps.of(file, &hits, &reads, names);
-                    let same = view.tests.get(&result.nodeid).is_some_and(|t| t.digest == set.digest);
-                    records.push(Record { nodeid: result.nodeid.clone(), outcome: result.outcome, cost, deps: (!same).then_some(set) });
+                    let stored = view.tests.get(&result.nodeid).map(|t| t.digest);
+                    let set = deps.of(file, &hits, &reads, names, stored);
+                    records.push(Record { nodeid: result.nodeid.clone(), outcome: result.outcome, cost, deps: set });
                     let failed = result.outcome.is_failure();
                     report(result, emit);
                     if failed {
@@ -754,6 +778,22 @@ impl Execution<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_test_whose_digest_is_stored_is_not_built_again() {
+        let root = crate::graph::tests::project("run-digest");
+        let fps = Fingerprints::new(&root, HashMap::new());
+        let graph = ImportGraph::new(&root, Arc::new(Fingerprints::new(&root, HashMap::new())), HashMap::new());
+        let mut deps = Deps::new(&root, &fps, &graph);
+        let names = Names::default();
+        let reads = ["data.json".to_string(), "pyproject.toml".to_string()];
+        let set = deps.of("tests/test_core.py", &[], &reads, &names, None).expect("nothing stored");
+        assert!(set.deps.iter().any(|d| &*d.path == "data.json" && &*d.qualname == FILE));
+        assert!(set.deps.iter().any(|d| &*d.path == "pkg/core.py" && &*d.qualname == MODULE));
+        assert!(deps.of("tests/test_core.py", &[], &reads, &names, Some(set.digest)).is_none());
+        assert!(deps.of("tests/test_core.py", &[], &reads[..1], &names, Some(set.digest)).is_none(), "pyproject.toml is in every base");
+        assert!(deps.of("tests/test_core.py", &[], &[], &names, Some(set.digest)).is_some());
+    }
 
     #[test]
     fn fnmatch_as_python() {

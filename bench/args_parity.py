@@ -65,6 +65,9 @@ def main() -> None:
         python = str(root / ".venv/bin/python")
         has_xdist = subprocess.run([python, "-c", "import xdist"], capture_output=True).returncode == 0
         for args in COMMON + PER_PROJECT.get(name, []):
+            # click's addopts deselect 31,000 slow tests; clearing them makes plain pytest run for many minutes.
+            if name == "click" and args == ["-o", "addopts="]:
+                continue
             if not has_xdist and any(a.startswith("-n") for a in args):
                 continue
             for db in (root / ".forktest").glob("forktest.db*"):
@@ -75,7 +78,7 @@ def main() -> None:
             total += 1
             failures += not ok
             mark = "ok  " if ok else "DIFF"
-            print(f"{mark} {name:8} {' '.join(args) or '(none)':48} pytest {p_code} {p_counts}  forktest {f_code} {f_counts}")
+            print(f"{mark} {name:8} {' '.join(args) or '(none)':48} pytest {p_code} {p_counts}  forktest {f_code} {f_counts}", flush=True)
             if not ok:
                 print("     " + "\n     ".join(f_out.strip().splitlines()[-6:]))
     print(f"\n{total - failures}/{total} argument sets agree")

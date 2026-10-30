@@ -54,6 +54,8 @@ PROJECTS = [
     Project("flask", "src/flask/helpers.py", "url_for"),
     Project("rich", "rich/text.py", "from_markup"),
     Project("pandas", "pandas/core/frame.py", "memory_usage", ["pandas/tests/frame"]),
+    Project("fastapi", "fastapi/encoders.py", "jsonable_encoder"),
+    Project("django-rest-framework", "rest_framework/fields.py", "get_attribute"),
 ]
 
 ALL_RUNNERS = {

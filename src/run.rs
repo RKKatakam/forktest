@@ -59,6 +59,18 @@ struct ArgsMeta {
 const PROJECT_META: &str = "project";
 const GRAPH_META: &str = "import_graph";
 
+/// The interpreter cannot run the shim. Nothing has been emitted, so the caller can hand the run to plain pytest.
+#[derive(Debug)]
+pub struct Unsupported(pub String);
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
 pub struct Project {
     root: PathBuf,
     python: PathBuf,
@@ -529,11 +541,15 @@ impl Project {
         Ok(0)
     }
 
-    /// The warm session for these args, or a new one.
+    /// The warm session for these args, or a new one. Fails with `Unsupported` before anything is emitted when the
+    /// interpreter cannot run the shim.
     fn session_for(&mut self, req: &Request, policy: ForkPolicy, meta: &ProjectMeta) -> anyhow::Result<&mut Session> {
         let key = SessionKey { args: req.pytest_args.clone(), policy, stdout_to_stderr: req.stdout_to_stderr };
         if self.session.as_ref().is_none_or(|(k, _)| *k != key) {
             self.session = None;
+            if let Some(why) = crate::python::check(&self.python).explain(&self.python) {
+                return Err(Unsupported(why).into());
+            }
             let preimport = meta
                 .preimport
                 .iter()

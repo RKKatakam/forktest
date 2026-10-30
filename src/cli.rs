@@ -3,7 +3,7 @@
 use crate::events::Event;
 use crate::fingerprint::{FILE, MODULE};
 use crate::report::{HumanReporter, JsonlReporter, JunitReporter, Reporter, Reporters};
-use crate::run::{Mode, Project, Request};
+use crate::run::{Mode, Project, Request, Unsupported};
 use crate::zygote::ForkPoint;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -126,8 +126,7 @@ fn dispatch(opts: Opts, root: PathBuf) -> anyhow::Result<i32> {
         None => crate::python::find_python(&root)?,
     };
     if opts.pytest_only() {
-        let err = std::process::Command::new(&python).args(["-m", "pytest"]).args(&opts.pytest_args).exec();
-        anyhow::bail!("running {} -m pytest: {err}", python.display());
+        return plain_pytest(&python, &opts.pytest_args);
     }
     let mut live: Vec<Box<dyn Reporter>> = vec![if opts.json {
         Box::new(JsonlReporter::new(std::io::stdout()))
@@ -153,11 +152,23 @@ fn dispatch(opts: Opts, root: PathBuf) -> anyhow::Result<i32> {
         fork_from: opts.fork_from,
         stdout_to_stderr: opts.json,
     };
-    let mut project = Project::open(&root, python)?;
+    let mut project = Project::open(&root, python.clone())?;
     let result = project.run(&request, &mut |e: &Event| reporters.emit(e));
+    if let Err(e) = &result
+        && let Some(unsupported) = e.downcast_ref::<Unsupported>()
+    {
+        eprintln!("forktest: {unsupported}");
+        drop(project);
+        return plain_pytest(&python, &request.pytest_args);
+    }
     reporters.close();
     drop(project);
     Ok(reporters.status.code(result?))
+}
+
+fn plain_pytest(python: &std::path::Path, args: &[String]) -> anyhow::Result<i32> {
+    let err = std::process::Command::new(python).args(["-m", "pytest"]).args(args).exec();
+    anyhow::bail!("running {} -m pytest: {err}", python.display());
 }
 
 /// Why a test would be selected now, from the store alone.

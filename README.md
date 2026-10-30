@@ -5,19 +5,28 @@ process, forks workers from it, and runs only the tests a change affects.
 Your suite, fixtures, markers and `conftest.py` files run on pytest's own
 machinery, unchanged.
 
-This is the v0 pure-Python build described in `PLAN.md`. `DESIGN.md` is the
-product spec. The Rust daemon, MCP server, spawn mode and database adapters
-from the spec are not here yet.
+forktest is one Rust binary. It decides what to run without starting Python,
+then drives pytest inside your project's own interpreter. The original
+pure-Python build in `src/forktest` is the behavioral reference until the Rust
+version replaces it.
 
 ## Install
 
-Python 3.12 or newer and pytest 8 or newer.
-
 ```bash
-uv tool install .          # from a checkout
-# or, inside a project venv
-uv pip install -e /path/to/forktest
+uv tool install git+https://github.com/RKKatakam/forktest   # needs a Rust toolchain to build
+uv tool install .                                           # from a checkout
+uvx --from . forktest                                       # run once without installing
 ```
+
+The wheel holds only the binary, built with maturin as ruff ships. Your tests
+run in your project's interpreter, found the way your tooling would:
+`FORKTEST_PYTHON` or `--python`, an activated virtualenv (`uv run` and
+`poetry run` activate one), a `.venv`, `venv` or `env` directory in the project
+or any parent, an activated conda env, Poetry's own env, then `python3` on PATH.
+
+That interpreter needs Python 3.12 or newer and pytest. With an older Python
+forktest says so on stderr and runs plain pytest, so the command still works.
+Without pytest you get a hint and pytest's own error.
 
 ## Usage
 

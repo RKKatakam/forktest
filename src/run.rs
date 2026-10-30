@@ -11,15 +11,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Mode {
     Affected,
     All,
     Since(String),
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Request {
     pub mode: Mode,
     pub verify: bool,
@@ -65,6 +68,55 @@ pub struct Project {
     store: Store,
     fps: Arc<Fingerprints>,
     session: Option<(SessionKey, Session)>,
+    /// The session's L1 when it holds a full collection, which later requests with the same key run from as is.
+    warm: Option<Warm>,
+    /// Set from another thread to stop the run in progress.
+    cancel: Arc<AtomicBool>,
+}
+
+/// A full collection whose L1 is still alive.
+#[derive(Clone)]
+pub struct Warm {
+    collected: Arc<Collected>,
+    /// Root-relative files whose change makes the collection stale: what L1 imported, the test files, and what
+    /// collection read.
+    pub inputs: Arc<HashSet<String>>,
+    test_files: Arc<Vec<String>>,
+    config: Arc<BTreeMap<String, String>>,
+}
+
+impl Warm {
+    fn new(collected: Arc<Collected>, root: &Path, fps: &Fingerprints) -> Warm {
+        let c = &*collected;
+        let mut inputs: HashSet<String> = c.modules.values().cloned().collect();
+        inputs.extend(c.items.iter().map(|i| i.path.clone()));
+        inputs.extend(c.errors.iter().map(|(n, _)| test_file(n).to_string()));
+        inputs.extend(c.skips.iter().map(|n| test_file(n).to_string()));
+        for (file, (names, reads)) in &c.per_file {
+            inputs.insert(file.clone());
+            inputs.extend(names.iter().map(|(p, _)| p.clone()));
+            inputs.extend(reads.iter().cloned());
+        }
+        Warm {
+            test_files: Arc::new(test_files(root, &c.python_files)),
+            config: Arc::new(config_hashes(root, fps)),
+            inputs: Arc::new(inputs),
+            collected,
+        }
+    }
+
+    pub fn tests(&self) -> usize {
+        self.collected.items.len()
+    }
+
+    /// Project modules L1 imported.
+    pub fn modules(&self) -> usize {
+        self.collected.modules.len()
+    }
+
+    pub fn fork_point(&self) -> ForkPoint {
+        self.collected.fork_point
+    }
 }
 
 #[derive(PartialEq)]
@@ -320,17 +372,79 @@ impl Project {
     pub fn open(root: &Path, python: PathBuf) -> anyhow::Result<Project> {
         let store = Store::open(root)?;
         let fps = Arc::new(Fingerprints::new(root, store.file_infos()?));
-        Ok(Project { root: root.to_path_buf(), python, store, fps, session: None })
+        let cancel = Arc::new(AtomicBool::new(false));
+        Ok(Project { root: root.to_path_buf(), python, store, fps, session: None, warm: None, cancel })
+    }
+
+    pub fn python(&self) -> &Path {
+        &self.python
+    }
+
+    pub fn fingerprints(&self) -> &Fingerprints {
+        &self.fps
+    }
+
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.clone()
     }
 
     /// Runs one request, emitting its events, and returns pytest's exit code when it stopped before reporting.
     pub fn run(&mut self, req: &Request, emit: &mut dyn FnMut(&Event)) -> anyhow::Result<i32> {
         let mut learned = Learned::default();
         let result = self.pipeline(req, emit, &mut learned);
+        if req.strict || self.l1_pid().is_none() {
+            self.warm = None;
+        }
         let saved = self.save(&args_key(&req.pytest_args), learned);
         let code = result?;
         saved?;
         Ok(code)
+    }
+
+    /// Collects everything these args collect and keeps L1, so a later `run` of the same args collects nothing.
+    pub fn warm_up(&mut self, req: &Request) -> anyhow::Result<&Warm> {
+        self.warm = None;
+        let meta: ProjectMeta = read_meta(&self.store, PROJECT_META)?;
+        let session = self.session_for(req, full_policy(req), &meta)?;
+        let collected = session.collect(None)?;
+        if let Some(code) = collected.exit_code {
+            anyhow::bail!("pytest exited with code {code} before running tests");
+        }
+        let warm = Warm::new(Arc::new(collected), &self.root, &self.fps);
+        self.store.save_file_infos(self.fps.take_fresh())?;
+        Ok(self.warm.insert(warm))
+    }
+
+    pub fn warm(&self) -> Option<&Warm> {
+        self.warm.as_ref()
+    }
+
+    /// Kills L1 and keeps L0.
+    pub fn drop_warm(&mut self) {
+        self.warm = None;
+        if let Some((_, session)) = &mut self.session {
+            session.drop_l1();
+        }
+    }
+
+    /// Kills every Python process, so the next run starts from a fresh interpreter.
+    pub fn restart(&mut self) {
+        self.warm = None;
+        self.session = None;
+    }
+
+    pub fn l1_pid(&self) -> Option<i32> {
+        self.session.as_ref().and_then(|(_, s)| s.l1_pid())
+    }
+
+    pub fn preimported(&self) -> usize {
+        self.session.as_ref().map_or(0, |(_, s)| s.preimported())
+    }
+
+    /// The warm collection when it was made for this request's session.
+    fn warm_for(&self, req: &Request) -> Option<Warm> {
+        let (key, _) = self.session.as_ref()?;
+        (*key == session_key(req, full_policy(req))).then(|| self.warm.clone()).flatten()
     }
 
     fn save(&mut self, key: &str, learned: Learned) -> anyhow::Result<()> {
@@ -372,8 +486,13 @@ impl Project {
         let mut current = self.current(req, &fps)?;
         let graph = graph_of(&root, &self.store, &fps, &project.modules)?;
 
-        let full = full_collection_reason(req, &root, &fps, &inventory, &args_meta);
+        let warm = self.warm_for(req);
+        let full = match &warm {
+            Some(_) => Some("warm"),
+            None => full_collection_reason(req, &root, &fps, &inventory, &args_meta),
+        };
         let files: Option<Vec<String>> = match full {
+            Some("warm") => None,
             Some(why) => {
                 log(|| format!("full collection: {why}"));
                 None
@@ -407,34 +526,50 @@ impl Project {
                 Some(files.into_iter().collect())
             }
         };
-        if let Some(files) = &files {
-            log(|| format!("collecting {} files: {}", files.len(), files.join(" ")));
-        }
 
-        let policy = match (req.fork_from, full, args_meta.fork_point.as_deref()) {
-            (Some(p), _, _) => ForkPolicy::Force(p),
-            // A partial run trusts where the last run of these args could fork from; a full one checks again.
-            (None, None, Some("imported")) => ForkPolicy::Force(ForkPoint::Imported),
-            (None, None, Some("spawn")) => ForkPolicy::Force(ForkPoint::Spawn),
-            _ => ForkPolicy::Auto,
+        let (collected, warm) = match warm {
+            Some(warm) => {
+                log(|| format!("served by the warm collection of {} tests", warm.tests()));
+                (warm.collected.clone(), warm)
+            }
+            None => {
+                if let Some(files) = &files {
+                    log(|| format!("collecting {} files: {}", files.len(), files.join(" ")));
+                }
+                let policy = match (req.fork_from, full, args_meta.fork_point.as_deref()) {
+                    (Some(p), _, _) => ForkPolicy::Force(p),
+                    // A partial run trusts where the last run of these args could fork from; a full one checks again.
+                    (None, None, Some("imported")) => ForkPolicy::Force(ForkPoint::Imported),
+                    (None, None, Some("spawn")) => ForkPolicy::Force(ForkPoint::Spawn),
+                    _ => ForkPolicy::Auto,
+                };
+                self.warm = None;
+                let session = self.session_for(req, policy, &project)?;
+                let collected = Arc::new(session.collect(files.as_deref())?);
+                if let Some(code) = collected.exit_code {
+                    return Ok(code);
+                }
+                log(|| format!("collected {} tests; workers fork from {}", collected.items.len(), fork_point_name(collected.fork_point)));
+                if std::fs::canonicalize(&collected.rootdir).is_ok_and(|r| r != root) {
+                    eprintln!(
+                        "forktest: pytest's rootdir is {} but forktest's is {}; affected-test selection may be off",
+                        collected.rootdir.display(),
+                        root.display()
+                    );
+                }
+                let warm = Warm::new(collected.clone(), &root, &fps);
+                if files.is_none() {
+                    self.warm = Some(warm.clone());
+                }
+                (collected, warm)
+            }
         };
-        let session = self.session_for(req, policy, &project)?;
-        let collected = session.collect(files.as_deref())?;
-        if let Some(code) = collected.exit_code {
-            return Ok(code);
-        }
-        log(|| format!("collected {} tests; workers fork from {}", collected.items.len(), fork_point_name(collected.fork_point)));
-        if std::fs::canonicalize(&collected.rootdir).is_ok_and(|r| r != root) {
-            eprintln!(
-                "forktest: pytest's rootdir is {} but forktest's is {}; affected-test selection may be off",
-                collected.rootdir.display(),
-                root.display()
-            );
-        }
+        let session = &mut self.session.as_mut().expect("collected above").1;
 
         let partial = files.is_some();
         let stored_modules = project.modules.clone();
         merge_project_meta(&mut project, &collected, session.dropped_preimports(), partial);
+        let collected = &*collected;
         let rebuilt;
         let graph = if partial && project.modules == stored_modules {
             &graph
@@ -444,14 +579,14 @@ impl Project {
         };
         if !partial {
             args_meta.python_files = collected.python_files.clone();
-            args_meta.test_files = test_files(&root, &collected.python_files);
-            args_meta.config = config_hashes(&root, &fps);
+            args_meta.test_files = warm.test_files.to_vec();
+            args_meta.config = (*warm.config).clone();
         }
         let fixtures = fixture_set(&project);
         learned.project = Some(project);
         learned.args = Some(args_meta);
 
-        let (rows, universe) = self.update_inventory(&collected, &inventory, files.as_deref(), &view, graph, learned);
+        let (rows, universe) = self.update_inventory(collected, &inventory, files.as_deref(), &view, graph, learned);
         learned.inventory = Some(rows);
         learned.graph = graph.export();
 
@@ -490,6 +625,7 @@ impl Project {
             maxfail: collected.maxfail,
             collect_errors,
             req,
+            cancel: &self.cancel,
         };
         let session = &mut self.session.as_mut().expect("started above").1;
         let mut tally = Tally::default();
@@ -498,6 +634,9 @@ impl Project {
             args.fork_point = Some(fork_point_name(session.fork_point()).into());
         }
         executed?;
+        if self.cancel.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
         let collect_skips = if matches!(req.mode, Mode::All) { collected.skips.len() as u64 } else { 0 };
         emit(&Event::Done(Done {
             passed: tally.passed,
@@ -525,14 +664,26 @@ impl Project {
             }
         };
         run.execute(session, &rest, true, learned, &mut on_unselected, &mut |_| {})?;
+        if self.cancel.load(Ordering::Relaxed) {
+            return Ok(0);
+        }
         emit(&Event::Verified { checked: rest.len() as u64, misses, duration_ms: ms(t1) });
         Ok(0)
     }
 
-    /// The warm session for these args, or a new one.
+    /// The warm session for these args, or a new one. Other args only need a new L1.
     fn session_for(&mut self, req: &Request, policy: ForkPolicy, meta: &ProjectMeta) -> anyhow::Result<&mut Session> {
-        let key = SessionKey { args: req.pytest_args.clone(), policy, stdout_to_stderr: req.stdout_to_stderr };
+        let key = session_key(req, policy);
+        if let Some((k, session)) = &mut self.session
+            && *k != key
+            && (k.policy, k.stdout_to_stderr) == (key.policy, key.stdout_to_stderr)
+        {
+            self.warm = None;
+            session.set_args(key.args.clone());
+            k.args = key.args.clone();
+        }
         if self.session.as_ref().is_none_or(|(k, _)| *k != key) {
+            self.warm = None;
             self.session = None;
             let preimport = meta
                 .preimport
@@ -641,6 +792,15 @@ impl Project {
     }
 }
 
+fn session_key(req: &Request, policy: ForkPolicy) -> SessionKey {
+    SessionKey { args: req.pytest_args.clone(), policy, stdout_to_stderr: req.stdout_to_stderr }
+}
+
+/// Where a full collection may fork from: anywhere its thread counts allow, unless the request says.
+fn full_policy(req: &Request) -> ForkPolicy {
+    req.fork_from.map_or(ForkPolicy::Auto, ForkPolicy::Force)
+}
+
 fn fork_point_name(p: ForkPoint) -> &'static str {
     match p {
         ForkPoint::Collected => "collected",
@@ -673,6 +833,7 @@ struct Execution<'a> {
     maxfail: u32,
     collect_errors: HashSet<String>,
     req: &'a Request,
+    cancel: &'a AtomicBool,
 }
 
 impl Execution<'_> {
@@ -763,7 +924,7 @@ impl Execution<'_> {
                 Batch { nodeids, files }
             })
             .collect();
-        session.run(batches, nice, &mut names, &AtomicBool::new(false), &mut sink)
+        session.run(batches, nice, &mut names, self.cancel, &mut sink)
     }
 }
 

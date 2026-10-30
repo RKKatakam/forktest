@@ -21,7 +21,8 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ForkPoint {
     /// Workers fork from L1 and inherit its collected session.
     Collected,
@@ -162,6 +163,7 @@ pub struct Session {
     l1: Option<Proc>,
     tolerated: u32,
     dropped: Vec<String>,
+    preimported: usize,
     fork_point: ForkPoint,
     serial: u64,
     /// Where children's stderr goes instead of ours.
@@ -208,6 +210,7 @@ impl Session {
             l1: None,
             tolerated: 0,
             dropped: Vec::new(),
+            preimported: 0,
             fork_point: ForkPoint::Collected,
             serial: 0,
             stderr,
@@ -240,6 +243,8 @@ impl Session {
                     );
                     s.kill_l0();
                     s.fork_point = ForkPoint::Spawn;
+                } else {
+                    s.preimported = preimport.len();
                 }
                 return Ok(s);
             }
@@ -500,6 +505,21 @@ impl Session {
 
     pub fn fork_point(&self) -> ForkPoint {
         self.fork_point
+    }
+
+    pub fn l1_pid(&self) -> Option<i32> {
+        self.l1.as_ref().map(|l1| l1.pid)
+    }
+
+    /// Modules L0 preimported.
+    pub fn preimported(&self) -> usize {
+        self.preimported
+    }
+
+    /// Replaces the pytest args later collections and runs use. L0 never saw them, so it stays.
+    pub fn set_args(&mut self, args: Vec<String>) {
+        self.drop_l1();
+        self.config.pytest_args = args;
     }
 
     /// Kills L1 (a project file it imported changed) and keeps L0.

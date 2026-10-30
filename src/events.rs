@@ -124,7 +124,6 @@ impl Event {
         self.to_json().to_string()
     }
 
-    #[cfg(test)]
     pub fn parse(line: &str) -> anyhow::Result<Event> {
         let v: serde_json::Value = serde_json::from_str(line)?;
         let kind = v["event"].as_str().unwrap_or_default();

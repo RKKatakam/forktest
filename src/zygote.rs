@@ -881,7 +881,13 @@ mod groups {
 
     static SLOTS: [AtomicI32; 256] = [const { AtomicI32::new(0) }; 256];
 
+    /// Every group this process ever created, so tests can look for survivors of their own sessions only.
+    #[cfg(test)]
+    pub static EVER: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
     pub fn add(pgid: i32) {
+        #[cfg(test)]
+        EVER.lock().unwrap().push(pgid);
         install();
         for slot in &SLOTS {
             if slot.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
@@ -1175,19 +1181,35 @@ mod tests {
         counts
     }
 
+    /// Shim processes in the process groups this test process created. Other forktest runs on the machine (a
+    /// daemon, a benchmark, another worktree's tests) share the shim path and must not count.
     fn shim_processes() -> Vec<String> {
-        let shim = python::shim_path().unwrap().display().to_string();
-        let out = Command::new("ps").args(["-axww", "-o", "pid=,command="]).output().unwrap();
-        String::from_utf8_lossy(&out.stdout).lines().filter(|l| l.contains(&shim)).map(str::to_string).collect()
+        let ours = super::groups::EVER.lock().unwrap().clone();
+        shim_processes_in(&ours)
     }
 
-    /// Waits a little for killed processes to be reaped, then expects exactly `n` shim processes.
+    fn shim_processes_in(pgids: &[i32]) -> Vec<String> {
+        let shim = python::shim_path().unwrap().display().to_string();
+        let out = Command::new("ps").args(["-axww", "-o", "pid=,pgid=,command="]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains(&shim))
+            .filter(|l| l.split_whitespace().nth(1).and_then(|g| g.parse().ok()).is_some_and(|g: i32| pgids.contains(&g)))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Waits a little for killed processes to be reaped, then expects exactly `n` of our shim processes.
     fn assert_shim_processes(n: usize) {
+        assert_shim_processes_in(n, shim_processes);
+    }
+
+    fn assert_shim_processes_in(n: usize, list: impl Fn() -> Vec<String>) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut procs = shim_processes();
+        let mut procs = list();
         while procs.len() != n && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
-            procs = shim_processes();
+            procs = list();
         }
         assert_eq!(procs.len(), n, "shim processes: {procs:#?}");
     }
@@ -1606,13 +1628,19 @@ def test_warning_is_an_error():
             .spawn()
             .unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let ready = stdout.lines().map_while(Result::ok).any(|l| l.contains("signal target ready"));
-        assert!(ready);
-        assert!(shim_processes().len() >= 2);
+        let mut pgids: Vec<i32> = Vec::new();
+        for line in stdout.lines().map_while(Result::ok) {
+            if let Some(list) = line.strip_prefix("signal target groups ") {
+                pgids = list.split(',').filter_map(|g| g.parse().ok()).collect();
+                break;
+            }
+        }
+        assert!(!pgids.is_empty());
+        assert!(shim_processes_in(&pgids).len() >= 2);
         unsafe { libc::kill(child.id() as i32, signal) };
         let status = child.wait().unwrap();
         assert!(!status.success());
-        assert_no_orphans();
+        assert_shim_processes_in(0, || shim_processes_in(&pgids));
     }
 
     /// Run by the SIGTERM test as a child: a collected session, then waiting to be signalled.
@@ -1626,7 +1654,8 @@ def test_warning_is_an_error():
         let scratch = Scratch::example("demo");
         let mut session = Session::start(config(&scratch.0, &python)).unwrap();
         session.collect(None).unwrap();
-        println!("signal target ready");
+        let groups = super::groups::EVER.lock().unwrap().iter().map(i32::to_string).collect::<Vec<_>>().join(",");
+        println!("signal target groups {groups}");
         std::thread::sleep(Duration::from_secs(60));
     }
 }

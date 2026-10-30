@@ -350,7 +350,12 @@ def test_watch_reruns_affected_tests_on_save_and_exits_clean(demo):
 
 
 def test_watch_cancels_a_run_when_a_new_change_arrives(demo):
-    demo.write("tests/test_sleepy.py", "import time\nfrom config import CURRENCY\n\ndef test_sleepy():\n    time.sleep(3)\n")
+    # Slow only while the edit below is in place, so the first watch run stays quick. A watch that waited for the
+    # slow run instead of cancelling it would take 30 s to start the next one, far from the 15 s bound under load.
+    demo.write(
+        "tests/test_sleepy.py",
+        "import time\nfrom config import CURRENCY\n\ndef test_sleepy():\n    time.sleep(30 if CURRENCY == 'EURO' else 0)\n",
+    )
     proc = subprocess.Popen(
         [demo.binary, "watch"], cwd=demo.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         start_new_session=True, env=demo.env(),
@@ -360,18 +365,22 @@ def test_watch_cancels_a_run_when_a_new_change_arrives(demo):
     reader.start()
     try:
         wait_for(lambda: safety_nets(out) == 1, timeout=60, what="the first watch run")
+        # Count only what follows each edit: the watcher may still report the write of test_sleepy.py made just
+        # before it started, and the extra run that causes must not pass for the one an edit starts.
+        mark = len(out)
         demo.edit("config.py", 'CURRENCY = "EUR"', 'CURRENCY = "EURO"')
-        wait_for(lambda: any("13 of 17 tests selected" in line for line in out), what="a run that includes the slow test")
+        wait_for(lambda: any("13 of 17 tests selected" in line for line in out[mark:]), what="a run that includes the slow test")
         time.sleep(0.5)
+        mark = len(out)
         started = time.monotonic()
         demo.edit("config.py", 'CURRENCY = "EURO"', 'CURRENCY = "EUR"')
-        wait_for(lambda: sum("tests selected" in line for line in out) == 3, what="the next run")
-        assert time.monotonic() - started < 2.5, "the slow run was cancelled, not waited for"
+        wait_for(lambda: any("tests selected" in line for line in out[mark:]), timeout=60, what="the next run")
+        assert time.monotonic() - started < 15, "the slow run was waited for, not cancelled"
     finally:
         os.kill(proc.pid, signal.SIGINT)
         _, err = proc.communicate(timeout=30)
     assert proc.returncode == 0, err
-    assert "run cancelled by a new change" in err, err
+    assert "run cancelled by a new change" in err, err + "".join(out)
 
 
 def test_watch_refuses_to_start_next_to_a_daemon(served):

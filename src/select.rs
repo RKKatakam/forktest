@@ -629,3 +629,104 @@ mod speed {
         }
     }
 }
+
+/// Selection on a real recorded store, against the Python reference. Driven by `FT_*` variables from
+/// `bench/selcheck.py`; see that script.
+#[cfg(test)]
+mod real_store {
+    use super::*;
+    use crate::events::Outcome;
+    use crate::store::{DepSet, Record};
+    use std::path::Path;
+    use std::time::Instant;
+
+    fn env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
+    }
+
+    /// Copies a Python forktest store's tests and dep sets into a Rust store, hashing each dep with the Rust
+    /// fingerprints of the tree as it is now. Keys the Python side found changed now (`FT_STALE`) get hash 0.
+    #[test]
+    #[ignore]
+    fn convert_python_store() {
+        let root = env("FT_ROOT");
+        let root = Path::new(&root);
+        let py = rusqlite::Connection::open(env("FT_PY_STORE")).unwrap();
+        let stale: HashSet<u32> = serde_json::from_str(&std::fs::read_to_string(env("FT_STALE")).unwrap()).unwrap();
+        let fps = Arc::new(Fingerprints::new(root, HashMap::new()));
+        let mut keys: HashMap<u32, Dep> = HashMap::new();
+        let mut stmt = py.prepare("SELECT id, path, qualname FROM dep_keys").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        while let Some(r) = rows.next().unwrap() {
+            let (id, path, qualname): (u32, String, String) = (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap());
+            let hash = if stale.contains(&id) {
+                0
+            } else {
+                let info = fps.info(&path).expect("unchanged deps exist");
+                info.hash_of(&qualname).expect("unchanged deps have a hash").1
+            };
+            keys.insert(id, Dep { path: Arc::from(path), qualname: Arc::from(qualname), hash });
+        }
+        let mut stmt = py.prepare("SELECT nodeid, outcome, duration, deps FROM tests JOIN test_deps ON test_id = id").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut records = Vec::new();
+        while let Some(r) = rows.next().unwrap() {
+            let outcome = match r.get_ref(1).unwrap().as_str().unwrap() {
+                "passed" => Outcome::Passed,
+                "failed" => Outcome::Failed,
+                "skipped" => Outcome::Skipped,
+                "xfailed" => Outcome::Xfailed,
+                "xpassed" => Outcome::Xpassed,
+                _ => Outcome::Error,
+            };
+            let ids = r.get_ref(3).unwrap().as_blob().unwrap();
+            let deps = ids.as_chunks::<4>().0.iter().map(|c| keys[&u32::from_le_bytes(*c)].clone()).collect();
+            records.push(Record { nodeid: r.get(0).unwrap(), outcome, cost: r.get(2).unwrap(), deps: Some(DepSet::of(deps)) });
+        }
+        let n = records.len();
+        let mut store = Store::open(Path::new(&env("FT_RS_STORE"))).unwrap();
+        store.record(records).unwrap();
+        // The live session resolved these edges with its sys.modules map, which the recorded module sets reflect.
+        let py_graph: serde_json::Value = serde_json::from_str(
+            &py.query_row("SELECT value FROM meta WHERE key = 'import_graph'", [], |r| r.get::<_, String>(0)).unwrap(),
+        )
+        .unwrap();
+        let probe = ImportGraph::new(root, fps.clone(), HashMap::new());
+        probe.closure("pandas/conftest.py");
+        let modules = serde_json::from_str::<serde_json::Value>(&probe.export().unwrap()).unwrap()["modules"].clone();
+        let nodes: serde_json::Map<String, serde_json::Value> = py_graph["nodes"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter_map(|(path, node)| {
+                let sha = format!("{:032x}", fps.info(path)?.sha);
+                Some((path.clone(), serde_json::json!([sha, "", node[2]])))
+            })
+            .collect();
+        let state = serde_json::json!({"format": 1, "modules": modules, "dirs": {}, "nodes": nodes});
+        store.meta_set("import_graph", &state.to_string()).unwrap();
+        store.save_file_infos(fps.take_fresh()).unwrap();
+        eprintln!("converted {n} tests, {} keys ({} stale)", keys.len(), stale.len());
+    }
+
+    /// Prints `{"ms": .., "reasons": {nodeid: reason}, "changed": [..]}` for every recorded test, as a run would
+    /// select now. The store is left as it was, so every scenario starts from the same baseline.
+    #[test]
+    #[ignore]
+    fn select_on_real_store() {
+        let root = env("FT_ROOT");
+        let root = Path::new(&root);
+        let t = Instant::now();
+        let store = Store::open(Path::new(&env("FT_RS_STORE"))).unwrap();
+        let fps = Arc::new(Fingerprints::new(root, store.file_infos().unwrap()));
+        let view = store.view().unwrap();
+        let graph = ImportGraph::reusing(store.meta_get("import_graph").unwrap().as_deref(), root, fps.clone(), HashMap::new());
+        let mut nodeids: Vec<String> = view.tests.keys().cloned().collect();
+        nodeids.sort();
+        let affected = select(&nodeids, &view, &store, &mut WorkingTree::new(&fps), &graph, &HashSet::new()).unwrap();
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let reasons: BTreeMap<&String, &str> = affected.reasons.iter().map(|(n, r)| (n, r.as_str())).collect();
+        let out = serde_json::json!({"ms": ms, "reasons": reasons, "changed": affected.changed});
+        std::fs::write(env("FT_OUT"), out.to_string()).unwrap();
+    }
+}

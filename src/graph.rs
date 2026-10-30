@@ -644,7 +644,11 @@ print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlin
     #[test]
     fn closures_match_the_python_reference() {
         let tests_dir = Path::new(ROOT).join("pandas/tests/frame");
-        if !Path::new(PYTHON).exists() || !tests_dir.exists() {
+        let Some(reference) = crate::fingerprint::parity::python_reference() else {
+            eprintln!("skipped: set FORKTEST_PY_SRC to a checkout of main's src to compare with the Python forktest");
+            return;
+        };
+        if !tests_dir.exists() {
             return;
         }
         let mut files = Vec::new();
@@ -662,7 +666,7 @@ print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlin
         }
         let mut child = Command::new(PYTHON)
             .args(["-c", SCRIPT, ROOT])
-            .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
+            .env("PYTHONPATH", &reference)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

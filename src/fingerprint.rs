@@ -792,7 +792,7 @@ if os.name == "posix":
 }
 
 #[cfg(test)]
-mod parity {
+pub(crate) mod parity {
     use super::*;
     use std::io::Write;
     use std::process::{Command, Stdio};
@@ -822,23 +822,33 @@ print(json.dumps(out))
         }
     }
 
+    /// The Python forktest's source tree (a checkout of main's `src`), which these parity tests compare against.
+    pub(crate) fn python_reference() -> Option<std::path::PathBuf> {
+        let src = std::path::PathBuf::from(std::env::var_os("FORKTEST_PY_SRC")?);
+        if Path::new(PYTHON).exists() && src.join("forktest/fingerprint.py").exists() {
+            return Some(src);
+        }
+        None
+    }
+
     /// `FORKTEST_PARITY_EXTRA` adds a directory tree to compare.
     #[test]
     fn qualnames_match_the_python_reference() {
-        if !Path::new(PYTHON).exists() {
+        let Some(reference) = python_reference() else {
+            eprintln!("skipped: set FORKTEST_PY_SRC to a checkout of main's src to compare with the Python forktest");
             return;
-        }
+        };
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
         py_files(&repo.join("examples"), &mut files, true);
-        py_files(&repo.join("src/forktest"), &mut files, false);
+        py_files(&reference.join("forktest"), &mut files, false);
         py_files(Path::new("/tmp/forktest-pandas/pandas/pandas/core"), &mut files, false);
         if let Some(extra) = std::env::var_os("FORKTEST_PARITY_EXTRA") {
             py_files(Path::new(&extra), &mut files, true);
         }
         let mut child = Command::new(PYTHON)
             .args(["-c", SCRIPT])
-            .env("PYTHONPATH", repo.join("src"))
+            .env("PYTHONPATH", &reference)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

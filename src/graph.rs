@@ -529,7 +529,7 @@ pub(crate) mod tests {
 
     #[test]
     fn closure_resolves_through_the_test_directory_and_known_modules() {
-        let root = project("known");
+        let root = project("graph-known");
         let closure = graph(&root, &[]).closure("tests/sub/test_deep.py");
         assert!(closure.contains("tests/sub/local_helper.py"));
         assert!(closure.contains("conftest.py") && closure.contains("tests/conftest.py"));

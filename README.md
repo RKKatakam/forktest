@@ -1,13 +1,15 @@
 # forktest
 
-A fast, pytest-compatible test runner. It keeps pytest warm in a zygote
-process, forks workers from it, and runs only the tests a change affects.
-Your suite, fixtures, markers and `conftest.py` files run on pytest's own
-machinery, unchanged.
+A fast, pytest-compatible test runner. It decides which tests a change
+affects before Python starts, keeps pytest warm in a zygote, forks workers
+from it, and runs only those tests. Your suite, fixtures, markers, plugins and
+`conftest.py` files run on pytest's own machinery, unchanged.
 
-forktest is one Rust binary. It decides what to run without starting Python,
-then drives pytest inside your project's own interpreter. The original
-pure-Python version stays on the `main` branch as the behavioral reference.
+forktest is one Rust binary that drives pytest inside your project's own
+interpreter. It never forks a process that has threads, so suites that use
+JAX, torch or anything else with native thread pools run correctly. The
+original pure-Python version stays on the `main` branch as the behavioral
+reference.
 
 ## Install
 
@@ -35,10 +37,11 @@ forktest --all               # the whole suite, forked and parallel
 forktest --since main        # affected by every function changed since branching from main
 forktest --json              # one JSON object per line, for agents and CI
 forktest --junitxml out.xml  # JUnit XML as well
-forktest -n 4                # worker count (default: cpu count)
+forktest -n 4                # at most 4 workers (default: cpu count; fewer when the selection is cheap)
 forktest --strict-pytest     # one process, one shared session, exact pytest semantics
 forktest --verify-selection  # also run the unselected tests; a failure among them is a "miss"
-forktest --why tests/test_x.py::test_y   # why that test would run now, without running it
+forktest --why tests/test_x.py::test_y   # why that test would run now, without starting Python
+forktest --fork-from imported            # override where workers fork from (auto, collected, imported, spawn)
 forktest -k billing -x       # anything forktest does not know passes through to pytest
 
 forktest watch               # rerun affected tests on every save, safety net in the background
@@ -46,6 +49,11 @@ forktest daemon start        # keep warm zygotes behind a unix socket; plain `fo
 forktest daemon status
 forktest daemon stop
 ```
+
+Modes forktest has nothing to add to run plain pytest with the same
+arguments: `--collect-only`, `--fixtures`, `--fixtures-per-test`, `--markers`,
+`--version`, `-h`, `--pdb`, `--trace`, `--setup-plan`, `--setup-only`,
+`--setup-show`, `--lf`, `--ff`, `--sw` and `--stepwise-skip`.
 
 Human output:
 
@@ -70,226 +78,218 @@ Passing tests are not emitted as JSON lines; `done` carries their count.
 Other events are `collect_error`, `skip`, `xfail`, `xpass`, `error`, `miss`
 and `verified`. A strict xpass is reported as `fail`, as pytest does.
 
-Exit codes: 0 all selected tests passed, 1 a test failed or a miss was
-found, 2 collection failed, 5 nothing was collected at all.
+Exit codes follow pytest: 0 all selected tests passed, 1 a test failed or a
+miss was found, 2 collection failed, 4 pytest rejected the arguments, 5
+nothing was collected at all.
 
 ## How it works
 
-**Fingerprints.** Every `.py` file is parsed with `ast` into a map from
-function qualname to a hash of its definition with docstrings removed, plus
-a `<module>` hash of the file with every function body replaced by `...`.
-Moving or reformatting code changes nothing. Editing a constant, a
-signature, an import or a decorator changes the `<module>` hash. Each
-file's fingerprint, imports and stat (`mtime_ns`, `ctime_ns`, size) are
-kept in the store by path. A later process trusts the stored fingerprint
-without reading the file while the stat matches, and after a read while
-the content hash matches, so a new zygote or a cold run only reads the
-files that changed.
+**Fingerprints.** Rust parses every `.py` file with ruff's parser into a map
+from function qualname, spelled as CPython's `co_qualname`, to a hash of its
+definition with docstrings removed, plus a `<module>` hash of the file with
+every function body replaced by `...`. The hashes come from ruff's
+position-free AST, so moving, reformatting or re-commenting code changes
+nothing. Editing a constant, a signature, an import or a decorator changes
+the `<module>` hash. Parsing pandas' `frame.py` takes about 4 ms, against
+108 ms with Python's `ast`. Each file's fingerprint, imports and stat are
+kept in `.forktest/forktest.db`, and a file is read again only when its stat
+changes.
 
-**Recording.** While a test runs, a `sys.monitoring` `PY_START` hook
-records which project functions executed, and an `open` audit hook records
-which non-Python project files were read. Fixture definitions the test
-depends on are added statically, since a session fixture only executes for
-the first test in a batch. The static import closure of the test file and
-its `conftest.py` files is added as `<module>` dependencies, and so are the
-pytest config and lock files. Each worker turns its tests' hits into
-dependencies itself, in parallel, and compares a digest of each test's set
-with the one stored for it. An unchanged test sends only its result. A
-changed one sends its set as positions into dependencies that go over the
-pipe once per worker. All of it goes into `.forktest/store.db`, one
-baseline per test. Each distinct dependency is stored once, as a key, and
-the store keeps an index from each key to the tests that use it, patched
-on every write so it never needs a sweep.
+**Selection before Python.** A test runs when it is new, failed last time,
+or any recorded dependency hash differs from the current one. Each distinct
+dependency is checked once, and only the changed ones' rows of a key to
+tests index are read, so the work grows with the change, not the suite. A
+test also runs when its file's static import closure reaches a project file
+it did not record. Each selected test carries one reason: `config_change`,
+`new`, `last_failed`, `coverage`, `fixture`, `file_read` or `import_graph`.
+`--why` prints them. On pandas' `frame` tests, Rust's selection picks the
+same tests for the same reasons as the Python version's in every scenario
+`bench/selcheck.py` tries, in 28 to 38 ms against 66 to 182 ms.
 
-**Selection.** A test runs when it is new, failed last time, or any
-recorded dependency hash differs from the current one. Each distinct key is
-checked once against the current fingerprints, and only the changed keys'
-rows of the index are read, so the work grows with the size of the change,
-not the suite: 6,825 keys stand for 8.9M recorded references on pandas'
-`frame` tests. A test also runs when its file's current import closure
-reaches a project file it did not record, such as a newly created module.
-That rule depends only on the test file and the set of module paths the
-test recorded, so it runs once per distinct pair (124 on pandas). The
-import graph's resolved edges are persisted and reused while each file's
-imports, the listings of the directories its resolution scanned and the
-`sys.modules` map are unchanged. Each selected test carries one reason:
-`config_change`, `new`, `last_failed`, `coverage`, `fixture`, `file_read`
-or `import_graph`. `--why` prints them.
+**Collecting only what runs.** The store keeps, per set of pytest arguments,
+each test file's nodeids, its content hash, a digest of its import closure,
+and the functions and data files its collection used. When nothing is
+selected and nothing changed, Python never starts. Otherwise only the files
+holding selected tests are collected, and within them only the selected
+functions and classes, unless a file changed in a way that can change its
+tests. A new or removed test file, a config change, `--all` and
+`--verify-selection` collect everything.
 
-**Execution.** The collecting process is the zygote. Selected tests are
-grouped by module, failed-first, assigned to workers by longest processing
-time, using what each test cost its worker last time (the protocol plus
-recording, which for a failure or an xfail includes formatting the
-traceback). A module that costs more than an even share of the run is
-split by class first, then into consecutive runs, so module- and
-class-scoped fixtures are rebuilt as rarely as possible. Each worker is an
-`os.fork()` of the zygote. It runs its items through the
-`pytest_runtest_protocol` hook, as pytest's own loop does, so plugins that
-wrap it (the warnings plugin's `filterwarnings` marks, faulthandler,
-pytest-timeout) still apply, and it streams results back over a pipe.
+**Where workers fork from.** Rust counts each Python process's OS threads
+from outside it (`proc_pidinfo` on macOS, `/proc` on Linux), which sees the
+native threads `threading.active_count()` cannot. L0 is an interpreter with
+pytest and the project's third-party packages imported. L1 is forked from it
+and collects. Workers fork from L1 when it still has one thread. When
+collection started threads (JAX building arrays at import, a conftest
+starting a thread), workers fork from L0 instead and each collects its own
+files, as xdist workers do. When even a bare interpreter has threads, each
+worker is a fresh interpreter. A preimport that starts threads, or that pulls
+in a plugin pytest must import itself, is dropped from L0. The answer is
+stored, so the next run of a JAX suite skips L1 when the inventory already
+names every test to run.
 
-**Daemon.** `forktest daemon start` keeps an L0 process with the
-third-party modules imported and an L1 forked from it that has collected
-the suite. Edits to a file L1 imported, or adding or removing a `.py`
-file, kill L1 and re-fork it from L0. Edits to `pyproject.toml` or a
-lockfile restart L0. `forktest watch` is the same daemon in the
-foreground, driven by file changes, with a niced run of the unselected
-tests after each affected run so a selection miss is reported rather than
-hidden.
+**Execution and recording.** Selected tests are grouped by module, assigned
+to workers by longest processing time from what each test cost last time,
+and each worker runs its share in pytest's collection order through the
+`pytest_runtest_protocol` hook, so plugins that wrap it still apply. A
+`sys.monitoring` `PY_START` hook records which project functions ran, an
+`open` audit hook records which project data files were read, and fixture
+definitions are added statically. Workers send each distinct function name
+once and each test's hits as packed ids; Rust turns them into dependency
+sets and skips the write when a test's set is unchanged.
+
+**macOS.** A forked child cannot reach notifyd, so libc rereads the time zone
+file on every `localtime()`: `datetime.now()` takes 168 µs in a forked
+worker against 0.32 µs in its parent. forktest loads a small interposer into
+the test interpreter that keeps libc's cached zone, which brings it to
+0.26 µs, and removes it from the environment before any test runs. It also
+sets `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` for its Python processes.
+
+**Daemon.** `forktest daemon start` keeps L0 warm and, when the fork point
+allows, a fully collected L1. A file watcher (FSEvents, inotify) tells it
+which files changed, so a request trusts every other fingerprint without a
+stat. A change to a file L1 imported or read, a test file, or the set of
+`.py` files rebuilds L1 in the background, and a request that arrives
+meanwhile collects only what it needs in an L1 of its own. A change to
+`pyproject.toml` or a lockfile restarts L0. `forktest watch` is the same
+daemon in the foreground: each change cancels the run in progress, runs the
+affected tests, then runs the unselected ones at low priority so a selection
+miss is reported rather than hidden.
 
 ## Measured
 
-All numbers below were measured on a 12-core Apple Silicon laptop with
-Python 3.14.6, on 2026-10-28. Other work on the machine kept the load
-average between 2 and 6 during these runs, which is why the sides are
-interleaved where a table says so. Each number is the median wall-clock
-time of one CLI invocation, with the range of the runs after it.
-
-### attrs
-
-A shallow clone of [attrs](https://github.com/python-attrs/attrs) at
-c8bb9bf with pytest 9.1.1: 1,413 tests, of which 2 fail in a shallow clone
-(`test_packaging.py::TestLegacyMetadataHack::test_version_info`). The edit
-adds a line to `_InstanceOfValidator.__repr__` in `src/attr/validators.py`.
-forktest selects the 12 tests that run it plus the 2 failing tests. Every
-run reported the same pass and fail counts as pytest.
-
-| scenario | runs | median | range |
-|---|---|---|---|
-| `pytest -q`, whole suite | 5, interleaved | 4.81 s | 4.51 to 4.95 s |
-| `pytest -n auto`, whole suite | 5, interleaved | 2.40 s | 2.35 to 2.47 s |
-| `forktest` after the edit, no daemon | 5, interleaved | 0.51 s | 0.48 to 0.52 s |
-| `forktest --all`, no daemon | 5, interleaved | 1.11 s | 1.08 to 1.15 s |
-| `forktest` after the edit, daemon, waits for the zygote to rebuild | 5 | 0.26 s | 0.26 to 0.26 s |
-| `forktest` after the edit, daemon, zygote already rebuilt | 5 | 0.098 s | 0.098 to 0.099 s |
-
-Selection takes 13 ms. The code before this work took 49 ms (46 to 50 ms)
-for it and 0.52 s per edit run in the same rounds. No `--all` run can beat
-its longest test: `tests/test_make.py::TestMetadata::test_not_none_metadata`
-takes 0.42 s by pytest's count and 0.59 s with recording.
-
-### pandas
-
-[pandas](https://github.com/pandas-dev/pandas) at c32acd3, built from
-source as an editable install (meson and Cython), Python 3.14.6, pytest
-9.2.0, without pyarrow. The slice is `pandas/tests/frame`: 16,876 tests, of
-which 41 fail in this environment (timezone tests that use dateutil). The
-edit adds a line to `describe_ndframe` in `pandas/core/methods/describe.py`.
-forktest selects the 55 tests that run it plus the 41 tests that failed
-last time. Every run reported the same pass and fail counts as pytest, and
-`forktest --all` failed on exactly the same 41 tests as `pytest -n auto`.
-
-| scenario | runs | median | range |
-|---|---|---|---|
-| `pytest`, whole slice | 5, interleaved | 23.46 s | 23.05 to 24.36 s |
-| `pytest -n auto`, whole slice | 5, interleaved | 9.89 s | 9.45 to 11.02 s |
-| `forktest` after the edit, no daemon, 96 of 16,876 tests | 5, interleaved | 2.93 s | 2.80 to 3.19 s |
-| `forktest --all`, no daemon | 5, interleaved | 7.09 s | 6.34 to 7.48 s |
-
-After an edit, forktest is 8x faster than plain pytest and 3.4x faster
-than xdist. Selection takes 86 ms (84 to 92 ms). Most of the rest is
-pytest's own import and collection: `pytest --collect-only` alone took
-2.21 to 2.39 s in the same minutes. Running the 96 tests takes about 0.4 s,
-most of it the 41 failures formatting their tracebacks (3.2 s of worker
-time over 12 workers). `--all` is 1.4x faster than xdist. It is bound by
-the workers: about 44 s of CPU across 12 of them, of which recording with
-`sys.monitoring` is about 12 s and building results and dependency sets
-about 4 s. The code before this work took 5.95 s per edit, because
-selection loaded and checked all 8.9M recorded references, and 18.76 s for
-`--all`, because the parent turned every test's hits into dependencies one
-test at a time. Rerun it with `bench/bench_interleaved.py`.
-
-Running pandas found four compatibility bugs, all fixed with a test each:
-compiled extensions inside the project crashed recording, `filterwarnings`
-marks were skipped (564 false failures), the JUnit reporter imported
-`email.message` into the test process (a pandas test that forgets that
-import passed under forktest only), and a module skipped at import was not
-counted.
+On a 12-core Apple Silicon laptop, Python 3.12 for the demo and 3.14 for
+attrs and pandas, on 2026-10-30. Each table interleaves its sides round by
+round after a warm-up round, and reports the median wall-clock time of one
+CLI invocation with the range after it. Other work kept the load average
+between 3 and 6 for most rounds and up to 10 at the end of the pandas ones.
+Every forktest run reported the same pass, fail, skip and xfail counts as
+pytest. The Python version ran from a checkout of `main` (1fe3bc5).
 
 ### The demo
 
-`uv run python bench/bench.py` prints this table for your machine. Each
-side ran 5 times in a row, not interleaved.
+`examples/demo`, 16 tests, one of them sleeping 0.25 s. The edit inserts a
+statement into `round_vat` and selects the 7 tests that run it; the daemon
+rows flip `+ 0` on its return instead. 5 rounds.
 
-| scenario | pytest | forktest |
+| scenario | pytest | Python forktest | Rust forktest |
+|---|---|---|---|
+| one-function edit | 1.32 s, whole suite | 0.211 s (0.204 to 0.216) | 0.150 s (0.149 to 0.159) |
+| rerun, nothing changed | | 0.176 s (0.175 to 0.183) | 0.009 s (0.009 to 0.009) |
+| `--all` | 1.32 s (1.32 to 1.33) | 0.468 s (0.467 to 0.470) | 0.407 s (0.402 to 0.409) |
+| edit through the daemon, zygote rebuilt | | 59.8 ms (59.0 to 62.4) | 27.3 ms (25.1 to 27.8) |
+| edit through the daemon, during the rebuild | | 172.3 ms (167.6 to 175.6) | 91.2 ms (88.7 to 95.7) |
+
+A rerun with nothing changed starts no Python. The edit run is bound by
+starting Python and `import pytest` (about 70 ms) and the 0.25 s sleeps bound
+`--all`.
+
+### attrs
+
+[attrs](https://github.com/python-attrs/attrs) at c8bb9bf: 1,413 tests, 2 of
+which fail in a shallow clone. The edit adds a line to
+`_InstanceOfValidator.__repr__` and selects the 12 tests that run it plus the
+2 that failed last time. The rerun with nothing changed reruns those 2. 5
+rounds.
+
+| scenario | pytest | pytest -n auto | Python forktest | Rust forktest |
+|---|---|---|---|---|
+| one-function edit | 5.86 s, whole suite | 2.86 s, whole suite | 0.599 s (0.592 to 0.633) | 0.321 s (0.317 to 0.325) |
+| rerun, nothing changed | | | 0.566 s (0.557 to 0.578) | 0.307 s (0.302 to 0.311) |
+| `--all` | 5.86 s (5.81 to 6.13) | 2.86 s (2.77 to 2.90) | 1.303 s (1.25 to 1.44) | 1.193 s (1.17 to 1.22) |
+
+No `--all` run can beat its longest test,
+`TestMetadata::test_not_none_metadata`, which takes 0.42 s by pytest's count.
+
+### pandas
+
+[pandas](https://github.com/pandas-dev/pandas) at c32acd3, an editable meson
+build, pytest 9.2, without pyarrow. The slice is `pandas/tests/frame`: 16,876
+tests, of which 41 fail in this environment. The edit adds a line to
+`describe_ndframe` and selects the 55 tests that run it plus the 41 that
+failed last time. 3 rounds.
+
+| scenario | pytest -n auto | Python forktest | Rust forktest |
+|---|---|---|---|
+| one-function edit, 96 tests | 12.56 s, whole slice | 3.71 s (3.71 to 3.98) | 2.02 s (1.93 to 2.04) |
+| rerun, nothing changed, 41 tests | | 3.67 s (3.65 to 3.90) | 2.04 s (1.90 to 2.09) |
+| `--all` | 12.56 s (12.02 to 12.62) | 8.46 s (8.02 to 8.63) | 7.47 s (6.82 to 7.56) |
+
+Without the daemon, every run pays `import pandas` (0.9 s), since pandas is
+the project, and the 41 failing tests format their tracebacks. Collection is
+narrowed to the selected functions: 280 items instead of the 9,037 their files
+hold.
+
+### JAX
+
+`examples/jaxdemo`: 8 tests, and `tests/test_eager.py` builds JAX arrays at
+import, which starts 61 native threads during collection. The Python forktest
+forked 4 workers from that process and all 4 hung in XLA's compiler. 5
+rounds, Python 3.12, jax 0.12.
+
+| scenario | pytest | Rust forktest |
 |---|---|---|
-| cold full run | 1.24 s (1.23 to 1.24) | 0.52 s (0.51 to 0.53), `--all` |
-| one-function edit, cold process | 1.23 s (1.23 to 1.25), whole suite | 0.23 s (0.23 to 0.24), 7 of 16 selected |
-| one-function edit, warm daemon, waits for the zygote to rebuild | | 0.105 s (0.103 to 0.109) |
-| one-function edit, warm daemon, zygote already rebuilt | | 0.075 s (0.073 to 0.076) |
+| one-function edit, 7 tests | 0.930 s, whole suite | 0.656 s (0.621 to 0.699) |
+| `--all` | 0.930 s (0.917 to 0.950) | 0.830 s (0.785 to 0.852) |
 
-The demo's slow module sleeps 0.25 s per test, which is what bounds both
-full runs. The cold forktest floor is interpreter start plus `import
-pytest` (0.095 s) plus collection.
+Workers fork from L0, before collection, and each starts its own JAX
+backend. No run printed JAX's fork warning. `import pytest, jax` alone takes
+0.36 s of the edit run.
 
-## What works
+### Other projects
 
-- Fixtures of every scope, `conftest.py` hierarchies, parametrize,
-  markers, `-k`, `-m`, `-x`, paths and other pytest arguments.
-- Assertion rewriting and pytest's failure explanations.
-- Function-level selection, data-file selection, module-constant
-  selection through the import graph, config-change detection.
-- JSONL, JUnit and human reporters; `--verify-selection` and the watch
-  safety net.
+`bench/corpus.py` runs pytest, `pytest -n auto`, forktest, rtest and rpytest
+on more projects (more-itertools, click, flask, rich, FastAPI, Django REST
+framework) and checks every count against pytest; `bench/args_parity.py`
+checks exit codes and counts for 127 argument sets across five projects.
 
 ## Limitations, honestly
 
-- **Each worker builds session fixtures itself.** There is no L2 layer yet,
-  so a session fixture runs once per worker rather than once per run, and a
-  test that mutates a session fixture does not affect tests in other
-  workers. `--strict-pytest` gives exact single-process semantics.
-- **Selection still reads one row per test.** Changed keys and the index
-  rows they need are small, but every test's outcome, cost and module set
-  are loaded to find new and failed tests: about 30 ms of the 86 ms on
-  pandas' 16,876 tests.
-- **`--all` records coverage on every run.** On pandas, recording is about
-  12 s of the 44 s of worker CPU. A test whose dependency set is unchanged
-  sends nothing back, but its hits are still collected and hashed.
-- **A run that changes every test's dependencies records them serially.**
-  The first run, or the first after an upgrade resets the store, makes the
-  parent intern and index every test's set: `--all` on pandas took 11 to
-  16 s on such runs, against about 7 s afterwards.
-- **A file's stat is trusted.** A file whose `mtime_ns`, `ctime_ns` and size
-  match the stored ones is not read again. Any write moves ctime, even one
-  that restores mtime with `os.utime`, and a file read within 2 s of its
-  last change is read again next time, as git does for racily clean files.
-  An edit is missed only on a file system that does not update ctime, or
-  when the clock moves back.
-- **A function behind a cache is recorded by the test that filled it.**
-  With `functools.lru_cache`, later tests in the same worker get a cache hit
-  and never run the function, so an edit to it does not select them. On
-  pandas, about 130 of 16,876 tests record a different set between two
-  identical runs, mostly for this reason. `--verify-selection` and the watch safety
+- **Linux is untested.** Everything above ran on macOS. The Linux paths
+  (`/proc` thread counts, inotify) compile and are written for it, but have
+  not run. The daemon watches the project recursively, and inotify's watch
+  limit may need raising on large trees.
+- **First runs record everything.** A run with an empty store collects and
+  records every test, which on attrs is slower than `pytest -n auto`. Every
+  later run is faster.
+- **Each worker builds session fixtures itself.** A session fixture runs once
+  per worker rather than once per run, and a test that mutates one does not
+  affect tests in other workers. `--strict-pytest` gives exact single-process
+  semantics.
+- **A function behind a cache is recorded by the test that filled it.** With
+  `functools.lru_cache`, or a JAX function reached through a jit trace another
+  test already compiled, later tests in the same worker never run it, so an
+  edit to it does not select them. `--verify-selection` and the watch safety
   net report such a miss.
-- **The daemon does not start on pandas.** L0 preimports
-  `_hypothesis_globals`, pytest then warns that it cannot rewrite a module
-  already imported, and pandas' `filterwarnings = error` turns that warning
-  into a crash of every zygote. L0 also stays alive after it logs that it is
-  shutting down. Both happen with the code before this work too.
-- pytest-xdist is replaced, not supported.
+- **A file's stat is trusted.** A file whose `mtime_ns`, `ctime_ns` and size
+  match the stored ones is not read again. A file read within 2 s of its
+  last change is read again next time, as git does for racily clean files.
+- **New test files outside `python_files`** (doctest targets, plugin-collected
+  YAML) are found by the next full collection, not the next partial one.
+- **pytest's rootdir** is approximated without Python. When pytest picks a
+  different one, forktest warns and selection may be off.
 - **Captured output is not shown.** Failure events carry the assertion
   message and the project frames, not the captured stdout of the test.
-- **Hashes are read after the test ran.** An edit saved while a run is in
-  progress can be recorded against the wrong content. The safety net and
-  the next full run catch it.
-- **Same-second, same-size edits can run stale bytecode.** CPython's
-  `.pyc` check uses the source mtime in whole seconds and the size. This
-  is a CPython behaviour that plain pytest shares. forktest's selection is
-  content-based and will still pick the right tests.
-- **Threads in the zygote disable forking.** If anything started a thread
-  during collection, forktest warns and runs in-process.
-- **macOS.** forktest re-execs itself once with
-  `OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES` before forking. Linux is the
-  primary target.
+- **An edit saved during a run** can be recorded against the wrong content.
+  The safety net and the next full run catch it.
+- **Same-second, same-size edits can run stale bytecode.** CPython's `.pyc`
+  check uses the source mtime in whole seconds and the size, as plain pytest
+  does. forktest's selection is content-based and still picks the right tests.
+- pytest-xdist is replaced, not supported. `forktest -h` shows pytest's help;
+  forktest's own options are listed above.
 - **Windows** is not supported.
-- Static collection, the MCP server, spawn mode and the database and
-  connection adapters from `DESIGN.md` are not implemented.
 
 ## Development
 
 ```bash
-uv sync
-uv run pytest tests          # unit tests plus CLI, daemon and watch end-to-end tests on examples/demo
-uv run python bench/bench.py
-python bench/bench_interleaved.py ROOT TESTPATH EDIT_FILE ANCHOR_LINE ROUNDS LOG   # any real project
+cargo build --release
+cargo test --release                                  # unit tests and the process layer against real interpreters
+.venv/bin/python -m pytest tests                      # CLI, daemon, watch, JAX and interpreter tests on the binary
+FORKTEST_PY_SRC=../ft-py-ref/src cargo test parity    # fingerprints and import closures against the Python version
+python bench/bench_ab.py ROOT TESTPATH EDIT_FILE ANCHOR_LINE ROUNDS   # pytest, Python and Rust forktest, interleaved
+python bench/bench_daemon.py SOURCE EDIT_FILE OLD NEW EXPECT_FAILED ROUNDS
 ```
+
+`FORKTEST_BIN` names the binary the Python tests and benches run, and
+`FORKTEST_PY_SRC` a checkout of `main`'s `src` for the Python version.
+`RUST_PLAN.md` is the design. `DESIGN.md` is the original product spec.

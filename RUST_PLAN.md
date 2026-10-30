@@ -6,7 +6,7 @@ The Python version stays on `main` as the behavioral reference. Its CLI and daem
 
 ## Why the rewrite changes the process model
 
-Measured on this machine (Python 3.12, jax 0.8, macOS):
+Measured on this machine (Python 3.12, jax 0.12, macOS):
 
 - `import jax` leaves the process at 1 OS thread. The first `jnp.ones(3)` takes it to 62. `threading.active_count()` stays at 1 throughout.
 - The Python forktest checks only `threading.active_count()`. On `examples/jaxdemo`, whose `tests/test_eager.py` builds arrays at import, it forks 4 workers from a zygote with 62 native threads. All 4 hang inside `xla::CompileCpuExecutableInternal` waiting for a thread pool that did not survive `fork()`. Plain pytest runs the same 8 tests in 0.8 s.

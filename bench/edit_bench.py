@@ -9,6 +9,8 @@ every run meets the same kind of edit. The sides alternate their order every rou
 - oneshot: times `BIN --no-daemon --json` right after the edit.
 - building: starts BIN's daemon, makes the edit, waits until the daemon reports its zygote building, then times
   a client run, so the run meets the rebuild. The daemon stops after each run.
+- cold: as building, but times the edit and a client run started at once, for projects whose rebuild is too short
+  to catch.
 
 Every run prints the load average, the selection, the outcome counts and the FORKTEST_LOG collection line.
 """
@@ -23,7 +25,7 @@ from pathlib import Path
 
 mode, root, edit_file, anchor, rounds, bin_a, bin_b, *pytest_args = sys.argv[1:]
 root = Path(root)
-assert mode in ("oneshot", "building")
+assert mode in ("oneshot", "building", "cold")
 edits = 0
 
 
@@ -72,7 +74,7 @@ def summary(proc: subprocess.CompletedProcess) -> str:
     done = next((e for e in events if e["event"] == "done"), {})
     collected = [line for line in proc.stderr.splitlines() if "collected" in line or "served by" in line]
     return (
-        f"selected={sel.get('selected')} passed={done.get('passed')} failed={done.get('failed')} "
+        f"selected={sel.get('selected')} at {sel.get('duration_ms')} ms passed={done.get('passed')} failed={done.get('failed')} "
         f"errors={done.get('errors')} | {' | '.join(collected)}"
     )
 
@@ -90,9 +92,13 @@ def building(binary: str) -> float:
         wait_zygote(binary, "ready")
         timed(binary)
         wait_zygote(binary, "ready")
+        started = time.perf_counter()
         edit()
-        wait_zygote(binary, "building")
-        elapsed, proc = timed(binary)
+        if mode == "building":
+            wait_zygote(binary, "building")
+            started = time.perf_counter()
+        proc = run(binary, "--json", *pytest_args)
+        elapsed = time.perf_counter() - started
         print(f"    {summary(proc)}")
         return elapsed
     finally:

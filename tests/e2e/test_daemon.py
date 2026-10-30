@@ -192,6 +192,50 @@ def test_an_import_that_rewrites_a_module_unchanged_keeps_the_zygote(served):
     assert rc == 1 and failed(events) == {"tests/test_stamp.py::test_version"}
 
 
+SLOW_COLLECTION = "import time\n\ntime.sleep(3)\n\n\ndef test_collected_slowly():\n    pass\n"
+
+
+def test_an_edit_run_during_a_rebuild_collects_only_what_it_needs_and_the_rebuild_lands(served):
+    demo = served
+    demo.write("tests/test_slow_collection.py", SLOW_COLLECTION)
+    l1 = start(demo, FORKTEST_LOG="1")["zygote_pid"]
+    client(demo)
+    demo.edit("billing/tax.py", ROUND, ROUND + " + 1")
+    wait_for(lambda: zygote(demo)[0] == "building", what="the rebuild")
+    before = len(daemon_log(demo))
+    started = time.monotonic()
+    events, rc = client(demo)
+    elapsed = time.monotonic() - started
+    assert selection(events).reasons == {"coverage": 7} and rc == 1 and done(events).failed == 7
+    assert elapsed < 2.5, f"the run took {elapsed:.1f} s: it waited for the 3 s rebuild"
+    assert "collecting 2 files: tests/test_invoice.py tests/test_tax.py" in daemon_log(demo)[before:]
+
+    wait_ready(demo, other_than=l1, what="the rebuild")
+    assert status(demo)["tests"] == "17"
+    log = daemon_log(demo)[before:]
+    assert log.count("zygote building") == 0 and log.count("zygote ready") == 1, log
+    before = len(daemon_log(demo))
+    events, rc = client(demo)
+    assert selection(events).reasons == {"last_failed": 7} and rc == 1 and done(events).failed == 7
+    assert "served by the warm collection of 17 tests" in daemon_log(demo)[before:]
+
+
+def test_an_edit_while_the_zygote_builds_makes_it_build_again(served):
+    demo = served
+    demo.write("tests/test_slow_collection.py", SLOW_COLLECTION)
+    l1 = start(demo, FORKTEST_LOG="1")["zygote_pid"]
+    client(demo)
+    demo.edit("billing/tax.py", ROUND, ROUND + " + 1")
+    wait_for(lambda: zygote(demo)[0] == "building", what="the rebuild")
+    demo.edit("billing/tax.py", ROUND + " + 1", ROUND + " + 0 * 1")
+    wait_ready(demo, other_than=l1, what="the second rebuild")
+    assert "stale: billing/tax.py changed while it was collecting" in daemon_log(demo)
+    before = len(daemon_log(demo))
+    events, rc = client(demo)
+    assert selection(events).reasons == {"coverage": 7} and rc == 0 and done(events).passed == 7
+    assert "served by the warm collection of 17 tests" in daemon_log(demo)[before:]
+
+
 def test_a_new_test_file_is_seen_by_the_next_run(served):
     demo = served
     start(demo)

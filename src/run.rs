@@ -82,6 +82,8 @@ pub struct Project {
     session: Option<(SessionKey, Session)>,
     /// The session's L1 when it holds a full collection, which later requests with the same key run from as is.
     warm: Option<Warm>,
+    /// What `Warm::seen` will hold for the collection `start_warm_up` started.
+    warming: HashMap<String, Hash128>,
     /// Set from another thread to stop the run in progress.
     cancel: Arc<AtomicBool>,
 }
@@ -395,7 +397,7 @@ impl Project {
         let store = Store::open(root)?;
         let fps = Arc::new(Fingerprints::new(root, store.file_infos()?));
         let cancel = Arc::new(AtomicBool::new(false));
-        Ok(Project { root: root.to_path_buf(), python, store, fps, session: None, warm: None, cancel })
+        Ok(Project { root: root.to_path_buf(), python, store, fps, session: None, warm: None, warming: HashMap::new(), cancel })
     }
 
     pub fn python(&self) -> &Path {
@@ -423,30 +425,44 @@ impl Project {
         Ok(code)
     }
 
-    /// Collects everything these args collect and keeps L1, so a later `run` of the same args collects nothing.
-    pub fn warm_up(&mut self, req: &Request) -> anyhow::Result<&Warm> {
+    /// Starts collecting everything these args collect in an L1 that `finish_warm_up` keeps, so a later `run` of
+    /// the same args collects nothing. Runs meanwhile collect what they need in L1s of their own.
+    pub fn start_warm_up(&mut self, req: &Request) -> anyhow::Result<()> {
         self.warm = None;
         let meta: ProjectMeta = read_meta(&self.store, PROJECT_META)?;
-        let seen = self.content_hashes(&meta);
-        let session = self.session_for(req, full_policy(req), &meta)?;
-        let collected = session.collect(None)?;
+        self.warming = self.content_hashes(&meta);
+        self.session_for(req, full_policy(req), &meta)?.start_background()
+    }
+
+    /// The warm collection once the one `start_warm_up` started has finished. `None` while it runs, or when a run
+    /// replaced it.
+    pub fn finish_warm_up(&mut self) -> Option<anyhow::Result<()>> {
+        let collected = match self.session.as_mut()?.1.finish_background()? {
+            Ok(c) => c,
+            Err(e) => return Some(Err(e)),
+        };
         if let Some(code) = collected.exit_code {
-            anyhow::bail!("pytest exited with code {code} before running tests");
+            return Some(Err(anyhow::anyhow!("pytest exited with code {code} before running tests")));
         }
-        let warm = Warm::new(Arc::new(collected), &self.root, &self.fps, seen);
-        self.store.save_file_infos(self.fps.take_fresh())?;
-        Ok(self.warm.insert(warm))
+        let warm = Warm::new(Arc::new(collected), &self.root, &self.fps, std::mem::take(&mut self.warming));
+        self.warm = Some(warm);
+        Some(self.store.save_file_infos(self.fps.take_fresh()))
+    }
+
+    pub fn warming_up(&self) -> bool {
+        self.session.as_ref().is_some_and(|(_, s)| s.collecting_in_background())
     }
 
     pub fn warm(&self) -> Option<&Warm> {
         self.warm.as_ref()
     }
 
-    /// Kills L1 and keeps L0.
+    /// Kills L1 and any warm-up in progress, and keeps L0.
     pub fn drop_warm(&mut self) {
         self.warm = None;
         if let Some((_, session)) = &mut self.session {
             session.drop_l1();
+            session.drop_background();
         }
     }
 

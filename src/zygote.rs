@@ -168,6 +168,9 @@ pub struct Session {
     /// `None` when L0 had threads even without preimports, or the policy forces spawning.
     l0: Option<Proc>,
     l1: Option<Proc>,
+    background: Option<Background>,
+    /// Collect ids of L1s forked from L0 and dropped before they connected, killed when they do.
+    abandoned: HashSet<u64>,
     tolerated: u32,
     dropped: Vec<String>,
     preimported: usize,
@@ -176,6 +179,20 @@ pub struct Session {
     /// Where children's stderr goes instead of ours.
     stderr: Option<File>,
     server: Server,
+}
+
+/// A full collection in an L1 of its own while other work goes on.
+struct Background {
+    cid: u64,
+    collect: Value,
+    proc: Proc,
+    started: Instant,
+    /// Its last collection message, or a crash when it went away first.
+    outcome: Option<Value>,
+}
+
+fn crash(message: &str) -> Value {
+    json!({"type": "crash", "message": message})
 }
 
 struct Proc {
@@ -215,6 +232,8 @@ impl Session {
             conns: HashMap::new(),
             l0: None,
             l1: None,
+            background: None,
+            abandoned: HashSet::new(),
             tolerated: 0,
             dropped: Vec::new(),
             preimported: 0,
@@ -264,26 +283,16 @@ impl Session {
         &self.dropped
     }
 
-    /// Forks L1 from L0 and collects everything, or the `partial` scope when given.
+    /// Forks L1 from L0 and collects everything, or the `partial` scope when given. Collecting everything replaces
+    /// a background collection.
     pub fn collect(&mut self, partial: Option<&Partial>) -> anyhow::Result<Collected> {
         self.drop_l1();
-        self.serial += 1;
-        let cid = self.serial;
-        let (files, only) = (partial.map(|p| &p.files), partial.map(|p| &p.only));
-        let collect = json!({"type": "collect", "cid": cid, "args": self.config.pytest_args, "files": files, "only": only});
-        let child = match &self.l0 {
-            Some(l0) => {
-                let conn = l0.conn;
-                self.send(conn, &collect)?;
-                None
-            }
-            None => Some(self.spawn(&["l1", &cid.to_string()])?),
-        };
-        let spawned = child.is_some();
-        self.l1 = Some(Proc { pid: child.as_ref().map_or(0, |c| c.id() as i32), conn: u64::MAX, child });
-        if spawned {
-            groups::add(self.l1.as_ref().unwrap().pid);
+        if partial.is_none() {
+            self.drop_background();
         }
+        let (cid, collect, l1) = self.fork_l1(partial)?;
+        let spawned = l1.child.is_some();
+        self.l1 = Some(l1);
         let (conn, pid) = self.wait("L1 to connect", Who::L1, |_, conn, msg, _| {
             (msg["type"] == "hello" && msg["role"] == "l1" && msg["cid"] == cid)
                 .then(|| (conn, msg["pid"].as_i64().unwrap_or(0) as i32))
@@ -300,6 +309,32 @@ impl Session {
         let msg = self.wait("collection", Who::L1, |_, c, msg, _| {
             (c == conn && matches!(msg["type"].as_str(), Some("collected" | "failed" | "crash"))).then(|| msg.clone())
         })?;
+        self.finish_collection(&msg)
+    }
+
+    /// Asks L0 to fork an L1 that collects, or spawns one when there is no L0. It has not connected yet.
+    fn fork_l1(&mut self, partial: Option<&Partial>) -> anyhow::Result<(u64, Value, Proc)> {
+        self.serial += 1;
+        let cid = self.serial;
+        let (files, only) = (partial.map(|p| &p.files), partial.map(|p| &p.only));
+        let collect = json!({"type": "collect", "cid": cid, "args": self.config.pytest_args, "files": files, "only": only});
+        let child = match &self.l0 {
+            Some(l0) => {
+                let conn = l0.conn;
+                self.send(conn, &collect)?;
+                None
+            }
+            None => Some(self.spawn(&["l1", &cid.to_string()])?),
+        };
+        if let Some(child) = &child {
+            groups::add(child.id() as i32);
+        }
+        Ok((cid, collect, Proc { pid: child.as_ref().map_or(0, |c| c.id() as i32), conn: u64::MAX, child }))
+    }
+
+    /// What L1's last collection message says it collected. L1 is dropped when it has nothing to run.
+    fn finish_collection(&mut self, msg: &Value) -> anyhow::Result<Collected> {
+        let pid = self.l1.as_ref().map_or(0, |l1| l1.pid);
         match msg["type"].as_str() {
             Some("failed") => {
                 self.drop_l1();
@@ -331,9 +366,99 @@ impl Session {
                         fallback
                     }
                 };
-                Ok(Collected::parse(&msg, self.fork_point))
+                Ok(Collected::parse(msg, self.fork_point))
             }
         }
+    }
+
+    /// Starts collecting everything in an L1 of its own, next to the current one. Collections and runs go on
+    /// meanwhile, and `finish_background` makes it the session's L1 once it has collected.
+    pub fn start_background(&mut self) -> anyhow::Result<()> {
+        self.drop_background();
+        let (cid, collect, proc) = self.fork_l1(None)?;
+        self.background = Some(Background { cid, collect, proc, started: Instant::now(), outcome: None });
+        Ok(())
+    }
+
+    pub fn collecting_in_background(&self) -> bool {
+        self.background.is_some()
+    }
+
+    /// What the background collection collected, its L1 now the session's, once it has reported. `None` while it
+    /// runs, or when there is none.
+    pub fn finish_background(&mut self) -> Option<anyhow::Result<Collected>> {
+        loop {
+            let bg = self.background.as_mut()?;
+            if bg.outcome.is_none()
+                && let Some(Ok(Some(status))) = bg.proc.child.as_mut().map(Child::try_wait)
+            {
+                bg.outcome = Some(crash(&format!("the Python process exited ({status})")));
+            }
+            if bg.outcome.is_none() && bg.proc.conn == u64::MAX && bg.started.elapsed() > HELLO_TIMEOUT {
+                bg.outcome = Some(crash(&format!("no connection after {HELLO_TIMEOUT:?}")));
+            }
+            if bg.outcome.is_some() {
+                break;
+            }
+            match self.next(Duration::ZERO) {
+                None => return None,
+                Some(In::Closed(c)) if self.l0.as_ref().is_some_and(|l0| l0.conn == c) => {
+                    self.background.as_mut()?.outcome = Some(crash("the interpreter L1 forks from exited"));
+                }
+                Some(_) => {}
+            }
+        }
+        let bg = self.background.take()?;
+        if bg.proc.pid == 0 {
+            self.abandoned.insert(bg.cid);
+        }
+        self.drop_l1();
+        self.l1 = Some(bg.proc);
+        Some(self.finish_collection(&bg.outcome.expect("checked above")))
+    }
+
+    /// Kills the background collection, if any.
+    pub fn drop_background(&mut self) {
+        if let Some(bg) = self.background.take() {
+            if bg.proc.pid == 0 {
+                self.abandoned.insert(bg.cid);
+            }
+            self.reap(bg.proc);
+        }
+    }
+
+    /// Takes the frames of the background collection, and of an L1 dropped before it connected, so the waits of
+    /// other work never see them.
+    fn claim(&mut self, conn: u64, msg: &Value) -> bool {
+        let hello = msg["type"] == "hello" && msg["role"] == "l1";
+        let pid = msg["pid"].as_i64().unwrap_or(0) as i32;
+        if hello && msg["cid"].as_u64().is_some_and(|cid| self.abandoned.remove(&cid)) {
+            kill_group(pid);
+            self.conns.remove(&conn);
+            return true;
+        }
+        let Some(bg) = self.background.as_mut() else { return false };
+        if hello && msg["cid"] == bg.cid {
+            bg.proc.conn = conn;
+            if bg.proc.child.is_none() {
+                bg.proc.pid = pid;
+                groups::add(pid);
+            } else {
+                let collect = bg.collect.clone();
+                let config = json!({"type": "config", "preimport": [], "root": self.config.root});
+                if self.send(conn, &config).and_then(|_| self.send(conn, &collect)).is_err() {
+                    self.background.as_mut().unwrap().outcome = Some(crash("the Python process closed its connection"));
+                }
+            }
+            return true;
+        }
+        if conn != bg.proc.conn {
+            return false;
+        }
+        if matches!(msg["type"].as_str(), Some("collected" | "failed" | "crash")) {
+            bg.outcome.get_or_insert_with(|| msg.clone());
+        }
+        true
     }
 
     /// Runs batches from the current fork point, in parallel, streaming events. `nice` lowers worker priority.
@@ -527,18 +652,23 @@ impl Session {
     /// Replaces the pytest args later collections and runs use. L0 never saw them, so it stays.
     pub fn set_args(&mut self, args: Vec<String>) {
         self.drop_l1();
+        self.drop_background();
         self.config.pytest_args = args;
     }
 
     /// Kills L1 (a project file it imported changed) and keeps L0.
     pub fn drop_l1(&mut self) {
-        if let Some(mut l1) = self.l1.take() {
-            kill_group(l1.pid);
-            groups::remove(l1.pid);
-            self.conns.remove(&l1.conn);
-            if let Some(child) = l1.child.as_mut() {
-                let _ = child.wait();
-            }
+        if let Some(l1) = self.l1.take() {
+            self.reap(l1);
+        }
+    }
+
+    fn reap(&mut self, mut proc: Proc) {
+        kill_group(proc.pid);
+        groups::remove(proc.pid);
+        self.conns.remove(&proc.conn);
+        if let Some(child) = proc.child.as_mut() {
+            let _ = child.wait();
         }
     }
 
@@ -625,13 +755,8 @@ impl Session {
     }
 
     fn kill_l0(&mut self) {
-        if let Some(mut l0) = self.l0.take() {
-            kill_group(l0.pid);
-            groups::remove(l0.pid);
-            self.conns.remove(&l0.conn);
-            if let Some(child) = l0.child.as_mut() {
-                let _ = child.wait();
-            }
+        if let Some(l0) = self.l0.take() {
+            self.reap(l0);
         }
     }
 
@@ -668,10 +793,19 @@ impl Session {
                 Ok(Incoming::Open(conn, stream)) => {
                     self.conns.insert(conn, Conn { stream, names: Vec::new() });
                 }
-                Ok(Incoming::Frame(conn, frame)) => return Some(In::Frame(conn, frame.msg, frame.blob)),
+                Ok(Incoming::Frame(conn, frame)) => {
+                    if !self.claim(conn, &frame.msg) {
+                        return Some(In::Frame(conn, frame.msg, frame.blob));
+                    }
+                }
                 Ok(Incoming::Closed(conn)) => {
                     self.conns.remove(&conn);
-                    return Some(In::Closed(conn));
+                    match self.background.as_mut().filter(|bg| bg.proc.conn == conn) {
+                        Some(bg) => {
+                            bg.outcome.get_or_insert_with(|| crash("the Python process exited"));
+                        }
+                        None => return Some(In::Closed(conn)),
+                    }
                 }
                 Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => return None,
             }
@@ -728,6 +862,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.drop_background();
         self.drop_l1();
         self.kill_l0();
     }
@@ -1319,6 +1454,54 @@ mod tests {
             let narrowed = session.collect(Some(&partial(&files, &only))).unwrap();
             let got: Vec<_> = narrowed.items.iter().map(|i| i.nodeid.clone()).collect();
             assert_eq!(got, expected);
+        }
+        assert_no_orphans();
+    }
+
+    #[test]
+    fn a_background_collection_goes_on_beside_partial_runs_and_becomes_l1() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let scratch = Scratch::example("demo");
+        {
+            let (mut session, _) = start(&scratch, config(&scratch.0, &python));
+            let mut names = Names::default();
+            let cancel = AtomicBool::new(false);
+            session.start_background().unwrap();
+            let tax = session.collect(Some(&partial(&["tests/test_tax.py"], &[]))).unwrap();
+            let mut report = Report::default();
+            session.run(batches(&tax.items, 2), false, &mut names, &cancel, &mut report.sink()).unwrap();
+            assert!(report.lost.is_empty(), "{:?}", report.lost);
+            assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), tax.items.len() as u64)]));
+            assert!(session.collecting_in_background());
+
+            let full = loop {
+                if let Some(collected) = session.finish_background() {
+                    break collected.unwrap();
+                }
+                std::thread::sleep(TICK);
+            };
+            assert_eq!(full.items.len(), 16);
+            assert!(!session.collecting_in_background());
+            let mut report = Report::default();
+            session.run(batches(&full.items, 4), false, &mut names, &cancel, &mut report.sink()).unwrap();
+            assert_eq!(report.results.len(), 16, "{:?}", report.lost);
+
+            session.start_background().unwrap();
+            session.drop_background();
+            session.collect(Some(&partial(&["tests/test_tax.py"], &[]))).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                session.next(TICK);
+            }
+            let l0 = session.l0.as_ref().unwrap().pid.to_string();
+            let shim = python::shim_path().unwrap().display().to_string();
+            let l1s = || -> Vec<String> {
+                let out = Command::new("ps").args(["-axww", "-o", "ppid=,pid=,command="]).output().unwrap();
+                let lines = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect::<Vec<_>>();
+                lines.into_iter().filter(|l| l.contains(&shim) && l.split_whitespace().next() == Some(&l0)).collect()
+            };
+            assert_shim_processes_in(1, l1s);
         }
         assert_no_orphans();
     }

@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 /// A save is often several writes; rebuilding after the first would waste the rebuild.
 const REBUILD_DEBOUNCE: Duration = Duration::from_millis(50);
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(150);
+/// How often the daemon looks for the end of a zygote build when nothing else wakes it.
+const BUILD_POLL: Duration = Duration::from_millis(20);
 /// Far longer than any watcher latency seen, short enough that a lost cookie costs one slow request.
 const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -318,6 +320,9 @@ struct Daemon {
     workers: usize,
     zygote: Zygote,
     rebuild_at: Option<Instant>,
+    build_started: Instant,
+    /// Files reported changed while the zygote was building, checked against what it read once it is done.
+    changed_while_building: BTreeSet<String>,
     /// Every `.py` file under the root, to tell an added or removed one from an edit.
     py_files: BTreeSet<String>,
     rx: Receiver<Msg>,
@@ -372,6 +377,8 @@ fn serve(root: &Path, opts: Opts, watch: bool) -> anyhow::Result<()> {
         workers: opts.workers,
         zygote: Zygote::Absent,
         rebuild_at: Some(Instant::now()),
+        build_started: Instant::now(),
+        changed_while_building: BTreeSet::new(),
         rx,
         backlog: VecDeque::new(),
         shared,
@@ -519,6 +526,7 @@ impl Daemon {
             if self.zygote == Zygote::Absent && self.rebuild_at.is_some_and(|t| t <= now) {
                 self.rebuild();
             }
+            self.finish_rebuild();
             if let Some(Some(at)) = self.watch
                 && now.duration_since(at) >= WATCH_DEBOUNCE
             {
@@ -530,8 +538,9 @@ impl Daemon {
     fn idle_for(&self) -> Duration {
         let now = Instant::now();
         let rebuild = self.rebuild_at.filter(|_| self.zygote == Zygote::Absent);
+        let build = (self.zygote == Zygote::Building).then(|| now + BUILD_POLL);
         let watch = self.watch.flatten().map(|t| t + WATCH_DEBOUNCE);
-        match rebuild.into_iter().chain(watch).min() {
+        match rebuild.into_iter().chain(build).chain(watch).min() {
             Some(t) => t.saturating_duration_since(now),
             None => Duration::from_secs(3600),
         }
@@ -578,26 +587,52 @@ impl Daemon {
         self.publish();
     }
 
+    /// Starts a full collection that requests do not wait for: until it is done they collect what they need.
     fn rebuild(&mut self) {
         self.set_zygote(Zygote::Building);
         log(&format!("zygote building (pytest args {:?})", self.args));
-        let started = Instant::now();
+        self.build_started = Instant::now();
+        self.changed_while_building.clear();
         let req = self.request(false);
-        let next = match self.project.warm_up(&req) {
-            Ok(warm) => {
-                let (tests, modules, fork_point) = (warm.tests(), warm.modules(), warm.fork_point());
-                log(&format!(
-                    "zygote ready (pid {}, {tests} tests, {modules} project modules imported, workers fork from {fork_point:?}) in {:.2}s",
-                    self.project.l1_pid().unwrap_or(0),
-                    started.elapsed().as_secs_f64()
-                ));
-                Zygote::Ready
-            }
-            Err(e) => {
+        if let Err(e) = self.project.start_warm_up(&req) {
+            log(&format!("zygote failed: {e:#}; see {}", self.paths.log().display()));
+            self.set_zygote(Zygote::Failed);
+        }
+    }
+
+    /// Makes the build the zygote once it has collected, unless a file it read changed while it was collecting.
+    fn finish_rebuild(&mut self) {
+        if self.zygote != Zygote::Building {
+            return;
+        }
+        let next = match self.project.finish_warm_up() {
+            None => return,
+            Some(Err(e)) => {
                 log(&format!("zygote failed: {e:#}; see {}", self.paths.log().display()));
                 Zygote::Failed
             }
+            Some(Ok(())) => {
+                let warm = self.project.warm().expect("just finished");
+                let fps = self.project.fingerprints();
+                let pid = self.project.l1_pid().unwrap_or(0);
+                match self.changed_while_building.iter().find(|p| warm.stale_after_change(p, fps)).cloned() {
+                    Some(rel) => {
+                        log(&format!("zygote {pid} stale: {rel} changed while it was collecting"));
+                        self.project.drop_warm();
+                        Zygote::Absent
+                    }
+                    None => {
+                        let (tests, modules, fork_point) = (warm.tests(), warm.modules(), warm.fork_point());
+                        log(&format!(
+                            "zygote ready (pid {pid}, {tests} tests, {modules} project modules imported, workers fork from {fork_point:?}) in {:.2}s",
+                            self.build_started.elapsed().as_secs_f64()
+                        ));
+                        Zygote::Ready
+                    }
+                }
+            }
         };
+        self.changed_while_building.clear();
         self.set_zygote(next);
     }
 
@@ -637,6 +672,9 @@ impl Daemon {
             }
             if self.project.warm().is_some_and(|w| w.stale_after_change(&rel, self.project.fingerprints())) {
                 stale.get_or_insert_with(|| format!("{rel} changed"));
+            }
+            if self.zygote == Zygote::Building {
+                self.changed_while_building.insert(rel.clone());
             }
             changed.push(rel);
         }
@@ -725,6 +763,7 @@ impl Daemon {
         if self.shared.stopping.load(Ordering::SeqCst) {
             return;
         }
+        self.finish_rebuild();
         req.stdout_to_stderr = false;
         let previous = (std::mem::replace(&mut self.args, req.pytest_args.clone()), self.fork_from);
         self.fork_from = req.fork_from;
@@ -761,6 +800,7 @@ impl Daemon {
         match (self.project.warm().is_some(), self.zygote) {
             (true, _) => self.set_zygote(Zygote::Ready),
             (false, Zygote::Failed) => {}
+            (false, Zygote::Building) if self.project.warming_up() => {}
             (false, _) => {
                 self.rebuild_at = Some(Instant::now());
                 self.set_zygote(Zygote::Absent);
@@ -774,6 +814,7 @@ impl Daemon {
         if self.shared.stopping.load(Ordering::SeqCst) {
             return;
         }
+        self.finish_rebuild();
         let req = self.request(true);
         let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
         let mut reporter = HumanReporter::new(std::io::stdout(), tty, true);

@@ -154,14 +154,31 @@ fn probe_marker(python: &Path) -> Option<PathBuf> {
 
 /// Writes the embedded shim once per content hash under the user cache dir and returns its path.
 pub fn shim_path() -> anyhow::Result<PathBuf> {
+    cached("forktest_shim", "py", SHIM_SOURCE.as_bytes())
+}
+
+#[cfg(target_os = "macos")]
+const TZFIX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tzfix.dylib"));
+
+/// macOS only: a dylib for `DYLD_INSERT_LIBRARIES` that keeps libc's cached time zone in forked children. Without
+/// it a child cannot reach notifyd, libc treats every `localtime()` as a possible zone change and rereads the zone
+/// file, and `datetime.now()` gets about 700 times slower than in pytest's own unforked process.
+pub fn tzfix_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    return cached("forktest_tzfix", "dylib", TZFIX).ok();
+    #[cfg(not(target_os = "macos"))]
+    None
+}
+
+fn cached(stem: &str, ext: &str, content: &[u8]) -> anyhow::Result<PathBuf> {
     let dir = cache_dir()?.join("forktest");
-    let path = dir.join(format!("forktest_shim-{:016x}.py", xxhash_rust::xxh3::xxh3_64(SHIM_SOURCE.as_bytes())));
+    let path = dir.join(format!("{stem}-{:016x}.{ext}", xxhash_rust::xxh3::xxh3_64(content)));
     if path.is_file() {
         return Ok(path);
     }
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = dir.join(format!(".shim-{}-{:?}.tmp", std::process::id(), std::thread::current().id()));
-    std::fs::write(&tmp, SHIM_SOURCE).with_context(|| format!("writing {}", tmp.display()))?;
+    let tmp = dir.join(format!(".{stem}-{}-{:?}.tmp", std::process::id(), std::thread::current().id()));
+    std::fs::write(&tmp, content).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))?;
     Ok(path)
 }

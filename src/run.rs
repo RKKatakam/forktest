@@ -46,8 +46,11 @@ struct ProjectMeta {
     modules: BTreeMap<String, String>,
     fixtures: BTreeSet<(String, String)>,
     preimport: Vec<String>,
-    /// Top-level packages that started threads when L0 imported them.
+    /// Top-level packages that started threads, or imported a plugin pytest rewrites, when L0 imported them.
     dropped: BTreeSet<String>,
+    /// Modules pytest marked to rewrite, which L0 must leave for pytest to import.
+    #[serde(default)]
+    avoid: BTreeSet<String>,
 }
 
 /// What the store remembers per set of pytest args, to decide whether a partial collection is sound.
@@ -86,6 +89,8 @@ pub struct Project {
     warm: Option<Warm>,
     /// What `Warm::seen` will hold for the collection `start_warm_up` started.
     warming: HashMap<String, Hash128>,
+    /// A background collection failed with preimports, which are now forgotten; the next one should start at once.
+    healed: bool,
     /// Set from another thread to stop the run in progress.
     cancel: Arc<AtomicBool>,
 }
@@ -399,7 +404,7 @@ impl Project {
         let store = Store::open(root)?;
         let fps = Arc::new(Fingerprints::new(root, store.file_infos()?));
         let cancel = Arc::new(AtomicBool::new(false));
-        Ok(Project { root: root.to_path_buf(), python, store, fps, session: None, warm: None, warming: HashMap::new(), cancel })
+        Ok(Project { root: root.to_path_buf(), python, store, fps, session: None, warm: None, warming: HashMap::new(), healed: false, cancel })
     }
 
     pub fn python(&self) -> &Path {
@@ -437,11 +442,18 @@ impl Project {
     }
 
     /// The warm collection once the one `start_warm_up` started has finished. `None` while it runs, or when a run
-    /// replaced it.
+    /// replaced it. A failure with preimports forgets them and the session, so `take_healed` tells the caller to
+    /// start again at once.
     pub fn finish_warm_up(&mut self) -> Option<anyhow::Result<()>> {
         let collected = match self.session.as_mut()?.1.finish_background()? {
             Ok(c) => c,
-            Err(e) => return Some(Err(e)),
+            Err(e) => {
+                let mut meta: ProjectMeta = read_meta(&self.store, PROJECT_META).unwrap_or_default();
+                if self.forget_preimports(&mut meta) {
+                    self.healed = serde_json::to_string(&meta).is_ok_and(|m| self.store.meta_set(PROJECT_META, &m).is_ok());
+                }
+                return Some(Err(e));
+            }
         };
         if let Some(code) = collected.exit_code {
             return Some(Err(anyhow::anyhow!("pytest exited with code {code} before running tests")));
@@ -602,8 +614,8 @@ impl Project {
                 // Workers that collect their own files need no L1 when the inventory already names every test to run.
                 let no_l1 = known_fork_point.filter(|p| matches!(p, ForkPoint::Imported | ForkPoint::Spawn))
                     .filter(|_| !req.strict && partial.as_ref().is_some_and(|p| p.files.iter().all(|f| narrowed.contains(f))));
-                let session = self.session_for(req, full_policy(req), &project)?;
                 let collected = if let Some(fork_point) = no_l1 {
+                    let session = self.session_for(req, full_policy(req), &project)?;
                     session.drop_l1();
                     session.assume_fork_point(fork_point);
                     let only = &partial.as_ref().expect("checked above").only;
@@ -616,14 +628,14 @@ impl Project {
                     log(|| format!("no L1: {} tests from the inventory; workers fork from {} and collect their files", only.len(), fork_point_name(session.fork_point())));
                     Arc::new(Collected::known(items, session.fork_point()))
                 } else {
-                    let mut collected = session.collect(partial.as_ref())?;
+                    let mut collected = self.collect_healing(req, &mut project, partial.as_ref())?;
                     if let Some(p) = partial.as_mut().filter(|_| collected.exit_code.is_none())
                         && let Some(n) = not_collected(&collected, &p.only)
                     {
                         log(|| format!("{n} was not collected with its file narrowed to the selected tests; collecting whole files"));
                         p.only.clear();
                         narrowed.clear();
-                        collected = session.collect(Some(p))?;
+                        collected = self.collect_healing(req, &mut project, Some(p))?;
                     }
                     let collected = Arc::new(collected);
                     if let Some(code) = collected.exit_code {
@@ -756,6 +768,37 @@ impl Project {
         Ok(0)
     }
 
+    /// Preimports come from an earlier run and can break collection (a package that pulls in a plugin pytest
+    /// rewrites, under -W error). Without them the run is slower but sound, and teaches the next one better.
+    /// A collection that fails while preimports are in use is tried once more without them: a store can hold a list
+    /// from before L0 learned to avoid modules that pull in a plugin pytest must import itself.
+    fn collect_healing(&mut self, req: &Request, meta: &mut ProjectMeta, partial: Option<&Partial>) -> anyhow::Result<Collected> {
+        match self.session_for(req, full_policy(req), meta)?.collect(partial) {
+            Err(e) if self.forget_preimports(meta) => {
+                log(|| format!("collection failed with preimports, retrying without them: {e:#}"));
+                self.session_for(req, full_policy(req), meta)?.collect(partial)
+            }
+            other => other,
+        }
+    }
+
+    /// Clears the preimports and drops the session that used them. False when there were none to blame.
+    fn forget_preimports(&mut self, meta: &mut ProjectMeta) -> bool {
+        if meta.preimport.is_empty() {
+            return false;
+        }
+        meta.preimport.clear();
+        self.warm = None;
+        self.session = None;
+        true
+    }
+
+    /// Whether the last background collection failed with preimports that are now forgotten, so a retry should start
+    /// at once rather than wait for a file change.
+    pub fn take_healed(&mut self) -> bool {
+        std::mem::take(&mut self.healed)
+    }
+
     /// The warm session for these args, or a new one. Other args only need a new L1. Fails with `Unsupported`
     /// before anything is emitted when the interpreter cannot run the shim.
     fn session_for(&mut self, req: &Request, policy: ForkPolicy, meta: &ProjectMeta) -> anyhow::Result<&mut Session> {
@@ -785,6 +828,7 @@ impl Project {
                 python: self.python.clone(),
                 pytest_args: req.pytest_args.clone(),
                 preimport,
+                avoid: meta.avoid.iter().cloned().collect(),
                 policy,
                 stdout_to_stderr: req.stdout_to_stderr,
             })?;
@@ -918,6 +962,10 @@ fn merge_project_meta(meta: &mut ProjectMeta, collected: &Collected, dropped: &[
     let preimport: BTreeSet<String> = meta.preimport.drain(..).chain(collected.third_party.iter().cloned()).collect();
     meta.preimport = preimport.into_iter().collect();
     meta.dropped.extend(dropped.iter().cloned());
+    if !partial {
+        meta.avoid.clear();
+    }
+    meta.avoid.extend(collected.rewrite.iter().cloned());
 }
 
 /// Seconds one more worker adds before its first test: its fork, measured at about 3 ms on the demo.

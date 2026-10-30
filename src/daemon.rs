@@ -607,6 +607,10 @@ impl Daemon {
         }
         let next = match self.project.finish_warm_up() {
             None => return,
+            Some(Err(e)) if self.project.take_healed() => {
+                log(&format!("zygote failed with preimports, rebuilding without them: {e:#}"));
+                Zygote::Absent
+            }
             Some(Err(e)) => {
                 log(&format!("zygote failed: {e:#}; see {}", self.paths.log().display()));
                 Zygote::Failed

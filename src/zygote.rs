@@ -62,6 +62,8 @@ pub struct SessionConfig {
     pub python: PathBuf,
     pub pytest_args: Vec<String>,
     pub preimport: Vec<String>,
+    /// Modules pytest imports itself to rewrite (plugins). L0 drops a preimport that pulls one in.
+    pub avoid: Vec<String>,
     pub policy: ForkPolicy,
     /// Child stdout goes to our stderr, so `-s` output cannot corrupt JSON lines.
     pub stdout_to_stderr: bool,
@@ -86,6 +88,8 @@ pub struct Collected {
     pub modules: HashMap<String, String>,
     /// Third-party modules worth preimporting next time (minus those pytest wants to rewrite).
     pub third_party: Vec<String>,
+    /// Modules pytest marked to rewrite: plugins it has to import itself.
+    pub rewrite: Vec<String>,
     /// (path, qualname) of every fixture definition in the project the collected items use.
     pub fixtures: Vec<(String, String)>,
     /// Per collected file: names executed and files read while collecting it.
@@ -283,7 +287,7 @@ impl Session {
         }
     }
 
-    /// Top-level preimports L0 dropped because importing them started threads.
+    /// Top-level preimports L0 dropped because importing them started threads or pulled in a pytest plugin.
     pub fn dropped_preimports(&self) -> &[String] {
         &self.dropped
     }
@@ -771,7 +775,7 @@ impl Session {
             (msg["type"] == "hello" && msg["role"] == "l0").then_some(conn)
         })?;
         self.l0.as_mut().unwrap().conn = conn;
-        self.send(conn, &json!({"type": "config", "preimport": preimport, "root": self.config.root}))?;
+        self.send(conn, &json!({"type": "config", "preimport": preimport, "avoid": self.config.avoid, "root": self.config.root}))?;
         self.wait("L0 to preimport", Who::L0, |_, c, msg, _| (c == conn && msg["type"] == "ready").then(|| msg.clone()))
     }
 
@@ -792,6 +796,18 @@ impl Session {
             .stdout(if self.config.stdout_to_stderr { self.stderr_stdio()? } else { Stdio::inherit() });
         if cfg!(target_os = "macos") {
             cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
+        }
+        if let Some(tzfix) = python::tzfix_path() {
+            let inserted = match std::env::var_os("DYLD_INSERT_LIBRARIES").filter(|v| !v.is_empty()) {
+                Some(existing) => {
+                    let mut v = tzfix.into_os_string();
+                    v.push(":");
+                    v.push(existing);
+                    v
+                }
+                None => tzfix.into_os_string(),
+            };
+            cmd.env("DYLD_INSERT_LIBRARIES", inserted);
         }
         cmd.spawn().with_context(|| format!("starting {}", self.config.python.display()))
     }
@@ -905,6 +921,7 @@ impl Collected {
             python_files: Vec::new(),
             modules: HashMap::new(),
             third_party: Vec::new(),
+            rewrite: Vec::new(),
             fixtures: Vec::new(),
             per_file: HashMap::new(),
             fork_point,
@@ -928,6 +945,7 @@ impl Collected {
             python_files: strings(&msg["python_files"]),
             modules: msg["modules"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), s(v))).collect(),
             third_party: strings(&msg["third_party"]),
+            rewrite: strings(&msg["rewrite"]),
             fixtures: pairs(&msg["fixtures"]),
             per_file: per_file.map(|(k, v)| (k.clone(), (pairs(&v["names"]), strings(&v["reads"])))).collect(),
             fork_point,
@@ -1258,6 +1276,7 @@ mod tests {
             python: python.to_path_buf(),
             pytest_args: vec![root.display().to_string(), "-p".into(), "no:cacheprovider".into()],
             preimport: Vec::new(),
+            avoid: Vec::new(),
             policy: ForkPolicy::Auto,
             stdout_to_stderr: true,
         }

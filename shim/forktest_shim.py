@@ -14,6 +14,14 @@ import sys
 import threading
 import time
 
+# dyld has loaded forktest's time zone fix by now. Tests and the processes they start should not see it.
+if "forktest_tzfix" in os.environ.get("DYLD_INSERT_LIBRARIES", ""):
+    kept = [p for p in os.environ["DYLD_INSERT_LIBRARIES"].split(":") if p and "forktest_tzfix" not in p]
+    if kept:
+        os.environ["DYLD_INSERT_LIBRARIES"] = ":".join(kept)
+    else:
+        del os.environ["DYLD_INSERT_LIBRARIES"]
+
 if sys.path and sys.path[0] == os.path.dirname(os.path.abspath(__file__)):
     # `python shim.py` puts the shim's directory first; the `pytest` console script would not.
     del sys.path[0]
@@ -480,6 +488,7 @@ class L1Plugin(BasePlugin):
             "fork_from": self.config.getini("forktest_fork_from") or None,
             "modules": self.known_modules(),
             "third_party": self.third_party_modules(),
+            "rewrite": sorted(rewrite_names()),
             "fixtures": self.fixtures.of_all(self.items),
             "per_file": {
                 path: {"names": sorted(names), "reads": sorted(reads)} for path, (names, reads) in self.per_file.items()
@@ -612,8 +621,12 @@ def l1_main(conn, root, msg):
     flush_and_exit(0)
 
 
-def preimport(names):
-    """Imports one top-level package at a time; returns the tolerated thread count and the dropped packages."""
+def preimport(names, avoid=()):
+    """Imports one top-level package at a time; returns the tolerated thread count and the dropped packages.
+
+    A package that starts threads is dropped, and so is one that imports a module in `avoid`: pytest imports its
+    plugins itself to rewrite their asserts, and one imported earlier gets a warning a `-W error` suite fails on.
+    """
     import importlib
 
     tops = {}
@@ -622,6 +635,8 @@ def preimport(names):
     tolerated = 0
     dropped = []
     before = os_threads() if tops else None
+    avoid = set(avoid)
+    present = avoid.intersection(sys.modules)
     for top, mods in tops.items():
         for name in mods:
             try:
@@ -629,6 +644,12 @@ def preimport(names):
             except BaseException:  # the list came from an earlier environment; a name that no longer imports is fine
                 pass
         after = os_threads()
+        now = avoid.intersection(sys.modules)
+        if now - present:
+            dropped.append(top)
+            present = now
+            before = after
+            continue
         if before is None or after is None:
             continue
         if after > before:
@@ -647,7 +668,7 @@ def l0_main():
     if config is None:
         os._exit(0)
     root = config["root"]
-    tolerated, dropped, threads = preimport(config["preimport"])
+    tolerated, dropped, threads = preimport(config["preimport"], config.get("avoid", ()))
     conn.send(
         {
             "type": "ready",

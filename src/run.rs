@@ -6,7 +6,9 @@ use crate::graph::ImportGraph;
 use crate::root::{config_files, is_excluded};
 use crate::select::{self, Affected, Current, Reason, SinceBaseline, WorkingTree};
 use crate::store::{DepSet, GitBaseline, InventoryRow, Record, Store, StoreView, dep_hash};
-use crate::zygote::{Batch, Collected, Control, ForkPoint, ForkPolicy, Names, Partial, Session, SessionConfig, WorkerEvent};
+use crate::zygote::{
+    Batch, Collected, CollectedItem, Control, ForkPoint, ForkPolicy, Names, Partial, Session, SessionConfig, WorkerEvent,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -596,28 +598,46 @@ impl Project {
                 };
                 self.warm = None;
                 let seen = if partial.is_none() { self.content_hashes(&project) } else { HashMap::new() };
+                // Workers that collect their own files need no L1 when the inventory already names every test to run.
+                let no_l1 = matches!(policy, ForkPolicy::Force(ForkPoint::Imported | ForkPoint::Spawn))
+                    && !req.strict
+                    && partial.as_ref().is_some_and(|p| p.files.iter().all(|f| narrowed.contains(f)));
                 let session = self.session_for(req, policy, &project)?;
-                let mut collected = session.collect(partial.as_ref())?;
-                if let Some(p) = partial.as_mut().filter(|_| collected.exit_code.is_none())
-                    && let Some(n) = not_collected(&collected, &p.only)
-                {
-                    log(|| format!("{n} was not collected with its file narrowed to the selected tests; collecting whole files"));
-                    p.only.clear();
-                    narrowed.clear();
-                    collected = session.collect(Some(p))?;
-                }
-                let collected = Arc::new(collected);
-                if let Some(code) = collected.exit_code {
-                    return Ok(code);
-                }
-                log(|| format!("collected {} tests; workers fork from {}", collected.items.len(), fork_point_name(collected.fork_point)));
-                if std::fs::canonicalize(&collected.rootdir).is_ok_and(|r| r != root) {
-                    eprintln!(
-                        "forktest: pytest's rootdir is {} but forktest's is {}; affected-test selection may be off",
-                        collected.rootdir.display(),
-                        root.display()
-                    );
-                }
+                let collected = if no_l1 {
+                    session.drop_l1();
+                    let only = &partial.as_ref().expect("checked above").only;
+                    let path_of: HashMap<&str, &str> =
+                        inventory.iter().flat_map(|r| r.nodeids.iter().map(|n| (n.as_str(), &*r.path))).collect();
+                    let items = only
+                        .iter()
+                        .map(|n| CollectedItem { nodeid: n.clone(), path: path_of.get(n.as_str()).copied().unwrap_or(test_file(n)).to_string() })
+                        .collect();
+                    log(|| format!("no L1: {} tests from the inventory; workers fork from {} and collect their files", only.len(), fork_point_name(session.fork_point())));
+                    Arc::new(Collected::known(items, session.fork_point()))
+                } else {
+                    let mut collected = session.collect(partial.as_ref())?;
+                    if let Some(p) = partial.as_mut().filter(|_| collected.exit_code.is_none())
+                        && let Some(n) = not_collected(&collected, &p.only)
+                    {
+                        log(|| format!("{n} was not collected with its file narrowed to the selected tests; collecting whole files"));
+                        p.only.clear();
+                        narrowed.clear();
+                        collected = session.collect(Some(p))?;
+                    }
+                    let collected = Arc::new(collected);
+                    if let Some(code) = collected.exit_code {
+                        return Ok(code);
+                    }
+                    log(|| format!("collected {} tests; workers fork from {}", collected.items.len(), fork_point_name(collected.fork_point)));
+                    if std::fs::canonicalize(&collected.rootdir).is_ok_and(|r| r != root) {
+                        eprintln!(
+                            "forktest: pytest's rootdir is {} but forktest's is {}; affected-test selection may be off",
+                            collected.rootdir.display(),
+                            root.display()
+                        );
+                    }
+                    collected
+                };
                 let warm = Warm::new(collected.clone(), &root, &fps, seen);
                 if partial.is_none() {
                     self.warm = Some(warm.clone());
@@ -934,7 +954,7 @@ impl Execution<'_> {
         let mut deps = Deps::new(self.root, self.fps, self.graph);
         let mut names = Names::default();
         let mut failures = 0u32;
-        let maxfail = self.maxfail;
+        let mut maxfail = self.maxfail;
         let (view, path_of, collect_errors) = (self.view, self.path_of, &mut self.collect_errors);
         let records = &mut learned.records;
         let mut report = |result: TestResult, emit: &mut dyn FnMut(&Event)| {
@@ -957,6 +977,7 @@ impl Execution<'_> {
                         }
                     }
                 }
+                WorkerEvent::Started { maxfail: m } => maxfail = m,
                 WorkerEvent::CollectError { nodeid, message, .. } => {
                     if collect_errors.insert(nodeid.clone()) {
                         emit(&Event::CollectError { nodeid, message });

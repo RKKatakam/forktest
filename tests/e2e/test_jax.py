@@ -38,3 +38,40 @@ def test_all_on_four_workers_matches_pytest_and_an_edit_reruns_the_callers(jaxde
     assert failed(events) == set() and done(events).passed == selection(events).selected
     reran = {c.attrib["name"] for c in ET.parse(jaxdemo.root / "out.xml").getroot().iter("testcase")}
     assert {"test_dense_shape", "test_jit_matches_eager", "test_dense_zero_input"} <= reran, reran
+
+
+DENSE = "return jnp.tanh(w @ x)"
+
+
+def test_an_edit_run_whose_workers_collect_their_own_files_starts_no_l1_and_honours_x(jaxdemo):
+    events, rc = jaxdemo.forktest("-x")
+    assert rc == 0 and done(events).passed == 8
+    assert jaxdemo.log("collected") == ["forktest: collected 8 tests; workers fork from imported"]
+
+    jaxdemo.edit("model/layers.py", DENSE, DENSE + " + 0.0")
+    events, rc = jaxdemo.forktest("-x")
+    assert rc == 0 and FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr
+    assert jaxdemo.log("collected") == [] and len(jaxdemo.log("no L1: 7 tests from the inventory")) == 1, jaxdemo.stderr
+    assert selection(events).reasons == {"coverage": 7} and done(events).passed == 7 and failed(events) == set()
+
+    jaxdemo.edit("model/layers.py", DENSE + " + 0.0", DENSE + " * jnp.nan")
+    events, rc = jaxdemo.forktest("-x")
+    assert jaxdemo.log("collected") == [] and FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr
+    assert rc == 1 and len(failed(events)) == 1 and done(events).failed == 1, events
+
+
+def test_a_selected_test_the_workers_no_longer_find_is_reported(jaxdemo):
+    jaxdemo.write(
+        "tests/test_case.py",
+        "import os\n\nimport jax.numpy as jnp\nimport pytest\n\nfrom model.layers import dense\n\n\n"
+        "@pytest.mark.parametrize('case', [os.environ.get('JAXDEMO_CASE', 'a')])\n"
+        "def test_case(case):\n    assert dense(jnp.eye(2), jnp.zeros(2)).shape == (2,)\n",
+    )
+    events, rc = jaxdemo.forktest()
+    assert rc == 0 and done(events).passed == 9
+    jaxdemo.edit("model/layers.py", DENSE, DENSE + " + 0.0")
+    events, rc = jaxdemo.forktest(JAXDEMO_CASE="b")
+    assert len(jaxdemo.log("no L1: 8 tests from the inventory")) == 1, jaxdemo.stderr
+    assert failed(events) == {"tests/test_case.py::test_case[a]"} and done(events).passed == 7, events
+    lost = next(e for e in events if getattr(e, "nodeid", None) == "tests/test_case.py::test_case[a]")
+    assert "did not collect" in lost.message

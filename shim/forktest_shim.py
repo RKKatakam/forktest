@@ -561,6 +561,7 @@ class BatchPlugin(BasePlugin):
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtestloop(self, session):
+        self.conn.send({"type": "started", "maxfail": self.config.getoption("maxfail") or 0})
         for nodeid, message in self.errors:
             self.conn.send({"type": "collect_error", "nodeid": nodeid, "message": message})
         by_id = {item.nodeid: item for item in self.items}

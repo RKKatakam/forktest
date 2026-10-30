@@ -141,6 +141,8 @@ pub enum WorkerEvent {
         reads: Vec<String>,
     },
     CollectError { nodeid: String, message: String },
+    /// A worker that collected its own files read its config: sent before its first result.
+    Started { maxfail: u32 },
     /// The worker died or crashed; these nodeids of its batch never reported.
     Lost {
         #[cfg_attr(not(test), expect(dead_code, reason = "tests check which worker died"))]
@@ -271,6 +273,9 @@ impl Session {
                     s.fork_point = ForkPoint::Spawn;
                 } else {
                     s.preimported = preimport.len();
+                    if let ForkPolicy::Force(p) = s.config.policy {
+                        s.fork_point = p;
+                    }
                 }
                 return Ok(s);
             }
@@ -544,6 +549,12 @@ impl Session {
                             continue;
                         }
                         match kind {
+                            "started" if !halted => {
+                                let maxfail = msg["maxfail"].as_u64().unwrap_or(0) as u32;
+                                if let Control::Stop = sink(WorkerEvent::Started { maxfail }, names) {
+                                    halt(&mut slots, &mut halted);
+                                }
+                            }
                             "result" | "collect_error" if !halted => {
                                 let event = self.worker_event(index, conn, &msg, &blob, names, &mut slots[index]);
                                 if let Some(event) = event {
@@ -869,6 +880,11 @@ impl Drop for Session {
 }
 
 impl Collected {
+    /// Items already known, for workers that collect their own files: there is no L1 to report anything else.
+    pub fn known(items: Vec<CollectedItem>, fork_point: ForkPoint) -> Collected {
+        Collected { items, exit_code: None, ..Collected::failed(0, fork_point) }
+    }
+
     fn failed(code: i32, fork_point: ForkPoint) -> Collected {
         Collected {
             items: Vec::new(),
@@ -1281,6 +1297,7 @@ mod tests {
                         self.results.push((worker, result, hits));
                     }
                     WorkerEvent::CollectError { nodeid, .. } => self.collect_errors.push(nodeid),
+                    WorkerEvent::Started { .. } => {}
                     WorkerEvent::Lost { worker, nodeids, message } => self.lost.push((worker, nodeids, message)),
                 }
                 Control::Continue

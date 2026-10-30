@@ -1125,9 +1125,10 @@ mod tests {
     }
 
     /// Outcome counts from plain pytest's summary line, run on the same copy.
-    fn pytest_counts(python: &Path, root: &Path) -> BTreeMap<String, u64> {
+    fn pytest_counts(python: &Path, root: &Path, extra: &[&str]) -> BTreeMap<String, u64> {
         let out = Command::new(python)
             .args(["-m", "pytest", "-q", "-p", "no:cacheprovider"])
+            .args(extra)
             .current_dir(root)
             .output()
             .unwrap();
@@ -1174,7 +1175,7 @@ mod tests {
         let _serial = serial();
         let Some(python) = interpreter(DEMO_PYTHON) else { return };
         let scratch = Scratch::example("demo");
-        let expected = pytest_counts(&python, &scratch.0);
+        let expected = pytest_counts(&python, &scratch.0, &[]);
         {
             let t = Instant::now();
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
@@ -1324,7 +1325,7 @@ mod tests {
         let _serial = serial();
         let Some(python) = interpreter(DEMO_PYTHON) else { return };
         let scratch = Scratch::example("demo");
-        let expected = pytest_counts(&python, &scratch.0);
+        let expected = pytest_counts(&python, &scratch.0, &[]);
         {
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
             let collected = session.collect(None).unwrap();
@@ -1385,6 +1386,152 @@ mod tests {
             assert_eq!(lost, 0);
             eprintln!("after stop: {:#?}", shim_processes());
             assert_shim_processes(2);
+        }
+        assert_no_orphans();
+    }
+
+    /// Sets `PYTHONPATH` for the Python children of one test; tests are serialized, so nothing else sees it.
+    struct PythonPath;
+
+    impl PythonPath {
+        fn set(dir: &Path) -> PythonPath {
+            unsafe { std::env::set_var("PYTHONPATH", dir) };
+            PythonPath
+        }
+    }
+
+    impl Drop for PythonPath {
+        fn drop(&mut self) {
+            unsafe { std::env::remove_var("PYTHONPATH") };
+        }
+    }
+
+    #[test]
+    fn a_preimport_that_starts_threads_is_dropped_and_l0_restarts_without_it() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let site = Scratch::new();
+        site.write("threadpkg/__init__.py", "import threading, time\nthreading.Thread(target=time.sleep, args=(600,), daemon=True).start()\n");
+        let _path = PythonPath::set(&site.0);
+        let scratch = Scratch::example("demo");
+        {
+            let mut config = config(&scratch.0, &python);
+            config.preimport = vec!["json".into(), "threadpkg".into(), "threadpkg".into()];
+            let (mut session, _) = start(&scratch, config);
+            assert_eq!(session.dropped_preimports(), ["threadpkg"]);
+            assert_eq!(threads::os_threads(session.l0.as_ref().unwrap().pid), Some(1));
+            assert_eq!(session.collect(None).unwrap().fork_point, ForkPoint::Collected);
+        }
+        assert_no_orphans();
+    }
+
+    #[test]
+    fn an_interpreter_that_starts_threads_by_itself_spawns_every_worker() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let site = Scratch::new();
+        site.write("sitecustomize.py", "import threading, time\nthreading.Thread(target=time.sleep, args=(600,), daemon=True).start()\n");
+        let _path = PythonPath::set(&site.0);
+        let scratch = Scratch::example("demo");
+        let expected = pytest_counts(&python, &scratch.0, &[]);
+        {
+            let (mut session, _) = start(&scratch, config(&scratch.0, &python));
+            assert!(session.l0.is_none());
+            assert_eq!(session.fork_point(), ForkPoint::Spawn);
+            let collected = session.collect(None).unwrap();
+            assert_eq!(collected.fork_point, ForkPoint::Spawn);
+            assert_eq!(collected.items.len(), 16);
+            let mut report = Report::default();
+            let t = Instant::now();
+            session.run(batches(&collected.items, 4), false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
+            eprintln!("demo spawn run: {:?}", t.elapsed());
+            assert!(report.lost.is_empty(), "{:?}", report.lost);
+            assert_eq!(report.counts(), expected);
+        }
+        assert_no_orphans();
+    }
+
+    const MIXED: &str = r#"import warnings
+import pytest
+
+def test_passes():
+    assert True
+
+def test_fails():
+    assert 1 == 2
+
+def test_skips():
+    pytest.skip("not today")
+
+@pytest.mark.xfail
+def test_xfails():
+    assert False
+
+@pytest.mark.xfail
+def test_xpasses():
+    assert True
+
+@pytest.fixture
+def broken():
+    raise RuntimeError("setup")
+
+def test_errors(broken):
+    pass
+
+@pytest.mark.filterwarnings("error")
+def test_warning_is_an_error():
+    warnings.warn("boom", UserWarning)
+"#;
+
+    fn mixed_project() -> Scratch {
+        let scratch = Scratch::new();
+        scratch.write("pyproject.toml", "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n");
+        scratch.write("tests/test_mixed.py", MIXED);
+        scratch.write("tests/test_skipped_module.py", "import pytest\npytest.importorskip(\"no_such_module_here\")\n");
+        scratch.write("tests/test_broken.py", "def test_x(:\n");
+        scratch
+    }
+
+    #[test]
+    fn every_outcome_matches_pytest_from_each_fork_point() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let scratch = mixed_project();
+        let mut expected = pytest_counts(&python, &scratch.0, &["--continue-on-collection-errors"]);
+        // pytest counts the module that skipped itself and the file that failed to collect; `Collected` reports those.
+        *expected.get_mut("skipped").unwrap() -= 1;
+        *expected.get_mut("error").unwrap() -= 1;
+        for policy in [ForkPolicy::Auto, ForkPolicy::Force(ForkPoint::Imported), ForkPolicy::Force(ForkPoint::Spawn)] {
+            let mut config = config(&scratch.0, &python);
+            config.policy = policy;
+            let (mut session, _) = start(&scratch, config);
+            let collected = session.collect(None).unwrap();
+            assert_eq!(collected.skips, ["tests/test_skipped_module.py"]);
+            assert_eq!(collected.errors.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(), ["tests/test_broken.py"]);
+            let mut report = Report::default();
+            session.run(batches(&collected.items, 3), false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
+            assert!(report.lost.is_empty(), "{policy:?}: {:?}", report.lost);
+            assert_eq!(report.counts(), expected, "{policy:?}");
+            let failed = report.results.iter().find(|r| r.1.nodeid.ends_with("::test_fails")).unwrap();
+            assert_eq!(failed.1.line, Some(8), "{policy:?}");
+            assert_eq!(failed.1.trace.last().map(|f| f.func.as_str()), Some("test_fails"));
+        }
+        assert_no_orphans();
+    }
+
+    #[test]
+    fn the_fork_from_ini_option_overrides_the_thread_check() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let scratch = Scratch::new();
+        scratch.write("pyproject.toml", "[tool.pytest.ini_options]\nforktest_fork_from = \"imported\"\n");
+        scratch.write("tests/test_one.py", "def test_one():\n    assert 1\n");
+        {
+            let (mut session, log) = start(&scratch, config(&scratch.0, &python));
+            assert_eq!(session.collect(None).unwrap().fork_point, ForkPoint::Imported);
+            drop(session);
+            let stderr = std::fs::read_to_string(log).unwrap();
+            assert!(!stderr.contains("Unknown config option"), "{stderr}");
         }
         assert_no_orphans();
     }

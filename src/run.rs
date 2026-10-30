@@ -95,10 +95,12 @@ pub struct Warm {
     pub inputs: Arc<HashSet<String>>,
     test_files: Arc<Vec<String>>,
     config: Arc<BTreeMap<String, String>>,
+    /// Content hashes of inputs taken before L1 started, so a write that leaves one as it was keeps the collection.
+    seen: Arc<HashMap<String, Hash128>>,
 }
 
 impl Warm {
-    fn new(collected: Arc<Collected>, root: &Path, fps: &Fingerprints) -> Warm {
+    fn new(collected: Arc<Collected>, root: &Path, fps: &Fingerprints, mut seen: HashMap<String, Hash128>) -> Warm {
         let c = &*collected;
         let mut inputs: HashSet<String> = c.modules.values().cloned().collect();
         inputs.extend(c.items.iter().map(|i| i.path.clone()));
@@ -109,12 +111,20 @@ impl Warm {
             inputs.extend(names.iter().map(|(p, _)| p.clone()));
             inputs.extend(reads.iter().cloned());
         }
+        seen.retain(|p, _| inputs.contains(p));
         Warm {
             test_files: Arc::new(test_files(root, &c.python_files)),
             config: Arc::new(config_hashes(root, fps)),
             inputs: Arc::new(inputs),
+            seen: Arc::new(seen),
             collected,
         }
+    }
+
+    /// Whether a reported change to `rel` makes the collection stale: an input whose content differs from what it
+    /// was before L1 started, or one with no hash from then.
+    pub fn stale_after_change(&self, rel: &str, fps: &Fingerprints) -> bool {
+        self.inputs.contains(rel) && self.seen.get(rel).is_none_or(|h| fps.info(rel).is_none_or(|i| i.sha != *h))
     }
 
     pub fn tests(&self) -> usize {
@@ -417,12 +427,13 @@ impl Project {
     pub fn warm_up(&mut self, req: &Request) -> anyhow::Result<&Warm> {
         self.warm = None;
         let meta: ProjectMeta = read_meta(&self.store, PROJECT_META)?;
+        let seen = self.content_hashes(&meta);
         let session = self.session_for(req, full_policy(req), &meta)?;
         let collected = session.collect(None)?;
         if let Some(code) = collected.exit_code {
             anyhow::bail!("pytest exited with code {code} before running tests");
         }
-        let warm = Warm::new(Arc::new(collected), &self.root, &self.fps);
+        let warm = Warm::new(Arc::new(collected), &self.root, &self.fps, seen);
         self.store.save_file_infos(self.fps.take_fresh())?;
         Ok(self.warm.insert(warm))
     }
@@ -457,6 +468,13 @@ impl Project {
     fn warm_for(&self, req: &Request) -> Option<Warm> {
         let (key, _) = self.session.as_ref()?;
         (*key == session_key(req, full_policy(req))).then(|| self.warm.clone()).flatten()
+    }
+
+    /// Content hashes of the project modules the last full collection imported, as they are now.
+    fn content_hashes(&self, meta: &ProjectMeta) -> HashMap<String, Hash128> {
+        let paths: Vec<&str> = meta.modules.values().map(String::as_str).collect();
+        self.fps.prefetch(paths.clone());
+        paths.into_iter().filter_map(|p| self.fps.info(p).map(|i| (p.to_string(), i.sha))).collect()
     }
 
     fn save(&mut self, key: &str, learned: Learned) -> anyhow::Result<()> {
@@ -561,6 +579,7 @@ impl Project {
                     _ => ForkPolicy::Auto,
                 };
                 self.warm = None;
+                let seen = if partial.is_none() { self.content_hashes(&project) } else { HashMap::new() };
                 let session = self.session_for(req, policy, &project)?;
                 let mut collected = session.collect(partial.as_ref())?;
                 if let Some(p) = partial.as_mut().filter(|_| collected.exit_code.is_none())
@@ -583,7 +602,7 @@ impl Project {
                         root.display()
                     );
                 }
-                let warm = Warm::new(collected.clone(), &root, &fps);
+                let warm = Warm::new(collected.clone(), &root, &fps, seen);
                 if partial.is_none() {
                     self.warm = Some(warm.clone());
                 }

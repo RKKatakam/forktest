@@ -170,6 +170,28 @@ def test_an_edit_run_right_after_the_save_sees_the_new_code(served):
         assert (rc, done(events).failed) == ((1, 7) if delta else (0, 0)), (delta, events)
 
 
+def test_an_import_that_rewrites_a_module_unchanged_keeps_the_zygote(served):
+    demo = served
+    demo.write("stamp.py", 'VERSION = "1"\n')
+    demo.write(
+        "restamp.py",
+        "import pathlib\n\nSTAMP = pathlib.Path(__file__).with_name('stamp.py')\nSTAMP.write_text(STAMP.read_text())\n\n"
+        "from stamp import VERSION\n",
+    )
+    demo.write("tests/test_stamp.py", "from restamp import VERSION\n\n\ndef test_version():\n    assert VERSION == '1'\n")
+    events, rc = demo.forktest()
+    assert rc == 0 and done(events).passed == 17
+    l1 = start(demo)["zygote_pid"]
+    time.sleep(1.5)
+    assert zygote(demo) == ("ready", l1), daemon_log(demo)
+    assert "stale" not in daemon_log(demo)
+
+    demo.edit("stamp.py", '"1"', '"22"')
+    wait_ready(demo, other_than=l1, what="zygote rebuilt after a real edit")
+    events, rc = client(demo)
+    assert rc == 1 and failed(events) == {"tests/test_stamp.py::test_version"}
+
+
 def test_a_new_test_file_is_seen_by_the_next_run(served):
     demo = served
     start(demo)

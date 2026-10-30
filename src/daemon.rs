@@ -635,7 +635,7 @@ impl Daemon {
             if self.tree_changed(&rel) {
                 stale.get_or_insert_with(|| format!("{rel} added or removed"));
             }
-            if self.project.warm().is_some_and(|w| w.inputs.contains(&rel)) {
+            if self.project.warm().is_some_and(|w| w.stale_after_change(&rel, self.project.fingerprints())) {
                 stale.get_or_insert_with(|| format!("{rel} changed"));
             }
             changed.push(rel);

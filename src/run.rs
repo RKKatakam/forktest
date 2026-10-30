@@ -44,8 +44,11 @@ struct ProjectMeta {
     modules: BTreeMap<String, String>,
     fixtures: BTreeSet<(String, String)>,
     preimport: Vec<String>,
-    /// Top-level packages that started threads when L0 imported them.
+    /// Top-level packages that started threads, or imported a plugin pytest rewrites, when L0 imported them.
     dropped: BTreeSet<String>,
+    /// Modules pytest marked to rewrite, which L0 must leave for pytest to import.
+    #[serde(default)]
+    avoid: BTreeSet<String>,
 }
 
 /// What the store remembers per set of pytest args, to decide whether a partial collection is sound.
@@ -416,9 +419,8 @@ impl Project {
     /// Collects everything these args collect and keeps L1, so a later `run` of the same args collects nothing.
     pub fn warm_up(&mut self, req: &Request) -> anyhow::Result<&Warm> {
         self.warm = None;
-        let meta: ProjectMeta = read_meta(&self.store, PROJECT_META)?;
-        let session = self.session_for(req, full_policy(req), &meta)?;
-        let collected = session.collect(None)?;
+        let mut meta: ProjectMeta = read_meta(&self.store, PROJECT_META)?;
+        let collected = self.collect_healing(req, full_policy(req), &mut meta, None)?;
         if let Some(code) = collected.exit_code {
             anyhow::bail!("pytest exited with code {code} before running tests");
         }
@@ -556,8 +558,7 @@ impl Project {
                     _ => ForkPolicy::Auto,
                 };
                 self.warm = None;
-                let session = self.session_for(req, policy, &project)?;
-                let collected = Arc::new(session.collect(files.as_deref())?);
+                let collected = Arc::new(self.collect_healing(req, policy, &mut project, files.as_deref())?);
                 if let Some(code) = collected.exit_code {
                     return Ok(code);
                 }
@@ -685,6 +686,26 @@ impl Project {
         Ok(0)
     }
 
+    /// Preimports come from an earlier run and can break collection (a package that pulls in a plugin pytest
+    /// rewrites, under -W error). Without them the run is slower but sound, and teaches the next one better.
+    fn collect_healing(
+        &mut self,
+        req: &Request,
+        policy: ForkPolicy,
+        meta: &mut ProjectMeta,
+        files: Option<&[String]>,
+    ) -> anyhow::Result<Collected> {
+        match self.session_for(req, policy, meta)?.collect(files) {
+            Err(e) if !meta.preimport.is_empty() => {
+                log(|| format!("collection failed with preimports, retrying without them: {e:#}"));
+                meta.preimport.clear();
+                self.session = None;
+                self.session_for(req, policy, meta)?.collect(files)
+            }
+            other => other,
+        }
+    }
+
     /// The warm session for these args, or a new one. Other args only need a new L1. Fails with `Unsupported`
     /// before anything is emitted when the interpreter cannot run the shim.
     fn session_for(&mut self, req: &Request, policy: ForkPolicy, meta: &ProjectMeta) -> anyhow::Result<&mut Session> {
@@ -714,6 +735,7 @@ impl Project {
                 python: self.python.clone(),
                 pytest_args: req.pytest_args.clone(),
                 preimport,
+                avoid: meta.avoid.iter().cloned().collect(),
                 policy,
                 stdout_to_stderr: req.stdout_to_stderr,
             })?;
@@ -839,6 +861,10 @@ fn merge_project_meta(meta: &mut ProjectMeta, collected: &Collected, dropped: &[
     let preimport: BTreeSet<String> = meta.preimport.drain(..).chain(collected.third_party.iter().cloned()).collect();
     meta.preimport = preimport.into_iter().collect();
     meta.dropped.extend(dropped.iter().cloned());
+    if !partial {
+        meta.avoid.clear();
+    }
+    meta.avoid.extend(collected.rewrite.iter().cloned());
 }
 
 /// Seconds one more worker adds before its first test: its fork, measured at about 3 ms on the demo.

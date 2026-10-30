@@ -7,8 +7,7 @@ machinery, unchanged.
 
 forktest is one Rust binary. It decides what to run without starting Python,
 then drives pytest inside your project's own interpreter. The original
-pure-Python build in `src/forktest` is the behavioral reference until the Rust
-version replaces it.
+pure-Python version stays on the `main` branch as the behavioral reference.
 
 ## Install
 

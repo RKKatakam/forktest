@@ -421,20 +421,9 @@ impl Session {
                 }
                 Some(In::Closed(conn)) => {
                     if let Some(&index) = by_conn.get(&conn) {
-                        let message = slots[index].exit_message();
-                        if slots[index].finish(index, halted, &message, sink, names) {
-                            halt(&mut slots, &mut halted);
-                        }
+                        slots[index].closed.get_or_insert_with(Instant::now);
                     } else if Some(conn) == parent {
                         parent_gone = true;
-                        for index in 0..slots.len() {
-                            if slots[index].conn.is_none() {
-                                let message = "the process workers fork from exited";
-                                if slots[index].finish(index, halted, message, sink, names) {
-                                    halt(&mut slots, &mut halted);
-                                }
-                            }
-                        }
                     }
                 }
                 None => {}
@@ -446,9 +435,8 @@ impl Session {
                         slot.exited = Some((status_code(status), Instant::now()));
                     }
                 }
-                let gone = slot.exited.is_some_and(|(_, at)| at.elapsed() > EXIT_GRACE);
-                if !slot.finished && slot.conn.is_none() && gone {
-                    let message = slot.exit_message();
+                if !slot.finished && slot.settled(halted, parent_gone) {
+                    let message = slot.exit_message(parent_gone);
                     if slots[index].finish(index, halted, &message, sink, names) {
                         halt(&mut slots, &mut halted);
                     }
@@ -765,6 +753,8 @@ struct Slot {
     crash: Option<String>,
     /// Wait status and when its parent reported it.
     exited: Option<(i64, Instant)>,
+    /// When its connection closed.
+    closed: Option<Instant>,
     finished: bool,
 }
 
@@ -778,7 +768,20 @@ impl Slot {
             child: None,
             crash: None,
             exited: None,
+            closed: None,
             finished: false,
+        }
+    }
+
+    /// Whether a worker that will send nothing more is known well enough to report what it left.
+    /// A connection closes before its parent reports the wait status, so a closed one waits a little for it.
+    fn settled(&self, halted: bool, parent_gone: bool) -> bool {
+        match (self.closed, self.exited) {
+            (Some(_), _) if halted => true,
+            (Some(_), Some(_)) => true,
+            (Some(at), None) => parent_gone || at.elapsed() > EXIT_GRACE,
+            (None, Some((_, at))) => self.conn.is_none() && at.elapsed() > EXIT_GRACE,
+            (None, None) => self.conn.is_none() && parent_gone,
         }
     }
 
@@ -790,10 +793,11 @@ impl Slot {
         }
     }
 
-    fn exit_message(&self) -> String {
+    fn exit_message(&self, parent_gone: bool) -> String {
         match (&self.crash, self.exited) {
             (Some(crash), _) => crash.clone(),
             (None, Some((status, _))) => format!("worker exited before running this test (wait status {status})"),
+            (None, None) if parent_gone && self.conn.is_none() => "the process workers fork from exited".into(),
             (None, None) => "worker exited before running this test".into(),
         }
     }
@@ -1308,6 +1312,8 @@ mod tests {
             "import threading, time\nthreading.Thread(target=time.sleep, args=(600,), daemon=True).start()\n",
         );
         scratch.write("tests/test_one.py", "def test_one():\n    assert 1\n\ndef test_two():\n    assert 2\n");
+        let shim_dir = python::shim_path().unwrap().parent().unwrap().display().to_string();
+        scratch.write("tests/test_path.py", &format!("import sys\n\ndef test_shim_dir_not_on_path():\n    assert {shim_dir:?} not in sys.path\n"));
         {
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
             let collected = session.collect(None).unwrap();
@@ -1315,7 +1321,7 @@ mod tests {
             let mut report = Report::default();
             let mut names = Names::default();
             session.run(batches(&collected.items, 2), false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();
-            assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 2)]));
+            assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 3)]));
         }
         assert_no_orphans();
     }
@@ -1537,9 +1543,39 @@ def test_warning_is_an_error():
     }
 
     #[test]
-    fn sigterm_to_the_rust_process_takes_its_python_children_down() {
+    fn a_worker_that_dies_mid_batch_loses_the_rest_of_its_batch() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let scratch = Scratch::new();
+        scratch.write(
+            "tests/test_die.py",
+            "import os\n\ndef test_before():\n    pass\n\ndef test_dies():\n    os._exit(3)\n\ndef test_after():\n    pass\n",
+        );
+        {
+            let (mut session, _) = start(&scratch, config(&scratch.0, &python));
+            let collected = session.collect(None).unwrap();
+            let mut report = Report::default();
+            session.run(batches(&collected.items, 1), false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
+            assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 1)]));
+            let [(worker, nodeids, message)] = &report.lost[..] else { panic!("{:?}", report.lost) };
+            assert_eq!(*worker, 0);
+            assert_eq!(nodeids, &["tests/test_die.py::test_dies", "tests/test_die.py::test_after"]);
+            assert!(message.contains("wait status 768"), "{message}");
+        }
+        assert_no_orphans();
+    }
+
+    #[test]
+    fn a_fatal_signal_to_the_rust_process_takes_its_python_children_down() {
         let _serial = serial();
         let Some(_) = interpreter(DEMO_PYTHON) else { return };
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGKILL] {
+            signal_target_then(signal);
+            eprintln!("signal {signal}: no orphans");
+        }
+    }
+
+    fn signal_target_then(signal: i32) {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["zygote::tests::signal_target", "--exact", "--ignored", "--nocapture"])
             .env("FORKTEST_SIGNAL_TARGET", "1")
@@ -1550,7 +1586,7 @@ def test_warning_is_an_error():
         let ready = stdout.lines().map_while(Result::ok).any(|l| l.contains("signal target ready"));
         assert!(ready);
         assert!(shim_processes().len() >= 2);
-        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        unsafe { libc::kill(child.id() as i32, signal) };
         let status = child.wait().unwrap();
         assert!(!status.success());
         assert_no_orphans();

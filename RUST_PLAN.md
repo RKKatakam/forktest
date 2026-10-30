@@ -58,7 +58,9 @@ On pandas' frame slice, `pytest --collect-only` alone is 2.2 s of the Python for
 - A file is re-collected when its content hash, closure digest or recorded collection deps changed, or it had a collection error last time.
 - A full collection runs when there is no inventory for the args key, a file matching `python_files` or a `conftest.py` was added or removed, a config file changed, or the mode needs every test (`--all`, `--verify-selection`).
 - The shim restricts collection with a `tryfirst` `pytest_ignore_collect`: a directory with no target beneath it, and a file that is not a target (other than `__init__.py`), are ignored. User arguments, rootdir and conftest discovery are untouched.
+- A file collected only because it holds selected tests (not re-collected) is narrowed further: a `tryfirst` `pytest_pycollect_makeitem` returns no items for names that are not on a selected test's nodeid path (module-level functions and classes, then methods, nested classes in turn, parameters stripped). Every parametrization of a named function is made, and Rust keeps the selected ones. Its stored inventory row stands, since the collection saw only part of it. When a selected test is missing from a narrowed collection (a plugin that names items apart from their functions), the files are collected again whole.
 - Nothing selected and nothing to re-collect means Python never starts.
+- The daemon rebuilds its warm L1 in the background: a request that arrives meanwhile forks its own L1 from L0 for the files it needs, and the rebuild goes on. A file reported changed while the rebuild collects stales it once it is done, unless its content matches the hash taken before L1 started (importing pandas from a meson editable install rewrites `_version_meson.py` with the same bytes).
 
 ### Execution and recording
 

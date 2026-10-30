@@ -119,7 +119,7 @@ fn pack(ids: &[u32]) -> Vec<u8> {
 }
 
 fn unpack(b: &[u8]) -> Vec<u32> {
-    b.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes"))).collect()
+    b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
 }
 
 fn outcome_of(name: &str) -> Outcome {

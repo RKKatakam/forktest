@@ -49,10 +49,16 @@ fn sum(values: impl Iterator<Item = f64>) -> f64 {
     total + compensation
 }
 
-#[derive(PartialEq, PartialOrd)]
+#[derive(PartialEq)]
 struct Load(f64);
 
 impl Eq for Load {}
+
+impl PartialOrd for Load {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl Ord for Load {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {

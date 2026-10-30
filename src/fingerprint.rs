@@ -214,7 +214,7 @@ impl<'a> Reader<'a> {
 }
 
 /// The fingerprint and import statements of one source, from one parse.
-pub fn analyze(source: &str) -> Option<(HashMap<Arc<str>, Hash128>, Vec<ImportStmt>)> {
+pub fn analyze(source: &str) -> Option<(Fingerprint, Vec<ImportStmt>)> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut module = ruff_python_parser::parse_module(source).ok()?.into_syntax();
     let mut imports = Vec::new();
@@ -376,10 +376,6 @@ impl Fingerprints {
             fresh: Mutex::new(HashSet::new()),
             racy_ns: RACY_NS,
         }
-    }
-
-    pub fn root(&self) -> &Path {
-        &self.root
     }
 
     /// `None` for a missing file.

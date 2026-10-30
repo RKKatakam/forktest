@@ -364,6 +364,9 @@ pub struct Fingerprints {
     known: RwLock<HashMap<RelPath, Arc<FileInfo>>>,
     fresh: Mutex<HashSet<RelPath>>,
     racy_ns: i64,
+    /// With a file watcher reporting every change: files looked up since their last reported change, used without a
+    /// stat. `None` without a watcher.
+    watched: RwLock<Option<HashMap<RelPath, Arc<FileInfo>>>>,
 }
 
 impl Fingerprints {
@@ -375,7 +378,38 @@ impl Fingerprints {
             known: RwLock::new(known.into_iter().map(|(p, i)| (p, Arc::new(i))).collect()),
             fresh: Mutex::new(HashSet::new()),
             racy_ns: RACY_NS,
+            watched: RwLock::new(None),
         }
+    }
+
+    /// From now on a file looked up once is trusted until `invalidate` names it. The caller must report every change
+    /// under the root, outside excluded directories, before each lookup that has to see it.
+    pub fn trust_watcher(&self) {
+        self.watched.write().unwrap().get_or_insert_with(HashMap::new);
+    }
+
+    /// `rel` changed: a file, or a directory with everything under it.
+    pub fn invalidate(&self, rel: &str) {
+        if let Some(map) = self.watched.write().unwrap().as_mut()
+            && map.remove(rel).is_none()
+        {
+            let prefix = format!("{rel}/");
+            map.retain(|p, _| !p.starts_with(&prefix));
+        }
+    }
+
+    /// The watcher lost events: every file is stat'ed again.
+    pub fn invalidate_all(&self) {
+        if let Some(map) = self.watched.write().unwrap().as_mut() {
+            map.clear();
+        }
+    }
+
+    /// A watcher reports changes under the root's real path only, so a file reached through a symlink, or in a
+    /// directory the watcher skips, is never trusted.
+    fn watchable(&self, path: &str) -> bool {
+        let full = self.root.join(path);
+        !crate::root::is_excluded(path) && !path.starts_with('/') && std::fs::canonicalize(&full).is_ok_and(|real| real == full)
     }
 
     /// `None` for a missing file.
@@ -385,6 +419,26 @@ impl Fingerprints {
 
     /// The info with the interned path it is stored under.
     pub fn entry(&self, path: &str) -> Option<(RelPath, Arc<FileInfo>)> {
+        let trusted = match self.watched.read().unwrap().as_ref() {
+            None => None,
+            Some(map) => Some(map.get_key_value(path).map(|(p, i)| (p.clone(), i.clone()))),
+        };
+        match trusted {
+            None => self.lookup(path),
+            Some(Some(hit)) => Some(hit),
+            Some(None) => {
+                let found = self.lookup(path)?;
+                if self.watchable(path)
+                    && let Some(map) = self.watched.write().unwrap().as_mut()
+                {
+                    map.insert(found.0.clone(), found.1.clone());
+                }
+                Some(found)
+            }
+        }
+    }
+
+    fn lookup(&self, path: &str) -> Option<(RelPath, Arc<FileInfo>)> {
         let full = self.root.join(path);
         let stat = Stat::of(&std::fs::metadata(&full).ok()?);
         let known = self.known.read().unwrap().get_key_value(path).map(|(p, i)| (p.clone(), i.clone()));
@@ -643,6 +697,28 @@ if os.name == "posix":
         fresh.sort();
         assert_eq!(fresh, ["broken.py", "data.json", "m.py"]);
         assert!(fps.take_fresh().is_empty());
+    }
+
+    #[test]
+    fn a_watched_cache_trusts_a_file_until_the_watcher_names_it() {
+        let root = std::fs::canonicalize(tmp_dir("watched")).unwrap();
+        std::fs::create_dir_all(root.join("pkg")).unwrap();
+        std::fs::write(root.join("pkg/m.py"), "def f():\n    return 1\n").unwrap();
+        std::fs::write(root.join("n.py"), "def g():\n    return 1\n").unwrap();
+        std::os::unix::fs::symlink(root.join("n.py"), root.join("link.py")).unwrap();
+        let fps = Fingerprints::new(&root, HashMap::new());
+        fps.trust_watcher();
+        let before = |p: &str, q: &str| fps.dep(p, q).unwrap().hash;
+        let (m1, n1, l1) = (before("pkg/m.py", "f"), before("n.py", "g"), before("link.py", "g"));
+        std::fs::write(root.join("pkg/m.py"), "def f():\n    return 22\n").unwrap();
+        std::fs::write(root.join("n.py"), "def g():\n    return 22\n").unwrap();
+        assert_eq!(before("pkg/m.py", "f"), m1, "unreported edits are not seen");
+        assert_ne!(before("link.py", "g"), l1, "a symlinked file is always stat'ed");
+        fps.invalidate("pkg");
+        assert_ne!(before("pkg/m.py", "f"), m1, "a directory event covers the files under it");
+        assert_eq!(before("n.py", "g"), n1);
+        fps.invalidate_all();
+        assert_ne!(before("n.py", "g"), n1);
     }
 
     fn planted(info: &FileInfo) -> FileInfo {

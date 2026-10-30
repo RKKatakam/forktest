@@ -823,6 +823,9 @@ fn merge_project_meta(meta: &mut ProjectMeta, collected: &Collected, dropped: &[
     meta.dropped.extend(dropped.iter().cloned());
 }
 
+/// Seconds one more worker adds before its first test: its fork, measured at about 3 ms on the demo.
+const WORKER_COST: f64 = 0.003;
+
 /// Runs lists of tests through the session and turns what they report into events and records.
 struct Execution<'a> {
     root: &'a Path,
@@ -908,6 +911,9 @@ impl Execution<'_> {
             n => n,
         };
         let items: Vec<(&str, f64)> = nodeids.iter().map(|n| (*n, view.tests.get(*n).map_or(0.01, |t| t.cost))).collect();
+        let total: f64 = items.iter().map(|(_, cost)| cost).sum();
+        // Workers fork one after another, so k of them finish near k * WORKER_COST + total / k: fewest at the root.
+        let workers = workers.min(((total / WORKER_COST).sqrt().round() as usize).max(1));
         let failed: HashSet<&str> =
             view.tests.iter().filter(|(_, t)| t.outcome.is_failure()).map(|(n, _)| n.as_str()).collect();
         let batches = crate::schedule::schedule(&items, &failed, workers)

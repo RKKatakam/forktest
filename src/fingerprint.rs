@@ -107,6 +107,11 @@ impl FileInfo {
         }
     }
 
+    /// The info of `data` as the content of `path`, with no stat.
+    pub fn from_bytes(path: &str, data: &[u8]) -> FileInfo {
+        FileInfo::compute(path, data, xxh3_128(data))
+    }
+
     fn compute(path: &str, data: &[u8], sha: Hash128) -> FileInfo {
         let kind = if !path.ends_with(".py") {
             FileKind::Other

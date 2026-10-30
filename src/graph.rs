@@ -160,6 +160,7 @@ impl ImportGraph {
         self.state.lock().unwrap().closure(&self.inputs, test_file)
     }
 
+    #[cfg(test)]
     pub fn conftests_for(&self, path: &str) -> Vec<RelPath> {
         let mut st = self.state.lock().unwrap();
         st.conftests_for(&self.inputs, path)

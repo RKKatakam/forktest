@@ -124,6 +124,7 @@ impl Names {
 
 pub enum WorkerEvent {
     Result {
+        #[cfg_attr(not(test), expect(dead_code, reason = "tests check that batches run in parallel"))]
         worker: usize,
         result: TestResult,
         cost: f64,
@@ -131,9 +132,14 @@ pub enum WorkerEvent {
         hits: Vec<u32>,
         reads: Vec<String>,
     },
-    CollectError { worker: usize, nodeid: String, message: String },
+    CollectError { nodeid: String, message: String },
     /// The worker died or crashed; these nodeids of its batch never reported.
-    Lost { worker: usize, nodeids: Vec<String>, message: String },
+    Lost {
+        #[cfg_attr(not(test), expect(dead_code, reason = "tests check which worker died"))]
+        worker: usize,
+        nodeids: Vec<String>,
+        message: String,
+    },
 }
 
 pub enum Control {
@@ -508,9 +514,6 @@ impl Session {
         }
     }
 
-    /// Ends L0, L1 and any worker.
-    pub fn shutdown(self) {}
-
     fn fork_safe(&self, os_threads: Option<u32>, py_threads: Option<u64>) -> bool {
         os_threads.is_some_and(|n| n <= 1 + self.tolerated) && py_threads == Some(1)
     }
@@ -551,7 +554,7 @@ impl Session {
         let nodeid = msg["nodeid"].as_str().unwrap_or_default().to_string();
         if msg["type"] == "collect_error" {
             let message = msg["message"].as_str().unwrap_or_default().to_string();
-            return Some(WorkerEvent::CollectError { worker: index, nodeid, message });
+            return Some(WorkerEvent::CollectError { nodeid, message });
         }
         let local = &mut self.conns.get_mut(&conn)?.names;
         for name in msg["names"].as_array().into_iter().flatten() {

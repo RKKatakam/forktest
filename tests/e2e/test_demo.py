@@ -347,6 +347,53 @@ def test_an_edit_collects_only_the_files_holding_selected_tests(demo):
     assert demo.log("collecting") == ["forktest: collecting 2 files: tests/test_invoice.py tests/test_tax.py"]
 
 
+def test_a_file_collected_for_its_selected_tests_makes_only_those_and_keeps_the_rest_known(demo):
+    demo.write("narrow.py", "def value():\n    return 1\n")
+    demo.write(
+        "tests/test_narrow.py",
+        "import narrow\n\n\ndef test_selected():\n    assert narrow.value() == 1\n\n\n"
+        "def test_unselected():\n    assert True\n",
+    )
+    events, rc = demo.forktest()
+    assert rc == 0 and selection(events).reasons == {"new": 2}
+
+    demo.edit("narrow.py", "return 1", "return 1 * 1")
+    events, rc = demo.forktest()
+    assert rc == 0 and selection(events).reasons == {"coverage": 1} and done(events).passed == 1
+    assert demo.log("collecting") == ["forktest: collecting 1 files: tests/test_narrow.py"]
+    assert demo.log("collected") == ["forktest: collected 1 tests; workers fork from collected"]
+    assert selection(events).total == 18, "the narrowed file's other test is still known"
+
+    with open(demo.root / "tests" / "test_narrow.py", "a") as f:
+        f.write("\n\ndef test_added():\n    assert True\n")
+    events, rc = demo.forktest()
+    assert rc == 0 and selection(events).reasons == {"new": 1, "import_graph": 2} and selection(events).total == 19
+    assert demo.log("collected") == ["forktest: collected 3 tests; workers fork from collected"]
+    assert done(events).passed == 3
+    events, rc = demo.forktest("--all", "tests/test_narrow.py")
+    assert rc == 0 and done(events).passed == 3
+
+
+def test_a_selected_test_a_plugin_names_apart_from_its_function_is_still_collected(demo):
+    demo.write(
+        "tests/conftest.py",
+        "import pytest\n\n\ndef pytest_pycollect_makeitem(collector, name, obj):\n"
+        "    if name.startswith('check_'):\n"
+        "        return [pytest.Function.from_parent(collector, name='test_' + name[6:], callobj=obj)]\n",
+    )
+    demo.write("narrow.py", "def value():\n    return 1\n")
+    demo.write(
+        "tests/test_renamed.py",
+        "import narrow\n\n\ndef check_value():\n    assert narrow.value() == 1\n\n\ndef test_other():\n    assert True\n",
+    )
+    events, rc = demo.forktest()
+    assert rc == 0 and selection(events).reasons["new"] == 2
+    demo.edit("narrow.py", "return 1", "return 1 * 1")
+    events, rc = demo.forktest()
+    assert rc == 0 and selection(events).reasons == {"coverage": 1} and done(events).passed == 1
+    assert len(demo.log("tests/test_renamed.py::test_value was not collected")) == 1, demo.stderr
+
+
 def test_a_new_test_in_an_existing_file_is_selected_as_new(demo):
     with open(demo.root / "tests" / "test_config.py", "a") as f:
         f.write("\n\ndef test_added():\n    assert 1 + 1 == 2\n")

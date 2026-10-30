@@ -96,6 +96,13 @@ pub struct Collected {
     pub exit_code: Option<i32>,
 }
 
+/// A collection of some files only. Files holding a test in `only` are collected for just those tests' functions
+/// and classes; the rest whole.
+pub struct Partial {
+    pub files: Vec<String>,
+    pub only: Vec<String>,
+}
+
 /// One batch, run in order by one worker.
 pub struct Batch {
     pub nodeids: Vec<String>,
@@ -257,12 +264,13 @@ impl Session {
         &self.dropped
     }
 
-    /// Forks L1 from L0 and collects, restricted to `files` when given.
-    pub fn collect(&mut self, files: Option<&[String]>) -> anyhow::Result<Collected> {
+    /// Forks L1 from L0 and collects everything, or the `partial` scope when given.
+    pub fn collect(&mut self, partial: Option<&Partial>) -> anyhow::Result<Collected> {
         self.drop_l1();
         self.serial += 1;
         let cid = self.serial;
-        let collect = json!({"type": "collect", "cid": cid, "args": self.config.pytest_args, "files": files});
+        let (files, only) = (partial.map(|p| &p.files), partial.map(|p| &p.only));
+        let collect = json!({"type": "collect", "cid": cid, "args": self.config.pytest_args, "files": files, "only": only});
         let child = match &self.l0 {
             Some(l0) => {
                 let conn = l0.conn;
@@ -1101,6 +1109,10 @@ mod tests {
         (Session::start_with(config, Some(file)).unwrap(), log)
     }
 
+    fn partial(files: &[&str], only: &[&str]) -> Partial {
+        Partial { files: files.iter().map(|f| f.to_string()).collect(), only: only.iter().map(|n| n.to_string()).collect() }
+    }
+
     fn batches(items: &[CollectedItem], n: usize) -> Vec<Batch> {
         items
             .chunks(items.len().div_ceil(n).max(1))
@@ -1273,12 +1285,40 @@ mod tests {
             let expected: Vec<_> =
                 all.items.iter().filter(|i| i.path == "tests/test_tax.py").map(|i| i.nodeid.clone()).collect();
             assert!(!expected.is_empty() && expected.len() < all.items.len());
-            let only = session.collect(Some(&["tests/test_tax.py".to_string()])).unwrap();
+            let only = session.collect(Some(&partial(&["tests/test_tax.py"], &[]))).unwrap();
             let got: Vec<_> = only.items.iter().map(|i| i.nodeid.clone()).collect();
             assert_eq!(got, expected);
             assert!(only.per_file.keys().all(|k| k == "tests/test_tax.py"), "{:?}", only.per_file.keys());
             let (names, _) = &only.per_file["tests/test_tax.py"];
             assert!(names.contains(&("tests/test_tax.py".into(), "<module>".into())), "{names:?}");
+        }
+        assert_no_orphans();
+    }
+
+    #[test]
+    fn a_partial_collection_makes_only_the_named_tests_of_their_files() {
+        let _serial = serial();
+        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let scratch = Scratch::example("demo");
+        {
+            let (mut session, _) = start(&scratch, config(&scratch.0, &python));
+            let all = session.collect(None).unwrap();
+            let files = ["tests/test_tax.py", "tests/test_invoice.py", "tests/test_config.py"];
+            let only = ["tests/test_tax.py::test_round_vat[10.005-10.01]", "tests/test_invoice.py::TestInvoice::test_net"];
+            let expected: Vec<_> = all
+                .items
+                .iter()
+                .map(|i| i.nodeid.clone())
+                .filter(|n| {
+                    n.starts_with("tests/test_tax.py::test_round_vat[")
+                        || n == "tests/test_invoice.py::TestInvoice::test_net"
+                        || n.starts_with("tests/test_config.py::")
+                })
+                .collect();
+            assert_eq!(expected.iter().filter(|n| n.contains("test_round_vat")).count(), 3);
+            let narrowed = session.collect(Some(&partial(&files, &only))).unwrap();
+            let got: Vec<_> = narrowed.items.iter().map(|i| i.nodeid.clone()).collect();
+            assert_eq!(got, expected);
         }
         assert_no_orphans();
     }
@@ -1333,7 +1373,7 @@ mod tests {
             assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 8)]));
             assert!(parent_threads.iter().all(|&n| n == 1), "L0 OS threads during the run: {parent_threads:?}");
 
-            let lazy = session.collect(Some(&["tests/test_lazy.py".to_string()])).unwrap();
+            let lazy = session.collect(Some(&partial(&["tests/test_lazy.py"], &[]))).unwrap();
             assert_eq!(lazy.fork_point, ForkPoint::Collected);
             let mut report = Report::default();
             session.run(batches(&lazy.items, 2), false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();

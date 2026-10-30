@@ -219,6 +219,25 @@ class Restriction:
         return real not in self.targets and os.path.basename(real) not in ("__init__.py", "conftest.py")
 
 
+class Narrowing:
+    """In the modules and classes on the paths of the ``only`` nodeids, makes items for those tests' names alone.
+
+    Every parametrization of a named function is made: its ids only exist once the function is collected.
+    """
+
+    def __init__(self, only):
+        self.allowed = {}
+        for nodeid in only:
+            path, _, rest = nodeid.partition("::")
+            parts = [path, *rest.partition("[")[0].split("::")]
+            for i in range(1, len(parts)):
+                self.allowed.setdefault("::".join(parts[:i]), set()).add(parts[i])
+
+    def drops(self, collector, name):
+        allowed = self.allowed.get(collector.nodeid)
+        return allowed is not None and name not in allowed
+
+
 class Sender:
     """Sends results with each ``(path, qualname)`` named once per connection and hits as packed ids."""
 
@@ -355,13 +374,14 @@ def rewrite_names():
 
 
 class BasePlugin:
-    def __init__(self, conn, root, files):
+    def __init__(self, conn, root, files, only=None):
         self.conn = conn
         self.root = root
         self.project = ProjectFiles(root)
         self.recorder = Recorder(self.project)
         self.fixtures = Fixtures(self.project)
         self.restriction = Restriction(root, files) if files is not None else None
+        self.narrowing = Narrowing(only) if only else None
         self.errors = []
         self.skips = []
         self.items = []
@@ -382,6 +402,12 @@ class BasePlugin:
     def pytest_ignore_collect(self, collection_path, config):
         if self.restriction is not None and self.restriction.ignores(str(collection_path)):
             return True
+        return None
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_pycollect_makeitem(self, collector, name, obj):
+        if self.narrowing is not None and self.narrowing.drops(collector, name):
+            return []
         return None
 
     def pytest_collectreport(self, report):
@@ -412,8 +438,8 @@ class BasePlugin:
 class L1Plugin(BasePlugin):
     """Collects, reports what it found, then serves runs from the collected session."""
 
-    def __init__(self, conn, root, files):
-        super().__init__(conn, root, files)
+    def __init__(self, conn, root, files, only):
+        super().__init__(conn, root, files, only)
         self.per_file = {}
         self.served = False
 
@@ -570,9 +596,9 @@ def batch_worker(conn, root, args, nodeids, files, nice):
 
 
 def l1_main(conn, root, msg):
-    """Collects ``msg["files"]`` (everything when null), then serves runs. Never returns."""
+    """Collects ``msg["files"]`` (everything when null) narrowed to ``msg["only"]``, then serves runs. Never returns."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    plugin = L1Plugin(conn, root, msg["files"])
+    plugin = L1Plugin(conn, root, msg["files"], msg.get("only"))
     try:
         rc = pytest.main(list(msg["args"]), plugins=[plugin])
         if not plugin.served:

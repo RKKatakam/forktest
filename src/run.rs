@@ -6,7 +6,7 @@ use crate::graph::ImportGraph;
 use crate::root::{config_files, is_excluded};
 use crate::select::{self, Affected, Current, Reason, SinceBaseline, WorkingTree};
 use crate::store::{DepSet, GitBaseline, InventoryRow, Record, Store, StoreView, dep_hash};
-use crate::zygote::{Batch, Collected, Control, ForkPoint, ForkPolicy, Names, Session, SessionConfig, WorkerEvent};
+use crate::zygote::{Batch, Collected, Control, ForkPoint, ForkPolicy, Names, Partial, Session, SessionConfig, WorkerEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -503,7 +503,9 @@ impl Project {
             Some(_) => Some("warm"),
             None => full_collection_reason(req, &root, &fps, &inventory, &args_meta),
         };
-        let files: Option<Vec<String>> = match full {
+        // Root-relative paths of the files collected only for the selected tests in them.
+        let mut narrowed: BTreeSet<String> = BTreeSet::new();
+        let mut partial: Option<Partial> = match full {
             Some("warm") => None,
             Some(why) => {
                 log(|| format!("full collection: {why}"));
@@ -514,14 +516,17 @@ impl Project {
                 let path_of: HashMap<&str, &str> =
                     inventory.iter().flat_map(|r| r.nodeids.iter().map(|n| (n.as_str(), &*r.path))).collect();
                 let affected = select::select(&universe, &view, &self.store, &mut *current, &graph, &fixture_set(&project))?;
-                let mut files: BTreeSet<String> =
-                    affected.reasons.keys().map(|n| path_of.get(n.as_str()).copied().unwrap_or(test_file(n)).to_string()).collect();
+                let file_of = |n: &str| path_of.get(n).copied().unwrap_or(test_file(n)).to_string();
+                let mut whole: BTreeSet<String> = BTreeSet::new();
                 for row in &inventory {
                     if let Some(why) = select::recollect(row, &fps, &graph) {
                         log(|| format!("re-collecting {}: {why}", row.path));
-                        files.insert(row.path.to_string());
+                        whole.insert(row.path.to_string());
                     }
                 }
+                let only: Vec<String> = affected.reasons.keys().filter(|n| !whole.contains(&file_of(n))).cloned().collect();
+                narrowed = only.iter().map(|n| file_of(n)).collect();
+                let files: BTreeSet<String> = narrowed.iter().cloned().chain(whole).collect();
                 if files.is_empty() {
                     log(|| "no python started".into());
                     learned.graph = graph.export();
@@ -535,7 +540,7 @@ impl Project {
                     emit(&Event::Done(Done { duration_ms: ms(t0), ..Done::default() }));
                     return Ok(0);
                 }
-                Some(files.into_iter().collect())
+                Some(Partial { files: files.into_iter().collect(), only })
             }
         };
 
@@ -545,8 +550,8 @@ impl Project {
                 (warm.collected.clone(), warm)
             }
             None => {
-                if let Some(files) = &files {
-                    log(|| format!("collecting {} files: {}", files.len(), files.join(" ")));
+                if let Some(p) = &partial {
+                    log(|| format!("collecting {} files: {}", p.files.len(), p.files.join(" ")));
                 }
                 let policy = match (req.fork_from, full, args_meta.fork_point.as_deref()) {
                     (Some(p), _, _) => ForkPolicy::Force(p),
@@ -557,7 +562,16 @@ impl Project {
                 };
                 self.warm = None;
                 let session = self.session_for(req, policy, &project)?;
-                let collected = Arc::new(session.collect(files.as_deref())?);
+                let mut collected = session.collect(partial.as_ref())?;
+                if let Some(p) = partial.as_mut().filter(|_| collected.exit_code.is_none())
+                    && let Some(n) = not_collected(&collected, &p.only)
+                {
+                    log(|| format!("{n} was not collected with its file narrowed to the selected tests; collecting whole files"));
+                    p.only.clear();
+                    narrowed.clear();
+                    collected = session.collect(Some(p))?;
+                }
+                let collected = Arc::new(collected);
                 if let Some(code) = collected.exit_code {
                     return Ok(code);
                 }
@@ -570,7 +584,7 @@ impl Project {
                     );
                 }
                 let warm = Warm::new(collected.clone(), &root, &fps);
-                if files.is_none() {
+                if partial.is_none() {
                     self.warm = Some(warm.clone());
                 }
                 (collected, warm)
@@ -578,7 +592,8 @@ impl Project {
         };
         let session = &mut self.session.as_mut().expect("collected above").1;
 
-        let partial = files.is_some();
+        let files = partial.as_ref().map(|p| &p.files[..]);
+        let partial = partial.is_some();
         let stored_modules = project.modules.clone();
         merge_project_meta(&mut project, &collected, session.dropped_preimports(), partial);
         let collected = &*collected;
@@ -598,7 +613,7 @@ impl Project {
         learned.project = Some(project);
         learned.args = Some(args_meta);
 
-        let (rows, universe) = self.update_inventory(collected, &inventory, files.as_deref(), &view, graph, learned);
+        let (rows, universe) = self.update_inventory(collected, &inventory, files, &narrowed, &view, graph, learned);
         learned.inventory = Some(rows);
         learned.graph = graph.export();
 
@@ -723,12 +738,13 @@ impl Project {
     }
 
     /// The inventory rows after this collection, and the nodeid universe in collection order. Records which tests
-    /// vanished.
+    /// vanished. A `narrowed` file's collection saw only some of its tests, so its stored row stands.
     fn update_inventory(
         &self,
         collected: &Collected,
         previous: &[InventoryRow],
         requested: Option<&[String]>,
+        narrowed: &BTreeSet<String>,
         view: &StoreView,
         graph: &ImportGraph,
         learned: &mut Learned,
@@ -745,7 +761,7 @@ impl Project {
             .chain(collected.errors.iter().map(|(n, _)| test_file(n)))
             .chain(collected.skips.iter().map(|n| test_file(n)))
             .chain(requested.into_iter().flatten().map(String::as_str))
-            .filter(|p| seen.insert(p))
+            .filter(|p| !narrowed.contains(*p) && seen.insert(p))
             .collect();
         let mut nodeids: HashMap<&str, Vec<String>> = HashMap::new();
         for item in &collected.items {
@@ -825,6 +841,13 @@ fn fork_point_name(p: ForkPoint) -> &'static str {
         ForkPoint::Imported => "imported",
         ForkPoint::Spawn => "spawn",
     }
+}
+
+/// A selected test the narrowed collection did not make, outside the files that failed to collect.
+fn not_collected<'a>(collected: &Collected, only: &'a [String]) -> Option<&'a String> {
+    let made: HashSet<&str> = collected.items.iter().map(|i| i.nodeid.as_str()).collect();
+    let failed: HashSet<&str> = collected.errors.iter().map(|(n, _)| test_file(n)).collect();
+    only.iter().find(|n| !made.contains(n.as_str()) && !failed.contains(test_file(n)))
 }
 
 /// A partial collection saw only some files, so what it found adds to what the last full one found.

@@ -2,11 +2,16 @@
 //!
 //! A module costing more than an even share of the run is split by class, then into consecutive runs, so
 //! module- and class-scoped fixtures are rebuilt as rarely as the share allows.
+//!
+//! Failed-first and cost order decide which worker gets which batch. Each worker then runs its tests in collection
+//! order: suites that leak state between tests (a test mutating a shared module global) pass under pytest's order,
+//! and running a later file first on the same worker would expose the leak to an earlier one.
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-/// `items` are `(nodeid, cost in seconds)`. Returns per-worker lists of indices into `items`, each in order.
+/// `items` are `(nodeid, cost in seconds)` in collection order. Returns per-worker lists of indices into `items`,
+/// each ascending.
 pub fn schedule(items: &[(&str, f64)], failed: &HashSet<&str>, workers: usize) -> Vec<Vec<usize>> {
     let workers = workers.max(1);
     let cost = |batch: &[usize]| sum(batch.iter().map(|&i| items[i].1));
@@ -35,6 +40,7 @@ pub fn schedule(items: &[(&str, f64)], failed: &HashSet<&str>, workers: usize) -
         loads.push(Reverse((Load(load + c), k)));
     }
     assigned.retain(|a| !a.is_empty());
+    assigned.iter_mut().for_each(|a| a.sort_unstable());
     assigned
 }
 
@@ -164,6 +170,20 @@ mod tests {
         modules.sort();
         assert_eq!(modules, [vec!['a'; 3], vec!['b'; 3]]);
         assert!(p[0][0].starts_with("b.py"));
+    }
+
+    #[test]
+    fn each_worker_runs_its_tests_in_collection_order() {
+        let names: Vec<String> =
+            ["a", "b", "c", "d"].iter().flat_map(|m| (0..2).map(move |k| format!("{m}.py::test_{k}"))).collect();
+        let items: Vec<(&str, f64)> = names.iter().map(|n| (n.as_str(), 0.01)).collect();
+        let failed: HashSet<&str> = HashSet::from(["d.py::test_1"]);
+        let plan = schedule(&items, &failed, 2);
+        assert_eq!(plan.iter().map(Vec::len).sum::<usize>(), 8);
+        for worker in &plan {
+            assert!(worker.windows(2).all(|w| w[0] < w[1]), "{worker:?}");
+        }
+        assert!(plan.iter().any(|w| w.contains(&7)), "the failed module is still scheduled");
     }
 
     #[test]

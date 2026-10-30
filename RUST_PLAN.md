@@ -1,8 +1,8 @@
 # forktest in Rust: implementation plan
 
-Goal: replace the Python forktest (`src/forktest`, the reference implementation) with a Rust binary that is faster, stays a drop-in pytest replacement, and never forks a process that has threads, so suites using JAX, torch or anything else with native thread pools run correctly.
+Goal: replace the Python forktest (on `main`, the reference implementation) with a Rust binary that is faster, stays a drop-in pytest replacement, and never forks a process that has threads, so suites using JAX, torch or anything else with native thread pools run correctly.
 
-The Python version stays on `main` as the behavioral reference until this branch replaces it. Its tests (`tests/test_cli_demo.py`, `tests/test_daemon.py`) are the spec for user-visible behavior.
+The Python version stays on `main` as the behavioral reference. Its CLI and daemon tests were ported to `tests/e2e`, which runs the binary, and the parity tests and `bench/bench_ab.py` run the Python version from a checkout of `main` named by `FORKTEST_PY_SRC`.
 
 ## Why the rewrite changes the process model
 
@@ -18,7 +18,7 @@ So the thread check has to count OS threads, from outside the process, and there
 1. `forktest` is one Rust binary. `forktest [pytest args]` accepts every pytest argument, and pass/fail/skip/xfail/xpass counts match `pytest` with the same arguments on `examples/demo`, `examples/jaxdemo`, attrs and pandas' `pandas/tests/frame`.
 2. Exit codes match pytest: 0, 1 (failures or a miss), 2 (collection errors), 5 (nothing collected). Modes forktest cannot serve (`--collect-only`, `--fixtures`, `--markers`, `--version`, `-h`, `--pdb`, `--trace`, `--setup-plan`, `--setup-only`, `--lf`, `--ff`, `--sw`) exec plain pytest with the same arguments.
 3. On `examples/jaxdemo` with `-n 4`: every run completes, results match pytest, no worker forks from a process with more than one OS thread, and JAX never prints its fork warning.
-4. Every behavior in `tests/test_cli_demo.py` and `tests/test_daemon.py` holds against the Rust binary (the ported suite in `tests/` runs it through `FORKTEST_BIN`).
+4. Every behavior in `main`'s `tests/test_cli_demo.py` and `tests/test_daemon.py` holds against the Rust binary (the ported suite in `tests/e2e` runs it through `FORKTEST_BIN`).
 5. Faster than the Python version, interleaved on the same machine, for: a cold edit run, a no-op run, `--all`, and a daemon edit run, on the demo, attrs and pandas' frame slice.
 
 ## Architecture

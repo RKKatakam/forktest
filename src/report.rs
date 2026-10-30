@@ -397,7 +397,8 @@ impl ExitStatus {
         if self.collect_errors > 0 && self.total.is_none() {
             return 2;
         }
-        if done.failed > 0 || done.errors > 0 || self.misses > 0 {
+        // pytest counts collection errors as failures when it runs on past them.
+        if done.failed > 0 || done.errors > 0 || self.misses > 0 || self.collect_errors > 0 {
             return 1;
         }
         if self.total == Some(0) {
@@ -562,6 +563,7 @@ mod tests {
         assert_eq!(code(&[], 0), 3);
         assert_eq!(code(&[Event::CollectError { nodeid: "x".into(), message: "m".into() }, done(0)], 0), 2);
         assert_eq!(code(&[sel(3), done(1)], 0), 1);
+        assert_eq!(code(&[Event::CollectError { nodeid: "x".into(), message: "m".into() }, sel(3), done(0)], 0), 1);
         assert_eq!(code(&[sel(3), Event::Miss { nodeid: "x".into(), message: "m".into() }, done(0)], 0), 1);
         assert_eq!(code(&[sel(0), done(0)], 0), 5);
         assert_eq!(code(&[sel(3), done(0)], 0), 0);

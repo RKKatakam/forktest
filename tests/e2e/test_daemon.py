@@ -182,6 +182,17 @@ def test_a_new_test_file_is_seen_by_the_next_run(served):
     assert rc == 0 and selection(events).total == 16
 
 
+def test_args_pytest_rejects_get_its_exit_code_and_leave_the_zygote_alone(served):
+    demo = served
+    l1 = start(demo)["zygote_pid"]
+    proc = demo.run("--json", "--no-such-flag")
+    assert proc.returncode == 4, proc.stdout + proc.stderr
+    wait_ready(demo, other_than=l1, what="the zygote rebuilt for the daemon's own args")
+    assert status(demo)["pytest_args"] == "[]"
+    events, rc = client(demo)
+    assert rc == 0 and selection(events).reasons == {"new": 16}
+
+
 def test_no_daemon_and_another_directory_run_without_it(served):
     demo = served
     start(demo)

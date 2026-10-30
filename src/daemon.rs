@@ -723,15 +723,15 @@ impl Daemon {
             let _ = writeln!(stream, "{}", json!({"refused": reason}));
             return;
         }
+        let t = Instant::now();
         self.sync();
+        crate::run::log(|| format!("synced with the file watcher in {} us", t.elapsed().as_micros()));
         if self.shared.stopping.load(Ordering::SeqCst) {
             return;
         }
         req.stdout_to_stderr = false;
-        if (&req.pytest_args, req.fork_from) != (&self.args, self.fork_from) {
-            self.args = req.pytest_args.clone();
-            self.fork_from = req.fork_from;
-        }
+        let previous = (std::mem::replace(&mut self.args, req.pytest_args.clone()), self.fork_from);
+        self.fork_from = req.fork_from;
         self.shared.cancel.store(false, Ordering::SeqCst);
         let cancel = self.shared.cancel.clone();
         let mut writer = std::io::BufWriter::new(&stream);
@@ -742,12 +742,21 @@ impl Daemon {
             }
         });
         drop(writer);
+        let result_code = result.as_ref().ok().copied();
         if !self.shared.stopping.load(Ordering::SeqCst) {
             let end = match result {
                 Ok(code) => json!({"exit": code, "pid": std::process::id()}),
                 Err(e) => json!({"error": format!("{e:#}")}),
             };
             let _ = writeln!(stream, "{end}");
+        }
+        // pytest exiting before it reported anything means it rejected these args: keep warming the old ones.
+        if matches!(result_code, Some(code) if code != 0) {
+            (self.args, self.fork_from) = previous;
+            if self.project.warm().is_none() {
+                self.zygote = Zygote::Absent;
+                self.rebuild_at = Some(Instant::now());
+            }
         }
         self.after_run();
     }

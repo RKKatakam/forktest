@@ -565,38 +565,30 @@ impl Project {
         learned: &mut Learned,
     ) -> ((Vec<InventoryRow>, bool), Vec<String>) {
         let fps = &*self.fps;
-        let mut order: Vec<String> = Vec::new();
-        let mut nodeids: HashMap<String, Vec<String>> = HashMap::new();
-        let mut touch = |path: &str, order: &mut Vec<String>| {
-            if !nodeids.contains_key(path) {
-                nodeids.insert(path.to_string(), Vec::new());
-                order.push(path.to_string());
-            }
-        };
-        for item in &collected.items {
-            touch(&item.path, &mut order);
-        }
-        let mut per_file: Vec<&String> = collected.per_file.keys().collect();
+        let mut per_file: Vec<&str> = collected.per_file.keys().map(String::as_str).collect();
         per_file.sort();
-        let extra = per_file
-            .into_iter()
-            .map(String::as_str)
+        let mut seen: HashSet<&str> = HashSet::new();
+        let order: Vec<&str> = collected
+            .items
+            .iter()
+            .map(|i| i.path.as_str())
+            .chain(per_file)
             .chain(collected.errors.iter().map(|(n, _)| test_file(n)))
             .chain(collected.skips.iter().map(|n| test_file(n)))
-            .chain(requested.into_iter().flatten().map(String::as_str));
-        for path in extra {
-            touch(path, &mut order);
-        }
+            .chain(requested.into_iter().flatten().map(String::as_str))
+            .filter(|p| seen.insert(p))
+            .collect();
+        let mut nodeids: HashMap<&str, Vec<String>> = HashMap::new();
         for item in &collected.items {
-            nodeids.get_mut(&item.path).expect("touched").push(item.nodeid.clone());
+            nodeids.entry(&item.path).or_default().push(item.nodeid.clone());
         }
         let errors: HashSet<&str> = collected.errors.iter().map(|(n, _)| test_file(n)).collect();
         let skips: HashSet<&str> = collected.skips.iter().map(|n| test_file(n)).collect();
         let mut rows: Vec<InventoryRow> = Vec::new();
         let mut unattributed = false;
-        for path in &order {
+        for path in order {
             let Some((rel, info)) = fps.entry(path).filter(|_| !path.starts_with('/') && !is_excluded(path)) else {
-                unattributed |= errors.contains(path.as_str());
+                unattributed |= errors.contains(path);
                 continue;
             };
             let deps = collected.per_file.get(path).map_or_else(Vec::new, |(names, reads)| {
@@ -608,8 +600,8 @@ impl Project {
                 closure: select::closure_digest(path, fps, graph),
                 deps,
                 nodeids: nodeids.remove(path).unwrap_or_default(),
-                error: errors.contains(path.as_str()),
-                skipped: skips.contains(path.as_str()),
+                error: errors.contains(path),
+                skipped: skips.contains(path),
             });
         }
 

@@ -22,6 +22,33 @@ const GRAPH_FORMAT: u32 = 1;
 type Edges = Arc<[RelPath]>;
 type Reach = Arc<HashSet<RelPath>>;
 
+/// A set of interned path ids. Closures of a large package overlap almost entirely, so unions are word-wide.
+#[derive(Default)]
+struct Bits(Vec<u64>);
+
+impl Bits {
+    fn insert(&mut self, i: u32) {
+        let (word, bit) = (i as usize / 64, i % 64);
+        if self.0.len() <= word {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << bit;
+    }
+
+    fn union(&mut self, other: &Bits) {
+        if self.0.len() < other.0.len() {
+            self.0.resize(other.0.len(), 0);
+        }
+        self.0.iter_mut().zip(&other.0).for_each(|(a, b)| *a |= b);
+    }
+
+    fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(w, &word)| {
+            (0..64).filter(move |b| word & (1 << b) != 0).map(move |b| (w * 64 + b) as u32)
+        })
+    }
+}
+
 pub struct ImportGraph {
     inputs: Inputs,
     state: Mutex<State>,
@@ -36,14 +63,15 @@ struct Inputs {
 
 #[derive(Default)]
 struct State {
-    paths: HashSet<RelPath>,
+    ids: HashMap<RelPath, u32>,
+    names: Vec<RelPath>,
     listings: HashMap<String, Arc<Listing>>,
     dir_digests: BTreeMap<String, Hash128>,
     basedirs: HashMap<String, String>,
     targets: HashMap<String, Edges>,
     direct: HashMap<RelPath, Edges>,
     resolved_any: bool,
-    reach: HashMap<RelPath, Reach>,
+    reach: HashMap<RelPath, Arc<Bits>>,
     closure: HashMap<RelPath, Reach>,
 }
 
@@ -165,12 +193,22 @@ impl ImportGraph {
 
 impl State {
     fn intern(&mut self, path: &str) -> RelPath {
-        if let Some(p) = self.paths.get(path) {
+        if let Some((p, _)) = self.ids.get_key_value(path) {
             return p.clone();
         }
         let p: RelPath = Arc::from(path);
-        self.paths.insert(p.clone());
+        self.ids.insert(p.clone(), self.names.len() as u32);
+        self.names.push(p.clone());
         p
+    }
+
+    fn id(&mut self, path: &str) -> u32 {
+        let p = self.intern(path);
+        self.ids[&p]
+    }
+
+    fn paths(&self, bits: &Bits) -> HashSet<RelPath> {
+        bits.ids().map(|i| self.names[i as usize].clone()).collect()
     }
 
     /// The files and subdirectories of `d`. A directory its parent does not list is never scanned.
@@ -321,20 +359,20 @@ impl State {
         let path = self.intern(path);
         let mut roots = vec![path.clone()];
         roots.extend(self.conftests_for(inp, &path));
-        let mut out: HashSet<RelPath> = HashSet::new();
+        let mut bits = Bits::default();
         for r in roots {
             if self.exists(inp, &r) {
-                out.extend(self.reachable(inp, &r).iter().cloned());
+                bits.union(&self.reachable(inp, &r));
             }
         }
-        let out = Arc::new(out);
+        let out = Arc::new(self.paths(&bits));
         self.closure.insert(path, out.clone());
         out
     }
 
     /// `start` and every file it imports, transitively. Tarjan's algorithm, iteratively: every member of an
     /// import cycle gets the same set, so a package whose `__init__` imports most of it computes that set once.
-    fn reachable(&mut self, inp: &Inputs, start: &RelPath) -> Reach {
+    fn reachable(&mut self, inp: &Inputs, start: &RelPath) -> Arc<Bits> {
         if let Some(r) = self.reach.get(start) {
             return r.clone();
         }
@@ -392,11 +430,12 @@ impl State {
                     break;
                 }
             }
-            let mut reach = members.clone();
+            let mut reach = Bits::default();
             for m in &members {
+                reach.insert(self.id(m));
                 for nxt in self.direct.get(m).expect("resolved").iter() {
                     if !members.contains(nxt) {
-                        reach.extend(self.reach[nxt].iter().cloned());
+                        reach.union(&self.reach[nxt]);
                     }
                 }
             }
@@ -536,7 +575,8 @@ pub(crate) mod tests {
                         stack.extend(edges[&n].iter().cloned());
                     }
                 }
-                assert_eq!(*st.reachable(&g.inputs, start), seen, "trial {trial} from {start}");
+                let reach = st.reachable(&g.inputs, start);
+                assert_eq!(st.paths(&reach), seen, "trial {trial} from {start}");
             }
         }
     }

@@ -531,3 +531,101 @@ mod tests {
         assert_eq!(recollect_now(&root, &row), Some("missing"));
     }
 }
+
+#[cfg(test)]
+mod speed {
+    use super::*;
+    use crate::events::Outcome;
+    use crate::store::{DepSet, Record};
+    use std::path::Path;
+    use std::time::Instant;
+
+    /// `cargo test --release select_speed -- --ignored --nocapture`: a pandas-frame-sized store, then what one run
+    /// with nothing changed pays to load it and select.
+    #[test]
+    #[ignore]
+    fn select_speed() {
+        let root = Path::new("/tmp/forktest-pandas/pandas");
+        let tests_dir = root.join("pandas/tests/frame");
+        if !tests_dir.exists() {
+            return;
+        }
+        let mut files: Vec<String> = Vec::new();
+        let mut stack = vec![tests_dir];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(d).unwrap().flatten() {
+                let p = e.path();
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if name.starts_with("test_") && name.ends_with(".py") {
+                    files.push(p.strip_prefix(root).unwrap().to_string_lossy().to_string());
+                }
+            }
+        }
+        let fps = Arc::new(Fingerprints::new(root, HashMap::new()));
+        let graph = ImportGraph::new(root, fps.clone(), HashMap::new());
+        let t = Instant::now();
+        let closures: Vec<Arc<HashSet<RelPath>>> = files.iter().map(|f| graph.closure(f)).collect();
+        let all: Vec<&str> = closures.iter().flat_map(|c| c.iter().map(|p| &**p)).collect::<HashSet<_>>().into_iter().collect();
+        fps.prefetch(all.clone());
+        eprintln!("cold: closures and parse of {} files: {:?}", all.len(), t.elapsed());
+        let frame = fps.info("pandas/core/frame.py").unwrap();
+        let crate::fingerprint::FileKind::Python { fingerprint, .. } = &frame.kind else { panic!() };
+        let mut funcs: Vec<&Arc<str>> = fingerprint.keys().collect();
+        funcs.sort();
+
+        let store_root = crate::fingerprint::tests::tmp_dir("select-speed");
+        let mut store = Store::open(&store_root).unwrap();
+        let mut records = Vec::new();
+        let mut nodeids = Vec::new();
+        for (i, (f, closure)) in files.iter().zip(&closures).enumerate() {
+            for k in 0..100 {
+                let mut deps: Vec<Dep> = closure.iter().filter_map(|p| fps.dep(p, MODULE)).collect();
+                deps.extend((0..50).map(|j| fps.dep("pandas/core/frame.py", funcs[(i * 7 + k * 3 + j) % funcs.len()]).unwrap()));
+                let nodeid = format!("{f}::test_{k}");
+                nodeids.push(nodeid.clone());
+                records.push(Record { nodeid, outcome: Outcome::Passed, cost: 0.01, deps: Some(DepSet::of(deps)) });
+            }
+        }
+        let t = Instant::now();
+        store.record(records).unwrap();
+        eprintln!("record {} tests: {:?}", nodeids.len(), t.elapsed());
+        store.save_file_infos(fps.take_fresh()).unwrap();
+        drop(store);
+
+        let mut state: Option<String> = None;
+        for round in 0..4 {
+            let t = Instant::now();
+            let store = Store::open(&store_root).unwrap();
+            let known = store.file_infos().unwrap();
+            let t_infos = t.elapsed();
+            let view = store.view().unwrap();
+            let t_view = t.elapsed();
+            let fps = Arc::new(Fingerprints::new(root, known));
+            let graph = ImportGraph::reusing(state.as_deref(), root, fps.clone(), HashMap::new());
+            let t_reuse = t.elapsed();
+            for f in &files {
+                graph.closure(f);
+            }
+            let t_graph = t.elapsed();
+            let affected =
+                select(&nodeids, &view, &store, &mut WorkingTree::new(&fps), &graph, &HashSet::new()).unwrap();
+            eprintln!(
+                "warm{}: file infos {:?}, +view ({} tests, {} keys) {:?}, +reusing {:?}, +closures {:?}, +select {:?}; {} selected",
+                if state.is_some() { " (graph reused)" } else { "" },
+                t_infos,
+                view.tests.len(),
+                view.keys.len(),
+                t_view,
+                t_reuse,
+                t_graph,
+                t.elapsed(),
+                affected.reasons.len()
+            );
+            if round == 1 {
+                state = graph.export();
+            }
+        }
+    }
+}

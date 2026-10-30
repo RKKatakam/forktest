@@ -1,24 +1,34 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "forktest"
-version = "0.0.1"
+dynamic = ["version"]
 description = "A fast, pytest-compatible test runner: warm zygotes, forked workers, affected-test selection."
 readme = "README.md"
-requires-python = ">=3.12"
+# The wheel holds only the binary. It runs the tests with the project's own interpreter, which needs 3.12+ and pytest.
+requires-python = ">=3.8"
 license = "MIT"
-dependencies = ["pytest>=8"]
+keywords = ["pytest", "testing", "test-runner"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: Pytest",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Software Development :: Testing",
+]
 
-[project.scripts]
-forktest = "forktest.cli:main"
+[tool.maturin]
+bindings = "bin"
+strip = true
 
 [dependency-groups]
 dev = ["pytest>=8"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/forktest"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,6 +2,8 @@
 
 usage: python bench/corpus.py CORPUS_DIR FORKTEST_BIN ROUNDS [PROJECT ...]
 
+CORPUS_RUNNERS=pytest,rpytest limits the runners.
+
 Each project lives in CORPUS_DIR/<name> as a git checkout with its own .venv
 holding pytest, pytest-xdist and rtest. rpytest and rpytest-daemon are looked
 up in CORPUS_DIR/.tools/bin. Per round, per project:
@@ -54,7 +56,7 @@ PROJECTS = [
     Project("pandas", "pandas/core/frame.py", "memory_usage", ["pandas/tests/frame"]),
 ]
 
-RUNNERS = {
+ALL_RUNNERS = {
     "pytest": lambda p: [p.python, "-m", "pytest", "-q", *p.args],
     "pytest -n auto": lambda p: [p.python, "-m", "pytest", "-q", "-n", "auto", *p.args],
     "rtest -n auto": lambda p: [str(Path(p.python).parent / "rtest"), "-n", "auto", *p.args],
@@ -62,6 +64,8 @@ RUNNERS = {
     "forktest": lambda p: [FORKTEST, "-q", *p.args],
     "forktest --all": lambda p: [FORKTEST, "-q", "--all", *p.args],
 }
+
+RUNNERS = {k: v for k, v in ALL_RUNNERS.items() if k in os.environ.get("CORPUS_RUNNERS", ",".join(ALL_RUNNERS)).split(",")}
 
 COUNT = re.compile(r"(\d+) (passed|failed|skipped|xfailed|xpassed|errors?)\b")
 
@@ -91,7 +95,10 @@ def cold(runner: str, root: Path) -> None:
         for db in (root / ".forktest").glob("forktest.db*"):
             db.unlink()
     if runner == "rpytest":
+        # One daemon serves every project through a global socket, and --daemon-stop needs a pid file it can lose.
         subprocess.run([str(TOOLS / "rpytest"), "--daemon-stop"], cwd=root, capture_output=True)
+        subprocess.run(["pkill", "-f", "rpytest-daemon"], capture_output=True)
+        Path("/tmp/rpytest.sock").unlink(missing_ok=True)
 
 
 def edit(root: Path, project: Project, variant: int) -> None:
@@ -143,11 +150,11 @@ def main() -> None:
             continue
         print(f"\n## {project.name}")
         print(f"{'runner':16} {'full s':>8} {'noop s':>8} {'edit s':>8}  full counts / edit counts")
-        reference = counts.get((project.name, "full", "pytest"), {})
+        reference = counts.get((project.name, "full", "pytest"))
         for runner in RUNNERS:
             cells = [statistics.median(times[(project.name, s, runner)]) for s in ("full", "noop", "edit")]
             full = counts[(project.name, "full", runner)]
-            flag = "" if full == reference else "  MISMATCH vs pytest"
+            flag = "" if reference is None or full == reference else "  MISMATCH vs pytest"
             print(
                 f"{runner:16} {cells[0]:8.2f} {cells[1]:8.2f} {cells[2]:8.2f}  {full} / {counts[(project.name, 'edit', runner)]}{flag}"
             )

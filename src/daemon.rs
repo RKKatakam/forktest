@@ -70,9 +70,6 @@ fn log(msg: &str) {
     eprintln!("[forktest {now}] {msg}");
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Client side.
-
 fn send(paths: &Paths, msg: &Value) -> Option<UnixStream> {
     let mut stream = UnixStream::connect(paths.sock()).ok()?;
     stream.set_write_timeout(Some(CLIENT_TIMEOUT)).ok()?;
@@ -273,9 +270,6 @@ fn stop(paths: &Paths) -> i32 {
     0
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Server side.
-
 enum Msg {
     Fs(notify::Result<notify::Event>),
     Run(UnixStream, PathBuf, Request),
@@ -358,6 +352,8 @@ fn serve(root: &Path, opts: Opts, watch: bool) -> anyhow::Result<()> {
     let sock = paths.sock();
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
+    // Whoever can connect can run code as this user.
+    std::fs::set_permissions(&sock, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     std::fs::write(paths.pid(), std::process::id().to_string())?;
     {
         let (tx, shared) = (tx.clone(), shared.clone());

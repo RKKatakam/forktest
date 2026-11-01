@@ -143,8 +143,8 @@ def main() -> None:
                     times.setdefault((project.name, scenario, runner), []).append(dt)
                     counts[(project.name, scenario, runner)] = c
             revert(root)
-            for runner in ("rpytest",):
-                cold(runner, root)
+            if "rpytest" in RUNNERS:
+                cold("rpytest", root)
             print(f"round {rnd + 1}: {project.name} done", flush=True)
 
     for project in projects:

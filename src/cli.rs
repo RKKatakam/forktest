@@ -99,10 +99,10 @@ pub fn main(argv: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let root = crate::root::find_root(&cwd);
+    let root_for = |args: &[String]| crate::root::find_root(&cwd, &Opts::parse(args).map(|o| o.pytest_args).unwrap_or_default());
     match argv.first().map(String::as_str) {
-        Some("daemon") => return crate::daemon::daemon_command(&root, &argv[1..]),
-        Some("watch") => return crate::daemon::watch_command(&root, &argv[1..]),
+        Some("daemon") => return crate::daemon::daemon_command(&root_for(argv.get(2..).unwrap_or_default()), &argv[1..]),
+        Some("watch") => return crate::daemon::watch_command(&root_for(&argv[1..]), &argv[1..]),
         _ => {}
     }
     let opts = match Opts::parse(&argv) {
@@ -112,6 +112,7 @@ pub fn main(argv: Vec<String>) -> i32 {
             return 2;
         }
     };
+    let root = crate::root::find_root(&cwd, &opts.pytest_args);
     if opts.print_root {
         println!("{}", root.display());
         return 0;

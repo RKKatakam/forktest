@@ -19,6 +19,7 @@ ruff_python_ast = "=0.0.20"
 ruff_python_parser = "=0.0.20"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+shlex = "2"
 thin-vec = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

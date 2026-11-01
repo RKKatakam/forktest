@@ -65,6 +65,21 @@ CASES = [
         {"setup.py": "", "pkg/pyproject.toml": PYPROJECT, "pkg/t/test_a.py": TEST},
         "pkg/t", [], {},
     ),
+    (
+        "pyproject dotted key under [tool]",
+        {"tox.ini": "[pytest]\n", "pkg/pyproject.toml": "[tool]\npytest.ini_options.addopts = '-q'\n", "pkg/t/test_a.py": TEST},
+        "pkg/t", [], {},
+    ),
+    (
+        "pyproject table header inside a multi-line string",
+        {"tox.ini": "[pytest]\n", "pkg/pyproject.toml": '[project]\nreadme = """\n[tool.pytest.ini_options]\n"""\n', "pkg/t/test_a.py": TEST},
+        "pkg/t", [], {},
+    ),
+    (
+        "setup.py above the args beats config inside them",
+        {"setup.py": "", "a/pytest.ini": "", "a/test_a.py": TEST, "b/test_b.py": TEST},
+        ".", ["a", "b"], {},
+    ),
     ("setup.cfg [tool:pytest]", {"pyproject.toml": PYPROJECT, "pkg/setup.cfg": "[tool:pytest]\n", "pkg/t/test_a.py": TEST}, "pkg/t", [], {}),
     ("setup.cfg without [tool:pytest]", {"pyproject.toml": PYPROJECT, "pkg/setup.cfg": "[metadata]\nname = x\n", "pkg/t/test_a.py": TEST}, "pkg/t", [], {}),
     ("tox.ini [pytest]", {"pyproject.toml": PYPROJECT, "pkg/tox.ini": "[tox]\n[pytest]\n", "pkg/t/test_a.py": TEST}, "pkg/t", [], {}),

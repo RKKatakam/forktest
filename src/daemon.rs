@@ -690,7 +690,8 @@ impl Daemon {
             let Some(rel) = relative(&self.paths.root, path) else { continue };
             self.project.fingerprints().invalidate(&rel);
             let name = rel.rsplit('/').next().unwrap_or(&rel);
-            reporter_stale |= name == "conftest.py" || is_config_file(&rel);
+            // A prepared reporter has imported the conftests and whatever project modules they load.
+            reporter_stale |= rel.ends_with(".py") || is_config_file(&rel);
             if RESTART_FILES.contains(&name) || (name.starts_with("requirements") && name.ends_with(".txt")) {
                 restart.get_or_insert_with(|| rel.clone());
             } else if is_config_file(&rel) {
@@ -725,6 +726,9 @@ impl Daemon {
             self.set_zygote(Zygote::Absent);
         } else if self.zygote == Zygote::Failed {
             self.set_zygote(Zygote::Absent);
+        }
+        if reporter_stale {
+            self.project.prepare_reporter(&self.request(false));
         }
         if let Some(pending) = &mut self.watch {
             log(&format!("changed: {}{}", changed[..changed.len().min(5)].join(", "), if changed.len() > 5 { " ..." } else { "" }));

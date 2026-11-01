@@ -525,7 +525,7 @@ impl Project {
         }
     }
 
-    /// Kills a prepared reporter: a conftest or config file it read changed.
+    /// Kills a prepared reporter: a project file it may have imported, or a config file it read, changed.
     pub fn drop_reporter(&mut self) {
         if let Some((_, session)) = &mut self.session {
             session.drop_reporter();

@@ -1,6 +1,7 @@
 """The human output and --junitxml are pytest's own, printed by a pytest session that replays the run."""
 
 import re
+import time
 import xml.etree.ElementTree as ET
 
 from conftest import Project
@@ -98,7 +99,7 @@ def test_the_daemon_hands_its_reporter_the_clients_terminal(served):  # noqa: F8
     assert "short test summary info" in proc.stdout and proc.returncode == 1
 
 
-def test_the_daemon_prepares_the_next_runs_reporter_and_drops_it_when_a_conftest_changes(served):  # noqa: F811
+def test_the_daemon_prepares_the_next_runs_reporter_and_a_fresh_one_when_a_conftest_changes(served):  # noqa: F811
     start(served, FORKTEST_LOG="1")
     served.run()
     served.edit("billing/tax.py", "ROUND_HALF_UP", "ROUND_HALF_EVEN")
@@ -108,10 +109,27 @@ def test_the_daemon_prepares_the_next_runs_reporter_and_drops_it_when_a_conftest
     assert "test session starts" in proc.stdout, proc.stdout
     with open(served.root / "conftest.py", "a") as f:
         f.write("\n\ndef pytest_report_header():\n    return 'from the new conftest'\n")
+    time.sleep(0.5)
     before = len(daemon_log(served))
     proc = served.run()
-    assert "forktest: pytest's reporter starts now" in daemon_log(served)[before:]
+    assert "forktest: pytest's reporter was prepared" in daemon_log(served)[before:]
     assert "from the new conftest" in proc.stdout, proc.stdout
+
+
+def test_the_daemon_prepares_a_fresh_reporter_when_a_module_a_conftest_loads_changes(served):  # noqa: F811
+    with open(served.root / "conftest.py", "a") as f:
+        f.write('\n\npytest_plugins = ["header_plugin"]\n')
+    served.write("header_plugin.py", "def pytest_report_header():\n    return 'header v1'\n")
+    start(served, FORKTEST_LOG="1")
+    assert "header v1" in served.run().stdout
+    time.sleep(1)
+    served.write("header_plugin.py", "def pytest_report_header():\n    return 'header v2!'\n")
+    served.edit("billing/tax.py", "ROUND_HALF_UP", "ROUND_HALF_EVEN")
+    time.sleep(0.5)
+    before = len(daemon_log(served))
+    proc = served.run()
+    assert "header v2!" in proc.stdout and "header v1" not in proc.stdout, proc.stdout
+    assert "forktest: pytest's reporter was prepared" in daemon_log(served)[before:]
 
 
 TERMINAL_WRITER = """def test_writes_to_the_terminal_mid_test(request):

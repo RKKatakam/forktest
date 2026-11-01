@@ -97,13 +97,22 @@ def test_never():
 BROKEN = ("tests/test_parity_broken.py", "import nothing_here_at_all\n\n\ndef test_x():\n    pass\n")
 
 TIMING = re.compile(r" in \d+\.\d+s( \(\d+:\d\d:\d\d\))?")
+# Object reprs differ between any two runs of pytest itself.
+ADDRESS = re.compile(r"0x[0-9a-f]{6,}")
+SHOWN = 40
 
 
 def normalise(text: str, forktest: bool) -> list[str]:
     lines = text.splitlines()
     if forktest and lines and lines[0].startswith("forktest · "):
         lines = lines[1:]
-    return [TIMING.sub(" in Xs", line) for line in lines]
+    return [ADDRESS.sub("0xADDR", TIMING.sub(" in Xs", line)) for line in lines]
+
+
+def diff(a: list[str], b: list[str]) -> str:
+    lines = list(difflib.unified_diff(a, b, "pytest", "forktest", lineterm="", n=1))
+    more = f"\n... {len(lines) - SHOWN} more diff lines" if len(lines) > SHOWN else ""
+    return "\n".join(lines[:SHOWN]) + more
 
 
 def junit(path: Path) -> list[str]:
@@ -114,7 +123,7 @@ def junit(path: Path) -> list[str]:
         for attr in ("time", "timestamp", "hostname"):
             el.attrib.pop(attr, None)
     ET.indent(root)
-    return ET.tostring(root, encoding="unicode").splitlines()
+    return [ADDRESS.sub("0xADDR", line) for line in ET.tostring(root, encoding="unicode").splitlines()]
 
 
 def run(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
@@ -142,12 +151,14 @@ def compare(project: Path, name: str, args: list[str], out: Path) -> bool:
     problems = []
     if theirs.returncode != ours.returncode:
         problems.append(f"exit code: pytest {theirs.returncode}, forktest {ours.returncode}")
+    (out / f"{name}.pytest.out").write_text(theirs.stdout)
+    (out / f"{name}.forktest.out").write_text(ours.stdout)
     a, b = normalise(theirs.stdout, False), normalise(ours.stdout, True)
     if a != b:
-        problems.append("\n".join(difflib.unified_diff(a, b, "pytest", "forktest", lineterm="", n=1)))
+        problems.append(diff(a, b))
     a, b = junit(theirs_xml), junit(ours_xml)
     if a != b:
-        problems.append("JUnit:\n" + "\n".join(difflib.unified_diff(a, b, "pytest", "forktest", lineterm="", n=1)))
+        problems.append("JUnit:\n" + diff(a, b))
     noise = [line for line in ours.stderr.splitlines() if line.strip()]
     print(f"{'PASS' if not problems else 'DIFF'}  {name}", flush=True)
     for p in problems:
@@ -191,7 +202,7 @@ def main() -> int:
         finally:
             broken.unlink(missing_ok=True)
     passed = sum(results.values())
-    print(f"\n{passed}/{len(results)} cases match on {project}")
+    print(f"\n{passed}/{len(results)} cases match on {project}; outputs in {out}")
     return 0 if passed == len(results) else 1
 
 

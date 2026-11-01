@@ -467,6 +467,33 @@ mod tests {
         assert_eq!(human(&[verified], false), "safety net: 9 unselected tests ran in 0.25s · 2 MISSED\n");
     }
 
+    fn held(events: &[Event]) -> String {
+        let mut out = Vec::new();
+        let mut r = HumanReporter::new(&mut out, false, true, true);
+        for e in events {
+            r.handle(e).unwrap();
+        }
+        drop(r);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn pytests_report_stands_in_for_ours_but_the_safety_net_still_shows() {
+        let sel = Event::Selection { changed: vec![], selected: 1, total: 2, reasons: BTreeMap::new(), duration_ms: 0 };
+        let failed = result("t.py::a", Outcome::Failed, Some("boom"));
+        let verified = Event::Verified { checked: 1, misses: 0, duration_ms: 0 };
+        let reported = [sel.clone(), failed.clone(), Event::Reported { exit: 1 }, Event::Done(Done::default()), verified.clone()];
+        assert_eq!(held(&reported), "safety net: 1 unselected tests ran in 0.00s · 0 misses\n");
+
+        let lost = Event::ReporterLost { reason: "gone".into(), headline_shown: true };
+        let out = held(&[sel.clone(), failed.clone(), lost, Event::Done(Done { failed: 1, ..Done::default() })]);
+        assert!(out.starts_with("  ✗ t.py::a\n"), "{out}");
+        assert!(out.ends_with("1 failed, 0 passed in 0.00s · safety net: running unselected tests\n"), "{out}");
+
+        let nothing_ran = held(&[sel, Event::Done(Done::default())]);
+        assert!(nothing_ran.starts_with("forktest · 0 files changed · 1 of 2 tests selected"), "{nothing_ran}");
+    }
+
     #[test]
     fn jsonl_skips_passes_and_escapes_like_python() {
         let mut out = Vec::new();
@@ -498,6 +525,8 @@ mod tests {
         assert_eq!(code(&[sel(3), Event::Miss { nodeid: "x".into(), message: "m".into() }, done(0)], 0), 1);
         assert_eq!(code(&[sel(0), done(0)], 0), 5);
         assert_eq!(code(&[sel(3), done(0)], 0), 0);
+        assert_eq!(code(&[sel(3), Event::Reported { exit: 2 }, done(0)], 0), 2);
+        assert_eq!(code(&[sel(3), Event::Reported { exit: 0 }, done(0), Event::Miss { nodeid: "x".into(), message: "m".into() }], 0), 1);
     }
 
     struct Closed;

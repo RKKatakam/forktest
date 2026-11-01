@@ -775,7 +775,7 @@ impl Session {
                             let b = &batches[index];
                             self.send(conn, &json!({"type": "config", "preimport": [], "root": self.config.root}))?;
                             let args = &self.config.pytest_args;
-                            let work = json!({"type": "work", "args": args, "nodeids": b.nodeids, "files": b.files, "nice": nice, "replay": replay});
+                            let work = json!({"type": "work", "args": args, "nodeids": b.nodeids, "files": b.files, "nice": nice, "replay": replay, "workers": batches.len()});
                             self.send(conn, &work)?;
                         }
                     } else if kind == "exited" && Some(conn) == parent && msg["rid"] == rid {

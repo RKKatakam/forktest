@@ -13,6 +13,7 @@ import struct
 import sys
 import threading
 import time
+import uuid
 
 # dyld has loaded forktest's time zone fix by now. Tests and the processes they start should not see it.
 if "forktest_tzfix" in os.environ.get("DYLD_INSERT_LIBRARIES", ""):
@@ -602,13 +603,13 @@ class L1Plugin(BasePlugin):
             for index, items in enumerate(batches):
                 pid = os.fork()
                 if pid == 0:
-                    self.forked_worker(rid, index, items, nice, replay)
+                    self.forked_worker(rid, index, len(batches), items, nice, replay)
                 pids[pid] = index
         finally:
             gc.unfreeze()
         wait_and_report(self.conn, rid, pids)
 
-    def forked_worker(self, rid, index, items, nice, replay):
+    def forked_worker(self, rid, index, count, items, nice, replay):
         try:
             default_signals()
             self.conn.close()
@@ -618,6 +619,7 @@ class L1Plugin(BasePlugin):
                 if nice:
                     os.nice(10)
                 self.reinit_capture()
+                become_worker(self.config, rid, index, count)
                 run_items(items, Sender(conn), self.recorder, self.project, self.fixtures, replay)
                 conn.send({"type": "done"})
             except BaseException as exc:
@@ -629,10 +631,11 @@ class L1Plugin(BasePlugin):
 class BatchPlugin(BasePlugin):
     """A worker that collects its batch's files itself and runs exactly its nodeids, in order."""
 
-    def __init__(self, conn, root, files, nodeids, replay):
+    def __init__(self, conn, root, files, nodeids, replay, identity):
         super().__init__(conn, root, files)
         self.nodeids = nodeids
         self.replay = replay
+        self.identity = identity
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtestloop(self, session):
@@ -649,11 +652,26 @@ class BatchPlugin(BasePlugin):
         by_id = {item.nodeid: item for item in self.items}
         items = [by_id[n] for n in self.nodeids if n in by_id]
         try:
+            become_worker(self.config, *self.identity)
             run_items(items, Sender(self.conn), self.recorder, self.project, self.fixtures, self.replay)
             self.conn.send({"type": "done"})
         except BaseException as exc:
             self.conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
         flush_and_exit(0)
+
+
+def become_worker(config, rid, index, count):
+    """Gives a worker the identity a pytest-xdist worker has, just before its tests run.
+
+    Suites and plugins key per-worker state on it: xdist's `worker_id` fixture, pytest-django's per-worker test
+    databases, ports and temp names. Set after session start, so pytest-cov keeps its single-process mode.
+    """
+    if hasattr(config, "workerinput"):
+        return
+    workerid = f"gw{index}"
+    uid = uuid.uuid5(uuid.NAMESPACE_OID, f"{os.getppid()}:{rid}").hex
+    os.environ.update(PYTEST_XDIST_WORKER=workerid, PYTEST_XDIST_WORKER_COUNT=str(count), PYTEST_XDIST_TESTRUNUID=uid)
+    config.workerinput = {"workerid": workerid, "workercount": count, "testrunuid": uid, "mainargv": list(sys.argv)}
 
 
 def wait_and_report(conn, rid, pids):
@@ -664,12 +682,12 @@ def wait_and_report(conn, rid, pids):
             conn.send({"type": "exited", "rid": rid, "index": index, "status": status})
 
 
-def batch_worker(conn, root, args, nodeids, files, nice, replay):
+def batch_worker(conn, root, args, nodeids, files, nice, replay, identity):
     """Runs one batch with its own collection, for the Imported and Spawn fork points. Never returns."""
     try:
         if nice:
             os.nice(10)
-        rc = pytest.main(list(args), plugins=[BatchPlugin(conn, root, files, nodeids, replay)])
+        rc = pytest.main(list(args), plugins=[BatchPlugin(conn, root, files, nodeids, replay, identity)])
         conn.send({"type": "crash", "message": f"pytest exited with code {int(rc)} before running the batch"})
     except BaseException as exc:
         try:
@@ -954,6 +972,31 @@ def preimport(names, avoid=()):
     return tolerated, dropped, before
 
 
+def refresh_editable_builds():
+    """Runs each meson-python editable finder's rebuild here, once, before forking.
+
+    The finder rebuilds once per process (`_rebuild` is an lru_cache) and pandas marks its version file
+    always stale, so children that each import the project race `ninja` on the same outputs: one reads
+    `_version_meson.py` while another rewrites it. Children forked after this share the cached result.
+    Clearing the cache first keeps an edit to a compiled source picked up on the next fork.
+
+    The cache holds one entry and a `.pth` can register the same finder twice, so each build path is
+    rebuilt once, last for the finder that comes first on `sys.meta_path`, which is the one imports reach.
+    """
+    finders = {}
+    for finder in sys.meta_path:
+        rebuild = getattr(finder, "_rebuild", None)
+        if rebuild is not None and hasattr(rebuild, "cache_clear"):
+            finders.setdefault(getattr(finder, "_build_path", id(finder)), finder)
+    for finder in finders.values():
+        finder._rebuild.cache_clear()
+    for finder in reversed(list(finders.values())):
+        try:
+            finder._rebuild()
+        except Exception:  # the child's own import reports the failure, as plain pytest would
+            finder._rebuild.cache_clear()
+
+
 def l0_main():
     conn = Conn()
     conn.send({"type": "hello", "role": "l0", "pid": os.getpid(), "python": sys.version.split()[0]})
@@ -986,6 +1029,8 @@ def l0_main():
                 except OSError:
                     pass
             os.killpg(0, signal.SIGKILL)
+        if msg["type"] in ("collect", "run_workers", "reporter"):
+            refresh_editable_builds()
         if msg["type"] == "collect":
             gc.freeze()
             pid = os.fork()
@@ -1024,7 +1069,8 @@ def l0_main():
                             conn.close()
                             worker = Conn()
                             worker.send({"type": "hello", "role": "worker", "pid": os.getpid(), "rid": msg["rid"], "index": index})
-                            batch_worker(worker, root, msg["args"], batch["nodeids"], batch["files"], msg["nice"], msg["replay"])
+                            identity = (msg["rid"], index, len(msg["batches"]))
+                            batch_worker(worker, root, msg["args"], batch["nodeids"], batch["files"], msg["nice"], msg["replay"], identity)
                         finally:
                             os._exit(1)
                     pids[pid] = index
@@ -1050,7 +1096,8 @@ def spawned_main(argv):
     if argv[0] == "l1":
         l1_main(conn, config["root"], msg)
     default_signals()
-    batch_worker(conn, config["root"], msg["args"], msg["nodeids"], msg["files"], msg["nice"], msg["replay"])
+    identity = (int(argv[1]), int(argv[2]), msg["workers"])
+    batch_worker(conn, config["root"], msg["args"], msg["nodeids"], msg["files"], msg["nice"], msg["replay"], identity)
 
 
 if __name__ == "__main__":

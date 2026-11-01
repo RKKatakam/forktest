@@ -33,6 +33,8 @@ pub struct Opts {
     pub no_daemon: bool,
     pub python: Option<PathBuf>,
     pub fork_from: Option<ForkPoint>,
+    /// Print the project root and exit. Hidden, for `bench/rootdir_matrix.py`.
+    pub print_root: bool,
     /// Everything else, in order.
     pub pytest_args: Vec<String>,
 }
@@ -57,6 +59,7 @@ impl Opts {
                 "--strict-pytest" => o.strict = true,
                 "--verify-selection" => o.verify = true,
                 "--no-daemon" => o.no_daemon = true,
+                "--print-root" => o.print_root = true,
                 "--since" => o.since = Some(value("--since")?),
                 "--junitxml" => o.junitxml = Some(PathBuf::from(value("--junitxml")?)),
                 "--why" => o.why = Some(value("--why")?),
@@ -96,10 +99,10 @@ pub fn main(argv: Vec<String>) -> i32 {
             return 2;
         }
     };
-    let root = crate::root::find_root(&cwd);
+    let root_for = |args: &[String]| crate::root::find_root(&cwd, &Opts::parse(args).map(|o| o.pytest_args).unwrap_or_default());
     match argv.first().map(String::as_str) {
-        Some("daemon") => return crate::daemon::daemon_command(&root, &argv[1..]),
-        Some("watch") => return crate::daemon::watch_command(&root, &argv[1..]),
+        Some("daemon") => return crate::daemon::daemon_command(&root_for(argv.get(2..).unwrap_or_default()), &argv[1..]),
+        Some("watch") => return crate::daemon::watch_command(&root_for(&argv[1..]), &argv[1..]),
         _ => {}
     }
     let mut opts = match Opts::parse(&argv) {
@@ -110,6 +113,11 @@ pub fn main(argv: Vec<String>) -> i32 {
         }
     };
     opts.junitxml = opts.junitxml.map(|p| cwd.join(p));
+    let root = crate::root::find_root(&cwd, &opts.pytest_args);
+    if opts.print_root {
+        println!("{}", root.display());
+        return 0;
+    }
     // The daemon's interpreters run in the root, so relative pytest args only mean the same there.
     let from_root = std::fs::canonicalize(&cwd).is_ok_and(|c| c == root);
     match dispatch(opts, root, from_root) {

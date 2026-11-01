@@ -289,8 +289,11 @@ checks exit codes and counts for 127 argument sets across five projects.
   last change is read again next time, as git does for racily clean files.
 - **New test files outside `python_files`** (doctest targets, plugin-collected
   YAML) are found by the next full collection, not the next partial one.
-- **pytest's rootdir** is approximated without Python. When pytest picks a
-  different one, forktest warns and selection may be off.
+- **pytest's rootdir** is found without Python, by pytest's own rules for
+  test-path arguments, `--rootdir`, `-c` and `PYTEST_ADDOPTS`. Arguments read
+  from an `@file`, and a `tool.pytest` table written only as nested inline
+  tables, are not followed. When pytest picks a different rootdir anyway,
+  forktest warns and selection may be off.
 - **Captured output is not shown.** Failure events carry the assertion
   message and the project frames, not the captured stdout of the test.
 - **An edit saved during a run** can be recorded against the wrong content.

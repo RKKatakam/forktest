@@ -737,10 +737,14 @@ class Replay:
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_load_initial_conftests(self, early_config):
+        ns = early_config.known_args_namespace
         # fd capture would remember the stdout this process had before the handover and put it back at the end.
         # Nothing runs here, so capturing at the sys level is the same.
-        if early_config.known_args_namespace.capture == "fd":
-            early_config.known_args_namespace.capture = "sys"
+        if ns.capture == "fd":
+            ns.capture = "sys"
+        # pytest-cov would measure this process, which runs no tests, and report that as the run's coverage.
+        if hasattr(ns, "no_cov"):
+            ns.no_cov = True
         return (yield)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)

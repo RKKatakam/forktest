@@ -112,3 +112,20 @@ def test_the_daemon_prepares_the_next_runs_reporter_and_drops_it_when_a_conftest
     proc = served.run()
     assert "forktest: pytest's reporter starts now" in daemon_log(served)[before:]
     assert "from the new conftest" in proc.stdout, proc.stdout
+
+
+TERMINAL_WRITER = """def test_writes_to_the_terminal_mid_test(request):
+    request.config.get_terminal_writer().line("written mid-test")
+
+
+def test_last_failed():
+    assert False
+"""
+
+
+def test_a_test_can_write_through_the_terminal_writer_and_lf_sees_the_failure(fresh: Project):
+    fresh.write("tests/test_terminal.py", TERMINAL_WRITER)
+    ours = fresh.run("--no-daemon", "--all", "tests/test_terminal.py")
+    assert "1 failed, 1 passed" in ours.stdout and "FAILED tests/test_terminal.py::test_writes" not in ours.stdout, ours.stdout
+    rerun = fresh.run("--lf", "tests/test_terminal.py")
+    assert "1 failed" in rerun.stdout and "1 passed" not in rerun.stdout, rerun.stdout

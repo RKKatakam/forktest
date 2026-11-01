@@ -431,6 +431,38 @@ def rewrite_names():
     return set()
 
 
+class WorkerTerminal:
+    """Stands in for the terminal reporter in L1 and workers, which print no session output of their own.
+
+    A plugin that writes to the terminal while a test runs (pytest-timeout's stack dump goes through
+    `config.get_terminal_writer()`) gets a writer on stderr instead of an assertion that no reporter exists.
+    It has no hooks, so it prints nothing unasked.
+    """
+
+    def __init__(self, config):
+        from _pytest.config import create_terminal_writer
+
+        self.config = config
+        self._tw = create_terminal_writer(config, sys.stderr)
+        self.verbosity = config.option.verbose
+        self.stats = {}
+
+    def write(self, content, **markup):
+        self._tw.write(content, **markup)
+
+    def write_line(self, line, **markup):
+        self._tw.line(line, **markup)
+
+    def line(self, msg, **markup):
+        self._tw.line(msg, **markup)
+
+    def write_sep(self, sep, title=None, **markup):
+        self._tw.sep(sep, title, **markup)
+
+    def section(self, title, sep="=", **markup):
+        self._tw.sep(sep, title, **markup)
+
+
 class BasePlugin:
     def __init__(self, conn, root, files, only=None):
         self.conn = conn
@@ -458,6 +490,7 @@ class BasePlugin:
         reporter = config.pluginmanager.getplugin("terminalreporter")
         if reporter is not None:
             config.pluginmanager.unregister(reporter)
+            config.pluginmanager.register(WorkerTerminal(config), "terminalreporter")
         self.recorder.start()
 
     @pytest.hookimpl(tryfirst=True)

@@ -129,3 +129,27 @@ def test_a_test_can_write_through_the_terminal_writer_and_lf_sees_the_failure(fr
     assert "1 failed, 1 passed" in ours.stdout and "FAILED tests/test_terminal.py::test_writes" not in ours.stdout, ours.stdout
     rerun = fresh.run("--lf", "tests/test_terminal.py")
     assert "1 failed" in rerun.stdout and "1 passed" not in rerun.stdout, rerun.stdout
+
+
+PARTLY_COVERED = "def used(flag):\n    if flag:\n        return 1\n    return 2\n\n\ndef unused():\n    return 3\n"
+USES_IT = "from billing.extra import used\n\n\ndef test_used():\n    assert used(True) == 1\n"
+
+
+def coverage_section(text: str) -> list[str]:
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines) if "coverage: platform" in line)
+    end = next(i for i, line in enumerate(lines) if line.startswith("TOTAL"))
+    return lines[start : end + 1]
+
+
+def test_cov_reports_what_the_workers_measured_as_pytest_does(fresh: Project):
+    fresh.write("billing/extra.py", PARTLY_COVERED)
+    fresh.write("tests/test_extra.py", USES_IT)
+    args = ("-p", "no:cacheprovider", "--cov=billing", "--cov-branch", "--cov-report=term-missing", "--cov-fail-under=100")
+    theirs = fresh.pytest(*args)
+    for fork_from in ("collected", "imported"):
+        ours = fresh.run("--no-daemon", "--all", "--fork-from", fork_from, *args)
+        assert ours.returncode == theirs.returncode == 1, ours.stdout + ours.stderr
+        assert coverage_section(ours.stdout) == coverage_section(theirs.stdout), ours.stdout
+        assert "Required test coverage of 100% not reached" in ours.stdout
+    assert not list(fresh.root.glob(".coverage.*"))

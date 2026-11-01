@@ -654,6 +654,7 @@ class L1Plugin(BasePlugin):
                 self.reinit_capture()
                 become_worker(self.config, rid, index, count)
                 run_items(items, Sender(conn), self.recorder, self.project, self.fixtures, replay)
+                save_coverage(self.config)
                 conn.send({"type": "done"})
             except BaseException as exc:
                 conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
@@ -687,10 +688,24 @@ class BatchPlugin(BasePlugin):
         try:
             become_worker(self.config, *self.identity)
             run_items(items, Sender(self.conn), self.recorder, self.project, self.fixtures, self.replay)
+            save_coverage(self.config)
             self.conn.send({"type": "done"})
         except BaseException as exc:
             self.conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
         flush_and_exit(0)
+
+
+def save_coverage(config):
+    """Writes what pytest-cov measured in this process to a data file of its own.
+
+    Coverage names the file by the saving process's pid, so each forked worker writes its own; the reporter's
+    pytest-cov combines them at session end. Workers never reach the session end that would save it.
+    """
+    plugin = config.pluginmanager.get_plugin("_cov")
+    cov = getattr(getattr(plugin, "cov_controller", None), "cov", None)
+    if cov is not None:
+        cov.stop()
+        cov.save()
 
 
 def become_worker(config, rid, index, count):
@@ -793,9 +808,6 @@ class Replay:
         # Nothing runs here, so capturing at the sys level is the same.
         if ns.capture == "fd":
             ns.capture = "sys"
-        # pytest-cov would measure this process, which runs no tests, and report that as the run's coverage.
-        if hasattr(ns, "no_cov"):
-            ns.no_cov = True
         return (yield)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)

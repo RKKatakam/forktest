@@ -28,7 +28,7 @@ bindings = "bin"
 strip = true
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pytest-cov>=7"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

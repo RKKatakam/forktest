@@ -243,14 +243,15 @@ pub struct Session {
     server: Server,
 }
 
-/// pytest's reporter for the current run.
+/// pytest's reporter: started ahead of its run, or by it, and claimed by one run.
 struct Reporter {
     id: u64,
     proc: Proc,
-    /// The terminal and the start message, handed over when it connects.
-    handover: Option<(Terminal, Value)>,
-    /// Gives the writer thread the reporter's stream once it has connected.
-    stream: Option<Sender<UnixStream>>,
+    args: Vec<String>,
+    claimed: bool,
+    /// What the run that claimed it hands over once it has connected: the terminal, the start message, and the
+    /// channel that gives the writer thread its stream.
+    handover: Option<(Terminal, Value, Sender<UnixStream>)>,
     began: bool,
     end: Option<ReporterEnd>,
     started: Instant,
@@ -546,30 +547,45 @@ impl Session {
         true
     }
 
-    /// Starts pytest's reporter for one run, replacing any earlier one: a pytest session with `args` that writes to
-    /// `terminal` and replays what the returned sender forwards. It forks from L0, which has pytest imported, or is a
-    /// fresh interpreter when there is no L0. It sets `env` first, so a daemon's reporter sees the client's terminal.
-    pub fn start_reporter(
-        &mut self,
-        args: Vec<String>,
-        env: &[(String, Option<String>)],
-        terminal: Terminal,
-    ) -> anyhow::Result<ToReporter> {
+    /// Starts a reporter for the next run with `args`, unless one is already waiting: a pytest session that parses
+    /// the args and loads plugins and conftests, then waits for a run to claim it. It forks from L0, which has pytest
+    /// imported, or is a fresh interpreter when there is no L0.
+    pub fn prepare_reporter(&mut self, args: Vec<String>) -> anyhow::Result<()> {
+        if self.reporter.as_ref().is_some_and(|r| !r.claimed && r.end.is_none() && r.args == args) {
+            return Ok(());
+        }
         self.drop_reporter();
         self.serial += 1;
         let id = self.serial;
         let child = match &self.l0 {
             Some(l0) => {
                 let conn = l0.conn;
-                self.send(conn, &json!({"type": "reporter", "id": id}))?;
+                self.send(conn, &json!({"type": "reporter", "id": id, "args": args}))?;
                 None
             }
             None => {
-                let child = self.spawn(&["reporter", &id.to_string()])?;
+                let child = self.spawn(&["reporter", &id.to_string(), &serde_json::to_string(&args)?])?;
                 groups::add(child.id() as i32);
                 Some(child)
             }
         };
+        let proc = Proc { pid: child.as_ref().map_or(0, |c| c.id() as i32), conn: u64::MAX, child };
+        self.reporter =
+            Some(Reporter { id, proc, args, claimed: false, handover: None, began: false, end: None, started: Instant::now() });
+        Ok(())
+    }
+
+    /// The reporter for this run, prepared earlier for these `args` or started now: it writes to `terminal`, sets
+    /// `env` first so a daemon's reporter sees the client's terminal, and replays what the returned sender forwards.
+    pub fn start_reporter(
+        &mut self,
+        args: Vec<String>,
+        env: &[(String, Option<String>)],
+        terminal: Terminal,
+    ) -> anyhow::Result<ToReporter> {
+        let prepared = self.reporter.as_ref().is_some_and(|r| !r.claimed && r.end.is_none() && r.args == args);
+        crate::run::log(|| format!("pytest's reporter {}", if prepared { "was prepared" } else { "starts now" }));
+        self.prepare_reporter(args)?;
         let (tx, rx) = channel::<Vec<u8>>();
         let (stream_tx, stream_rx) = channel::<UnixStream>();
         std::thread::spawn(move || {
@@ -580,21 +596,33 @@ impl Session {
                 }
             }
         });
-        let start = json!({"type": "start", "args": args, "env": env});
-        self.reporter = Some(Reporter {
-            id,
-            proc: Proc { pid: child.as_ref().map_or(0, |c| c.id() as i32), conn: u64::MAX, child },
-            handover: Some((terminal, start)),
-            stream: Some(stream_tx),
-            began: false,
-            end: None,
-            started: Instant::now(),
-        });
+        let r = self.reporter.as_mut().expect("prepared above");
+        r.claimed = true;
+        r.handover = Some((terminal, json!({"type": "start", "env": env}), stream_tx));
+        self.hand_over();
         Ok(ToReporter(tx))
     }
 
+    /// Sends a claimed reporter that has connected its terminal and start message, and gives the writer its stream.
+    fn hand_over(&mut self) {
+        let Some(r) = self.reporter.as_mut().filter(|r| r.proc.conn != u64::MAX) else { return };
+        let Some((terminal, start, stream_tx)) = r.handover.take() else { return };
+        let conn = self.conns.get_mut(&r.proc.conn);
+        let handed = (|| -> anyhow::Result<()> {
+            let c = conn.context("the reporter closed its connection")?;
+            proto::send_fds(&c.stream, &[terminal.out.as_fd(), terminal.err.as_fd()])?;
+            proto::write_frame(&mut c.stream, &start, &[])?;
+            let _ = stream_tx.send(c.stream.try_clone()?);
+            Ok(())
+        })();
+        if let Err(e) = handed {
+            r.end.get_or_insert(Err(format!("handing pytest's reporter the terminal: {e:#}")));
+        }
+    }
+
+    /// Whether a run has claimed a reporter that has not been finished or dropped.
     pub fn has_reporter(&self) -> bool {
-        self.reporter.is_some()
+        self.reporter.as_ref().is_some_and(|r| r.claimed)
     }
 
     /// Waits for the reporter to exit once everything forwarded, `end` included, has been sent. Returns pytest's exit
@@ -631,7 +659,7 @@ impl Session {
         }
     }
 
-    /// Takes the reporter's frames: its hello, which gets it the terminal and its args, and how it ended.
+    /// Takes the reporter's frames: its hello, after which a claimed reporter gets the terminal, and how it ended.
     fn claim_reporter(&mut self, conn: u64, msg: &Value) -> bool {
         if msg["type"] == "hello" && msg["role"] == "reporter" {
             let pid = msg["pid"].as_i64().unwrap_or(0) as i32;
@@ -648,21 +676,8 @@ impl Session {
                 groups::add(pid);
             }
             let ms = r.started.elapsed().as_millis();
-            crate::run::log(|| format!("pytest's reporter connected {ms} ms after it was asked for"));
-            let handed = (|| -> anyhow::Result<()> {
-                let (terminal, start) = r.handover.take().context("a second hello")?;
-                let c = self.conns.get_mut(&conn).context("the reporter closed its connection")?;
-                proto::send_fds(&c.stream, &[terminal.out.as_fd(), terminal.err.as_fd()])?;
-                proto::write_frame(&mut c.stream, &start, &[])?;
-                let stream = c.stream.try_clone()?;
-                if let Some(tx) = r.stream.take() {
-                    let _ = tx.send(stream);
-                }
-                Ok(())
-            })();
-            if let Err(e) = handed {
-                r.end.get_or_insert(Err(format!("handing pytest's reporter the terminal: {e:#}")));
-            }
+            crate::run::log(|| format!("pytest's reporter connected {ms} ms after it started"));
+            self.hand_over();
             return true;
         }
         let Some(r) = self.reporter.as_mut().filter(|r| r.proc.conn == conn) else { return false };
@@ -670,12 +685,12 @@ impl Session {
             Some("began") => {
                 r.began = true;
                 let ms = r.started.elapsed().as_millis();
-                crate::run::log(|| format!("pytest's reporter began {ms} ms after it was asked for"));
+                crate::run::log(|| format!("pytest's reporter began {ms} ms after it started"));
             }
             Some("exit") => {
                 r.end.get_or_insert(Ok(msg["code"].as_i64().unwrap_or(3) as i32));
                 let ms = r.started.elapsed().as_millis();
-                crate::run::log(|| format!("pytest's reporter exited {ms} ms after it was asked for"));
+                crate::run::log(|| format!("pytest's reporter exited {ms} ms after it started"));
             }
             Some("crash") => {
                 let message = msg["message"].as_str().unwrap_or_default();

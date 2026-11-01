@@ -505,6 +505,24 @@ impl Project {
         }
     }
 
+    /// Starts the pytest reporter the next run with this request's args will claim, so its startup is done by then.
+    /// Only with a session for these args already running.
+    pub fn prepare_reporter(&mut self, req: &Request) {
+        if let Some((key, session)) = &mut self.session
+            && *key == session_key(req, full_policy(req))
+            && let Err(e) = session.prepare_reporter(req.reporter_args())
+        {
+            log(|| format!("preparing pytest's reporter: {e:#}"));
+        }
+    }
+
+    /// Kills a prepared reporter: a conftest or config file it read changed.
+    pub fn drop_reporter(&mut self) {
+        if let Some((_, session)) = &mut self.session {
+            session.drop_reporter();
+        }
+    }
+
     /// Kills every Python process, so the next run starts from a fresh interpreter.
     pub fn restart(&mut self) {
         self.warm = None;
@@ -798,12 +816,12 @@ impl Project {
             args.fork_point = Some(fork_point_name(session.fork_point()).into());
         }
         executed?;
+        log(|| format!("every test reported {} ms into the run", ms(t0)));
         if self.cancel.load(Ordering::Relaxed) {
             return Ok(0);
         }
         if let Some(to) = reporter.take() {
             to.send(&replay::end());
-            log(|| format!("every test reported {} ms into the run", ms(t0)));
             if let Some(event) = reporter_event(session.finish_reporter()) {
                 emit(&event);
             }

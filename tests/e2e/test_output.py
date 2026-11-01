@@ -4,7 +4,7 @@ import re
 import xml.etree.ElementTree as ET
 
 from conftest import Project
-from test_daemon import served, start  # noqa: F401
+from test_daemon import daemon_log, served, start  # noqa: F401
 
 CASES = """import logging
 import sys
@@ -96,3 +96,19 @@ def test_the_daemon_hands_its_reporter_the_clients_terminal(served):  # noqa: F8
     lines = proc.stdout.splitlines()
     assert lines[0].startswith("forktest · no history · 16 of 16") and "test session starts" in lines[1], proc.stdout
     assert "short test summary info" in proc.stdout and proc.returncode == 1
+
+
+def test_the_daemon_prepares_the_next_runs_reporter_and_drops_it_when_a_conftest_changes(served):  # noqa: F811
+    start(served, FORKTEST_LOG="1")
+    served.run()
+    served.edit("billing/tax.py", "ROUND_HALF_UP", "ROUND_HALF_EVEN")
+    before = len(daemon_log(served))
+    proc = served.run()
+    assert "forktest: pytest's reporter was prepared" in daemon_log(served)[before:]
+    assert "test session starts" in proc.stdout, proc.stdout
+    with open(served.root / "conftest.py", "a") as f:
+        f.write("\n\ndef pytest_report_header():\n    return 'from the new conftest'\n")
+    before = len(daemon_log(served))
+    proc = served.run()
+    assert "forktest: pytest's reporter starts now" in daemon_log(served)[before:]
+    assert "from the new conftest" in proc.stdout, proc.stdout

@@ -659,6 +659,9 @@ impl Daemon {
         };
         self.changed_while_building.clear();
         self.set_zygote(next);
+        if next == Zygote::Ready {
+            self.project.prepare_reporter(&self.request(false));
+        }
     }
 
     /// The watcher lost track: nothing it said before can be trusted.
@@ -681,12 +684,13 @@ impl Daemon {
         if event.need_rescan() {
             return self.rescan("the file watcher dropped events");
         }
-        let (mut stale, mut restart) = (None, None);
+        let (mut stale, mut restart, mut reporter_stale) = (None, None, false);
         let mut changed = Vec::new();
         for path in &event.paths {
             let Some(rel) = relative(&self.paths.root, path) else { continue };
             self.project.fingerprints().invalidate(&rel);
             let name = rel.rsplit('/').next().unwrap_or(&rel);
+            reporter_stale |= name == "conftest.py" || is_config_file(&rel);
             if RESTART_FILES.contains(&name) || (name.starts_with("requirements") && name.ends_with(".txt")) {
                 restart.get_or_insert_with(|| rel.clone());
             } else if is_config_file(&rel) {
@@ -705,6 +709,9 @@ impl Daemon {
         }
         if changed.is_empty() {
             return;
+        }
+        if reporter_stale {
+            self.project.drop_reporter();
         }
         if let Some(rel) = restart {
             log(&format!("{rel} changed: restarting the interpreters"));
@@ -831,6 +838,7 @@ impl Daemon {
                 self.set_zygote(Zygote::Absent);
             }
         }
+        self.project.prepare_reporter(&self.request(false));
     }
 
     fn watch_run(&mut self) {

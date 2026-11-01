@@ -719,16 +719,43 @@ def warning_message_of(data):
 class Replay:
     """Turns pytest's session into a reporter: Rust sends the run's reports, in collection order, and this replays
     them through the hooks pytest's terminal reporter, junitxml and other plugins listen to. Nothing is collected or
-    run here. Rust sends ``begin`` once collection is done, so nothing reaches the terminal before forktest's headline.
+    run here.
+
+    A reporter can be started before its run: it parses the args and loads plugins and conftests, then waits for a
+    run to hand it the terminal before pytest configures, so the terminal writer decides colour and width from the
+    real terminal. stderr waits for ``begin``, so a config error L1 reports anyway is not printed twice, and Rust
+    sends ``begin`` once collection is done, so nothing reaches the terminal before forktest's headline.
     """
 
-    def __init__(self, conn, stderr_fd):
+    def __init__(self, conn):
         self.conn = conn
-        self.stderr_fd = stderr_fd
+        self.stderr_fd = None
         self.begin = None
 
     def pytest_addoption(self, parser):
         parser.addini("forktest_fork_from", "Where forktest workers fork from: auto, collected, imported or spawn.")
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_load_initial_conftests(self, early_config):
+        # fd capture would remember the stdout this process had before the handover and put it back at the end.
+        # Nothing runs here, so capturing at the sys level is the same.
+        if early_config.known_args_namespace.capture == "fd":
+            early_config.known_args_namespace.capture = "sys"
+        return (yield)
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_cmdline_main(self, config):
+        _, fds, _, _ = socket.recv_fds(self.conn.sock, 1, 2)
+        out, self.stderr_fd = fds
+        os.dup2(out, 1)
+        os.close(out)
+        sys.stdout.reconfigure(line_buffering=os.isatty(1))
+        for name, value in self.recv()["env"]:
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        return (yield)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_sessionstart(self, session):
@@ -862,34 +889,16 @@ def lost_report(nodeid, message):
     return TestReport(nodeid, (path, None, name), {}, "failed", message, "setup")
 
 
-def reporter_main(conn):
-    """pytest's own reporter for one run: replays what Rust forwards. Never returns.
-
-    Rust hands over the terminal's stdout and stderr first. stdout is in place before pytest configures, so its
-    terminal writer decides colour and width from the real terminal; stderr waits for ``begin``, so a config error
-    L1 reports anyway is not printed twice.
-    """
+def reporter_main(conn, args):
+    """pytest's own reporter for one run: replays what Rust forwards. Never returns."""
     # What it inherited is never garbage of its session; pytest's unconfigure collects garbage twice over it.
     gc.freeze()
     try:
-        _, fds, _, _ = socket.recv_fds(conn.sock, 1, 2)
-        out, err = fds
-        os.dup2(out, 1)
-        os.close(out)
         devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 1)
         os.dup2(devnull, 2)
         os.close(devnull)
-        if os.isatty(1):
-            sys.stdout.reconfigure(line_buffering=True)
-        start = conn.recv()
-        if start is None:
-            flush_and_exit(0)
-        for name, value in start["env"]:
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        rc = pytest.main(list(start["args"]), plugins=[Replay(conn, err)])
+        rc = pytest.main(list(args), plugins=[Replay(conn)])
         for stream in (sys.stdout, sys.stderr):
             stream.flush()
         conn.send({"type": "exit", "code": int(rc)})
@@ -996,7 +1005,7 @@ def l0_main():
                     conn.close()
                     reporter = Conn()
                     reporter.send({"type": "hello", "role": "reporter", "pid": os.getpid(), "id": msg["id"]})
-                    reporter_main(reporter)
+                    reporter_main(reporter, msg["args"])
                 finally:
                     os._exit(1)
         elif msg["type"] == "run_workers":
@@ -1025,7 +1034,7 @@ def spawned_main(argv):
     conn = Conn()
     if argv[0] == "reporter":
         conn.send({"type": "hello", "role": "reporter", "pid": os.getpid(), "id": int(argv[1])})
-        reporter_main(conn)
+        reporter_main(conn, json.loads(argv[2]))
     if argv[0] == "l1":
         conn.send({"type": "hello", "role": "l1", "pid": os.getpid(), "cid": int(argv[1])})
     else:
@@ -1046,4 +1055,4 @@ if __name__ == "__main__":
     elif sys.argv[1:2] in (["l1"], ["worker"], ["reporter"]):
         spawned_main(sys.argv[1:])
     else:
-        sys.exit(f"usage: {sys.argv[0]} l0 | l1 CID | worker RID INDEX | reporter ID")
+        sys.exit(f"usage: {sys.argv[0]} l0 | l1 CID | worker RID INDEX | reporter ID ARGS_JSON")

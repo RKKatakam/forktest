@@ -803,6 +803,7 @@ impl Project {
         }
         if let Some(to) = reporter.take() {
             to.send(&replay::end());
+            log(|| format!("every test reported {} ms into the run", ms(t0)));
             if let Some(event) = reporter_event(session.finish_reporter()) {
                 emit(&event);
             }

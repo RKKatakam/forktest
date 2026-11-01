@@ -869,6 +869,8 @@ def reporter_main(conn):
     terminal writer decides colour and width from the real terminal; stderr waits for ``begin``, so a config error
     L1 reports anyway is not printed twice.
     """
+    # What it inherited is never garbage of its session; pytest's unconfigure collects garbage twice over it.
+    gc.freeze()
     try:
         _, fds, _, _ = socket.recv_fds(conn.sock, 1, 2)
         out, err = fds

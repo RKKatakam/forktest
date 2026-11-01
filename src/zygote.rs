@@ -286,6 +286,8 @@ struct Conn {
 enum In {
     Frame(u64, Value, Vec<u8>),
     Closed(u64),
+    /// A frame or close the session took for itself, such as the reporter's exit: the caller's state may have changed.
+    Claimed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -645,6 +647,8 @@ impl Session {
                 r.proc.pid = pid;
                 groups::add(pid);
             }
+            let ms = r.started.elapsed().as_millis();
+            crate::run::log(|| format!("pytest's reporter connected {ms} ms after it was asked for"));
             let handed = (|| -> anyhow::Result<()> {
                 let (terminal, start) = r.handover.take().context("a second hello")?;
                 let c = self.conns.get_mut(&conn).context("the reporter closed its connection")?;
@@ -663,9 +667,15 @@ impl Session {
         }
         let Some(r) = self.reporter.as_mut().filter(|r| r.proc.conn == conn) else { return false };
         match msg["type"].as_str() {
-            Some("began") => r.began = true,
+            Some("began") => {
+                r.began = true;
+                let ms = r.started.elapsed().as_millis();
+                crate::run::log(|| format!("pytest's reporter began {ms} ms after it was asked for"));
+            }
             Some("exit") => {
                 r.end.get_or_insert(Ok(msg["code"].as_i64().unwrap_or(3) as i32));
+                let ms = r.started.elapsed().as_millis();
+                crate::run::log(|| format!("pytest's reporter exited {ms} ms after it was asked for"));
             }
             Some("crash") => {
                 let message = msg["message"].as_str().unwrap_or_default();
@@ -795,7 +805,7 @@ impl Session {
                         parent_gone = true;
                     }
                 }
-                None => {}
+                Some(In::Claimed) | None => {}
             }
             for index in 0..slots.len() {
                 let slot = &mut slots[index];
@@ -1046,16 +1056,18 @@ impl Session {
                     if !self.claim(conn, &frame.msg) {
                         return Some(In::Frame(conn, frame.msg, frame.blob));
                     }
+                    return Some(In::Claimed);
                 }
                 Ok(Incoming::Closed(conn)) => {
                     self.conns.remove(&conn);
                     if let Some(r) = self.reporter.as_mut().filter(|r| r.proc.conn == conn) {
                         r.end.get_or_insert_with(|| Err("pytest's reporter exited before it reported".into()));
-                        continue;
+                        return Some(In::Claimed);
                     }
                     match self.background.as_mut().filter(|bg| bg.proc.conn == conn) {
                         Some(bg) => {
                             bg.outcome.get_or_insert_with(|| crash("the Python process exited"));
+                            return Some(In::Claimed);
                         }
                         None => return Some(In::Closed(conn)),
                     }

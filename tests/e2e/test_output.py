@@ -231,3 +231,17 @@ def test_a_reporter_that_starts_late_keeps_the_coverage_its_workers_saved(fresh:
     args = ("-p", "no:cacheprovider", "-p", "slow_reporter", "--cov=billing")
     ours = fresh.run("--no-daemon", "--all", "--fork-from", "spawn", *args, PYTHONPATH=str(fresh.root))
     assert coverage_section(ours.stdout) == coverage_section(theirs.stdout), ours.stdout + ours.stderr
+
+
+def test_a_selection_reports_coverage_but_leaves_the_fail_under_threshold_to_full_runs(fresh: Project):
+    config = fresh.root / "pyproject.toml"
+    config.write_text(config.read_text().replace('pythonpath = ["."]', 'pythonpath = ["."]\naddopts = "--cov=billing --cov-fail-under=100"'))
+    assert fresh.pytest("-p", "no:cacheprovider").returncode == 0
+    fresh.run("--no-daemon")
+    fresh.edit("billing/tax.py", "    quantum = Decimal", "    quantum = 0\n    quantum = Decimal")
+    proc = fresh.run("--no-daemon", "-p", "no:cacheprovider")
+    assert "7 of 16 tests selected" in proc.stdout and "coverage: platform" in proc.stdout, proc.stdout
+    assert proc.returncode == 0 and "Required test coverage" not in proc.stdout, proc.stdout
+    assert "fail-under threshold applies to full runs (forktest --all)" in proc.stdout, proc.stdout
+    full = fresh.run("--no-daemon", "--all", "-p", "no:cacheprovider")
+    assert full.returncode == 0 and "Required test coverage of 100% reached" in full.stdout, full.stdout

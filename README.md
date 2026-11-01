@@ -87,7 +87,9 @@ FAILED tests/test_tax.py::test_round_vat[10.005-10.01] - AssertionError: asse...
 What still differs from plain pytest: with `-s`, a test's own output reaches
 the terminal while it runs in its worker, not between progress characters; and
 testsuite properties that plugins add from inside a test process (hypothesis'
-statistics) are missing from the JUnit XML, as under pytest-xdist.
+statistics) are missing from the JUnit XML, as under pytest-xdist. A run that
+selects only some tests shows pytest-cov's report for them but leaves
+`--cov-fail-under` to full runs (`forktest --all`), and says so in one line.
 
 JSON output (`--json`):
 

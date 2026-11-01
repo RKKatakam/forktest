@@ -832,6 +832,7 @@ class Replay:
         self.stderr_fd = None
         self.begin = None
         self.erase_coverage = False
+        self.unchecked_fail_under = None
 
     def pytest_addoption(self, parser):
         parser.addini("forktest_fork_from", "Where forktest workers fork from: auto, collected, imported or spawn.")
@@ -877,6 +878,10 @@ class Replay:
             cov._warn_no_data = False
             if self.erase_coverage:
                 erase_earlier_coverage(cov, self.begin["started"])
+            options = session.config.pluginmanager.get_plugin("_cov").options
+            if not self.begin.get("full", True) and options.cov_fail_under:
+                self.unchecked_fail_under = options.cov_fail_under
+                options.cov_fail_under = None
         if self.begin["headline"] is not None:
             sys.stdout.write(self.begin["headline"] + "\n")
             sys.stdout.flush()
@@ -891,6 +896,15 @@ class Replay:
         finally:
             for name, clock in clocks.items():
                 setattr(timing, name, clock)
+
+    @pytest.hookimpl(trylast=True)
+    def pytest_terminal_summary(self, terminalreporter):
+        if self.unchecked_fail_under is not None:
+            n = len(self.begin["items"])
+            terminalreporter.write_line(
+                f"forktest: coverage of the {n} selected test{'s' if n != 1 else ''}; the {self.unchecked_fail_under:g}% "
+                "fail-under threshold applies to full runs (forktest --all)"
+            )
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_collection(self, session):

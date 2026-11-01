@@ -59,21 +59,24 @@ impl<T> InOrder<T> {
 
 /// The message that ends the reporter's collection: forktest's headline, the tests it will replay in order, how many
 /// it deselected, what collection itself reported, and when the run started, which pytest counts its time from.
+/// A `full` run collected and runs every test, so it reports what plain pytest would: module-level skips, and
+/// pytest-cov's fail-under threshold, which a selection's coverage cannot meet.
 pub fn begin(
     headline: Option<String>,
     items: &[&str],
     deselected: u64,
     shown: &Shown,
-    with_skips: bool,
+    full: bool,
     started: std::time::SystemTime,
 ) -> Value {
     let reports: Vec<&Value> =
-        shown.collect_reports.iter().filter(|r| with_skips || r["outcome"] != "skipped").collect();
+        shown.collect_reports.iter().filter(|r| full || r["outcome"] != "skipped").collect();
     json!({
         "type": "begin",
         "headline": headline,
         "items": items,
         "deselected": deselected,
+        "full": full,
         "collect_reports": reports,
         "warnings": shown.warnings,
         "started": started.duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64()),

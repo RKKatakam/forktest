@@ -496,6 +496,14 @@ class BasePlugin:
     def pytest_addoption(self, parser):
         parser.addini("forktest_fork_from", "Where forktest workers fork from: auto, collected, imported or spawn.")
 
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_load_initial_conftests(self, early_config):
+        # pytest-cov erases every data file of the project as it starts; a worker starting late would erase what the
+        # run's other workers saved. Only the reporter clears data, and only what earlier runs left.
+        if hasattr(early_config.known_args_namespace, "cov_append"):
+            early_config.known_args_namespace.cov_append = True
+        return (yield)
+
     @pytest.hookimpl(tryfirst=True)
     def pytest_cmdline_main(self, config):
         # Nothing here prints session output, and plugins configuring (live logging) must find no terminal reporter.
@@ -641,6 +649,8 @@ class L1Plugin(BasePlugin):
                 items = [by_id[n] for n in msg["nodeids"] if n in by_id]
                 WorkerTerminal.stand_in(self.config)
                 run_items(items, sender, self.recorder, self.project, self.fixtures, msg["replay"])
+                if msg["replay"]:
+                    save_coverage(self.config)
                 self.conn.send({"type": "done", "rid": msg["rid"]})
 
     def fork_workers(self, rid, batches, nice, replay):
@@ -669,7 +679,8 @@ class L1Plugin(BasePlugin):
                 become_worker(self.config, rid, index, count)
                 WorkerTerminal.stand_in(self.config)
                 run_items(items, Sender(conn), self.recorder, self.project, self.fixtures, replay)
-                save_coverage(self.config)
+                if replay:
+                    save_coverage(self.config)
                 conn.send({"type": "done"})
             except BaseException as exc:
                 conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
@@ -704,7 +715,8 @@ class BatchPlugin(BasePlugin):
             become_worker(self.config, *self.identity)
             WorkerTerminal.stand_in(self.config)
             run_items(items, Sender(self.conn), self.recorder, self.project, self.fixtures, self.replay)
-            save_coverage(self.config)
+            if self.replay:
+                save_coverage(self.config)
             self.conn.send({"type": "done"})
         except BaseException as exc:
             self.conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
@@ -712,16 +724,22 @@ class BatchPlugin(BasePlugin):
 
 
 def save_coverage(config):
-    """Writes what pytest-cov measured in this process to a data file of its own.
+    """Writes what pytest-cov measured in this process to a data file of its own, for the reporter to combine.
 
     Coverage names the file by the saving process's pid, so each forked worker writes its own; the reporter's
-    pytest-cov combines them at session end. Workers never reach the session end that would save it.
+    pytest-cov combines them at session end. Workers never reach the session end that would save it. A worker
+    whose tests ran none of the measured code saves no data, which is no reason to warn.
     """
-    plugin = config.pluginmanager.get_plugin("_cov")
-    cov = getattr(getattr(plugin, "cov_controller", None), "cov", None)
+    cov = measured_coverage(config)
     if cov is not None:
         cov.stop()
+        cov._warn_no_data = False
         cov.save()
+
+
+def measured_coverage(config):
+    plugin = config.pluginmanager.get_plugin("_cov")
+    return getattr(getattr(plugin, "cov_controller", None), "cov", None)
 
 
 def become_worker(config, rid, index, count):
@@ -813,6 +831,7 @@ class Replay:
         self.conn = conn
         self.stderr_fd = None
         self.begin = None
+        self.erase_coverage = False
 
     def pytest_addoption(self, parser):
         parser.addini("forktest_fork_from", "Where forktest workers fork from: auto, collected, imported or spawn.")
@@ -824,6 +843,10 @@ class Replay:
         # Nothing runs here, so capturing at the sys level is the same.
         if ns.capture == "fd":
             ns.capture = "sys"
+        # pytest-cov erases at start; this run's workers may have saved by then. See `erase_earlier_coverage`.
+        if hasattr(ns, "cov_append"):
+            self.erase_coverage = not ns.cov_append
+            ns.cov_append = True
         return (yield)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
@@ -848,6 +871,12 @@ class Replay:
         self.begin = self.recv()
         os.dup2(self.stderr_fd, 2)
         os.close(self.stderr_fd)
+        cov = measured_coverage(session.config)
+        if cov is not None:
+            # This process runs no test; what it reports is what the workers saved.
+            cov._warn_no_data = False
+            if self.erase_coverage:
+                erase_earlier_coverage(cov, self.begin["started"])
         if self.begin["headline"] is not None:
             sys.stdout.write(self.begin["headline"] + "\n")
             sys.stdout.flush()
@@ -935,6 +964,20 @@ class Replay:
         if msg is None:
             flush_and_exit(1)
         return msg
+
+
+def erase_earlier_coverage(cov, started):
+    """What pytest-cov's erase at start does, for data files written before this run started: the run's workers
+    save theirs after it, perhaps before this reporter got here."""
+    import glob
+
+    data_file = os.path.abspath(cov.config.data_file)
+    for path in [data_file, *glob.glob(glob.escape(data_file) + ".*")]:
+        try:
+            if os.stat(path).st_mtime < started:
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def report_of(config, data):

@@ -191,3 +191,43 @@ def test_workers_print_no_live_log_as_xdist_workers_print_none(fresh: Project):
         proc = fresh.run("--no-daemon", "--all", "--fork-from", fork_from, "-o", "log_cli=true", "tests/test_live.py")
         assert proc.returncode == 0 and "1 passed" in proc.stdout, proc.stdout + proc.stderr
         assert "a live log line" not in proc.stdout + proc.stderr, fork_from + proc.stdout + proc.stderr
+
+
+SLOW_SECOND_PROCESS = """import os
+import time
+
+for n in (1, 2):
+    try:
+        os.close(os.open(f".started-{n}", os.O_CREAT | os.O_EXCL))
+    except FileExistsError:
+        continue
+    if n == 2:
+        time.sleep(2)
+    break
+"""
+
+
+def test_a_worker_that_starts_late_keeps_the_coverage_other_workers_saved(fresh: Project):
+    fresh.write("slow_second.py", SLOW_SECOND_PROCESS)
+    args = ("-p", "no:cacheprovider", "-p", "slow_second", "--cov=billing")
+    theirs = fresh.pytest("-p", "no:cacheprovider", "--cov=billing")
+    for _ in range(2):
+        for marker in fresh.root.glob(".started-*"):
+            marker.unlink()
+        ours = fresh.run("--no-daemon", "--all", "--fork-from", "imported", "-n", "4", *args, PYTHONPATH=str(fresh.root))
+        assert coverage_section(ours.stdout) == coverage_section(theirs.stdout), ours.stdout + ours.stderr
+        assert "No data was collected" not in ours.stderr, ours.stderr
+
+
+def test_json_alone_leaves_no_coverage_data_behind(fresh: Project):
+    proc = fresh.run("--no-daemon", "--all", "--json", "--cov=billing")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert not list(fresh.root.glob(".coverage*"))
+
+
+def test_a_reporter_that_starts_late_keeps_the_coverage_its_workers_saved(fresh: Project):
+    fresh.write("slow_reporter.py", "import sys\nimport time\n\nif sys.argv[1:2] == ['reporter']:\n    time.sleep(2)\n")
+    theirs = fresh.pytest("-p", "no:cacheprovider", "--cov=billing")
+    args = ("-p", "no:cacheprovider", "-p", "slow_reporter", "--cov=billing")
+    ours = fresh.run("--no-daemon", "--all", "--fork-from", "spawn", *args, PYTHONPATH=str(fresh.root))
+    assert coverage_section(ours.stdout) == coverage_section(theirs.stdout), ours.stdout + ours.stderr

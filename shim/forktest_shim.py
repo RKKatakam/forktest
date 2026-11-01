@@ -661,6 +661,31 @@ def preimport(names, avoid=()):
     return tolerated, dropped, before
 
 
+def refresh_editable_builds():
+    """Runs each meson-python editable finder's rebuild here, once, before forking.
+
+    The finder rebuilds once per process (`_rebuild` is an lru_cache) and pandas marks its version file
+    always stale, so children that each import the project race `ninja` on the same outputs: one reads
+    `_version_meson.py` while another rewrites it. Children forked after this share the cached result.
+    Clearing the cache first keeps an edit to a compiled source picked up on the next fork.
+
+    The cache holds one entry and a `.pth` can register the same finder twice, so each build path is
+    rebuilt once, last for the finder that comes first on `sys.meta_path`, which is the one imports reach.
+    """
+    finders = {}
+    for finder in sys.meta_path:
+        rebuild = getattr(finder, "_rebuild", None)
+        if rebuild is not None and hasattr(rebuild, "cache_clear"):
+            finders.setdefault(getattr(finder, "_build_path", id(finder)), finder)
+    for finder in finders.values():
+        finder._rebuild.cache_clear()
+    for finder in reversed(list(finders.values())):
+        try:
+            finder._rebuild()
+        except Exception:  # the child's own import reports the failure, as plain pytest would
+            finder._rebuild.cache_clear()
+
+
 def l0_main():
     conn = Conn()
     conn.send({"type": "hello", "role": "l0", "pid": os.getpid(), "python": sys.version.split()[0]})
@@ -693,6 +718,8 @@ def l0_main():
                 except OSError:
                     pass
             os.killpg(0, signal.SIGKILL)
+        if msg["type"] in ("collect", "run_workers"):
+            refresh_editable_builds()
         if msg["type"] == "collect":
             gc.freeze()
             pid = os.fork()

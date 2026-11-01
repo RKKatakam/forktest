@@ -432,20 +432,32 @@ def rewrite_names():
 
 
 class WorkerTerminal:
-    """Stands in for the terminal reporter in L1 and workers, which print no session output of their own.
+    """Stands in for the terminal reporter while a worker runs its tests; workers print no session output.
 
     A plugin that writes to the terminal while a test runs (pytest-timeout's stack dump goes through
     `config.get_terminal_writer()`) gets a writer on stderr instead of an assertion that no reporter exists.
-    It has no hooks, so it prints nothing unasked.
+    It has no hooks, so it prints nothing unasked. It is registered only once configuration is over: plugins
+    that look for a terminal reporter while configuring (live logging) must see none, as in an xdist worker.
     """
 
     def __init__(self, config):
+        from _pytest import compat
         from _pytest.config import create_terminal_writer
 
         self.config = config
         self._tw = create_terminal_writer(config, sys.stderr)
+        self.hasmarkup = self._tw.hasmarkup
+        self.isatty = getattr(compat, "CallableBool", bool)(sys.stderr.isatty())
         self.verbosity = config.option.verbose
         self.stats = {}
+
+    @classmethod
+    def stand_in(cls, config):
+        pm = config.pluginmanager
+        if pm.is_blocked("terminalreporter"):
+            # pluggy before 1.4 has no unblock.
+            getattr(pm, "unblock", lambda name: pm._name2plugin.pop(name, None))("terminalreporter")
+            pm.register(cls(config), "terminalreporter")
 
     def write(self, content, **markup):
         self._tw.write(content, **markup)
@@ -484,13 +496,14 @@ class BasePlugin:
     def pytest_addoption(self, parser):
         parser.addini("forktest_fork_from", "Where forktest workers fork from: auto, collected, imported or spawn.")
 
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_cmdline_main(self, config):
+        # Nothing here prints session output, and plugins configuring (live logging) must find no terminal reporter.
+        config.pluginmanager.set_blocked("terminalreporter")
+
     @pytest.hookimpl(trylast=True)
     def pytest_configure(self, config):
         self.config = config
-        reporter = config.pluginmanager.getplugin("terminalreporter")
-        if reporter is not None:
-            config.pluginmanager.unregister(reporter)
-            config.pluginmanager.register(WorkerTerminal(config), "terminalreporter")
         self.recorder.start()
 
     @pytest.hookimpl(tryfirst=True)
@@ -626,6 +639,7 @@ class L1Plugin(BasePlugin):
             elif msg["type"] == "run_in_process":
                 sender = Sender(self.conn)
                 items = [by_id[n] for n in msg["nodeids"] if n in by_id]
+                WorkerTerminal.stand_in(self.config)
                 run_items(items, sender, self.recorder, self.project, self.fixtures, msg["replay"])
                 self.conn.send({"type": "done", "rid": msg["rid"]})
 
@@ -653,6 +667,7 @@ class L1Plugin(BasePlugin):
                     os.nice(10)
                 self.reinit_capture()
                 become_worker(self.config, rid, index, count)
+                WorkerTerminal.stand_in(self.config)
                 run_items(items, Sender(conn), self.recorder, self.project, self.fixtures, replay)
                 save_coverage(self.config)
                 conn.send({"type": "done"})
@@ -687,6 +702,7 @@ class BatchPlugin(BasePlugin):
         items = [by_id[n] for n in self.nodeids if n in by_id]
         try:
             become_worker(self.config, *self.identity)
+            WorkerTerminal.stand_in(self.config)
             run_items(items, Sender(self.conn), self.recorder, self.project, self.fixtures, self.replay)
             save_coverage(self.config)
             self.conn.send({"type": "done"})

@@ -183,3 +183,11 @@ def test_a_lost_reporter_says_the_junit_xml_was_not_written(fresh: Project):
         proc = fresh.run("--no-daemon", "--all", *mode, "--junitxml", "out.xml")
         assert "pytest's reporter exited" in proc.stderr and "no JUnit XML was written" in proc.stderr, proc.stderr
         assert not (fresh.root / "out.xml").exists()
+
+
+def test_workers_print_no_live_log_as_xdist_workers_print_none(fresh: Project):
+    fresh.write("tests/test_live.py", 'import logging\n\n\ndef test_logs():\n    logging.getLogger("demo").warning("a live log line")\n')
+    for fork_from in ("collected", "imported", "spawn"):
+        proc = fresh.run("--no-daemon", "--all", "--fork-from", fork_from, "-o", "log_cli=true", "tests/test_live.py")
+        assert proc.returncode == 0 and "1 passed" in proc.stdout, proc.stdout + proc.stderr
+        assert "a live log line" not in proc.stdout + proc.stderr, fork_from + proc.stdout + proc.stderr

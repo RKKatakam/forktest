@@ -678,11 +678,14 @@ impl Project {
                     session.drop_l1();
                     session.assume_fork_point(fork_point);
                     let only = &partial.as_ref().expect("checked above").only;
-                    let path_of: HashMap<&str, &str> =
-                        inventory.iter().flat_map(|r| r.nodeids.iter().map(|n| (n.as_str(), &*r.path))).collect();
-                    let items = only
+                    let wanted: HashSet<&str> = only.iter().map(String::as_str).collect();
+                    // The inventory keeps each file's tests in collection order, which workers run them in and
+                    // pytest's reporter prints them in.
+                    let items = inventory
                         .iter()
-                        .map(|n| CollectedItem { nodeid: n.clone(), path: path_of.get(n.as_str()).copied().unwrap_or(test_file(n)).to_string() })
+                        .flat_map(|r| r.nodeids.iter().map(move |n| (n, &r.path)))
+                        .filter(|(n, _)| wanted.contains(n.as_str()))
+                        .map(|(n, path)| CollectedItem { nodeid: n.clone(), path: path.to_string() })
                         .collect();
                     log(|| format!("no L1: {} tests from the inventory; workers fork from {} and collect their files", only.len(), fork_point_name(session.fork_point())));
                     Arc::new(Collected::known(items, session.fork_point()))

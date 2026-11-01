@@ -29,11 +29,23 @@ forktest (Rust)                                              Python (embedded sh
 cli ─► root ─► fingerprint (ruff parser, rayon) ─► graph     L0  python shim.py l0: import pytest + preimports
             ─► store (SQLite) ─► select ─► schedule              │ fork on "collect"
             ─► zygote (process layer, unix socket server)        ├─► L1: pytest.main(args) restricted to files,
-            ─► report (human, jsonl, junit)                       │        reports items; forks workers on "run"
+            ─► report (human, jsonl) + replay (pytest's reporter) │        reports items; forks workers on "run"
 daemon/watch: same pipeline, long-lived, notify-based watcher    │          └─► worker: runs its batch
-                                                                  └─► worker (Imported mode): pytest.main(args)
-                                                                        restricted to its batch's files, runs it
+                                                                  ├─► worker (Imported mode): pytest.main(args)
+                                                                  │     restricted to its batch's files, runs it
+                                                                  └─► reporter: pytest.main(args) that replays the
+                                                                        run's reports through pytest's hooks
 ```
+
+### pytest's reporter (the human output and JUnit XML)
+
+Python processes never print a run's results: every one of them unregisters pytest's terminal reporter. A reporter process prints them, as pytest-xdist's controller does.
+
+- Workers add `"pytest": {"reports": [...], "warnings": [...]}` to each test's `result` message when the run replays: `pytest_report_to_serializable` of its setup, call and teardown reports, and the warnings recorded while it ran. L1's `collected` message carries `"pytest": {"collect_reports", "warnings", "deselected"}`: failed and skipped collect reports, collection warnings, and how many items `-k`/`-m` deselected. A batch worker sends its collection warnings in `started` and a collect error's report in `collect_error`. `--json` alone sends none of it.
+- The reporter is `pytest.main(args)` with the `Replay` plugin, forked from L0 (a fresh `python shim.py reporter ID ARGS` without one). It parses the args and loads plugins and conftests, then waits in `pytest_cmdline_main` for a run to hand it the terminal: stdout and stderr as descriptors over its socket (`SCM_RIGHTS`; the daemon gets them from the client the same way) and the client's `TERM`, `COLUMNS`, `NO_COLOR` and the like. pytest configures after that, so colour and width come from the real terminal. The daemon prepares the next run's reporter after each run and when its zygote is ready; a changed `conftest.py` or config file drops it.
+- `begin` follows selection: forktest's headline, which the reporter prints first, the nodeids it will replay in collection order, how many selection and pytest's own options deselected, the collect reports and warnings, and when the run started, which pytest's clocks count from. `Replay` turns these into placeholder items and a `CollectReport` for `pytest_collection`, then replays each test's reports through `pytest_runtest_logstart`, `pytest_runtest_logreport` and `pytest_runtest_logfinish`, and warnings through `pytest_warning_recorded`. A test whose worker died is replayed as an error at setup.
+- Rust forwards tests in collection order (`replay::InOrder`): a test's reports wait until every test before it has been forwarded. `--maxfail` and `-x` stop after the failure that reaches the limit in that order, as pytest would, and JSON results come out in that order too when a limit is set. A writer thread does the forwarding, so a reporter that stops reading never blocks the run.
+- The exit code is the reporter session's. If the reporter cannot start or dies before reporting, forktest's compact output stands in and says why on stderr.
 
 ### Fork points (the thread rule)
 

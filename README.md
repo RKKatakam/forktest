@@ -36,7 +36,7 @@ forktest                     # tests affected by your uncommitted edits (first r
 forktest --all               # the whole suite, forked and parallel
 forktest --since main        # affected by every function changed since branching from main
 forktest --json              # one JSON object per line, for agents and CI
-forktest --junitxml out.xml  # JUnit XML as well
+forktest --junitxml out.xml  # pytest's JUnit XML as well
 forktest -n 4                # at most 4 workers (default: cpu count; fewer when the selection is cheap)
 forktest --strict-pytest     # one process, one shared session, exact pytest semantics
 forktest --verify-selection  # also run the unselected tests; a failure among them is a "miss"
@@ -55,16 +55,39 @@ arguments: `--collect-only`, `--fixtures`, `--fixtures-per-test`, `--markers`,
 `--version`, `-h`, `--pdb`, `--trace`, `--setup-plan`, `--setup-only`,
 `--setup-show`, `--lf`, `--ff`, `--sw` and `--stepwise-skip`.
 
-Human output:
+Human output is pytest's own, after one line from forktest. A pytest session
+in its own process replays the workers' reports through pytest's hooks, as
+pytest-xdist's controller does, so tracebacks, captured output, the warnings
+summary, `-r` summaries, and whatever plugins print at the end come out as
+pytest prints them, in collection order, with pytest's colours and width.
+`--junitxml` is pytest's junitxml plugin in that session, and the exit code is
+that session's. The tests selection left out are counted as deselected:
 
 ```
-forktest · 1 file changed · 7 of 16 tests selected (0.01s)
-  ✗ tests/test_tax.py::test_round_vat[10.005-10.01]
-      tests/test_tax.py:14  assert Decimal('11.01') == Decimal('10.01')
-      +  where Decimal('11.01') = round_vat(Decimal('10.005'))
-  ✓ tests/test_invoice.py   2 passed
-1 failed, 6 passed in 0.05s
+forktest · 1 file changed · 7 of 16 tests selected (0.12s)
+============================= test session starts ==============================
+platform darwin -- Python 3.12.15, pytest-9.2.0, pluggy-1.7.0
+rootdir: /private/tmp/demo
+configfile: pyproject.toml
+testpaths: tests
+collected 16 items / 9 deselected / 7 selected
+
+tests/test_invoice.py FF                                                 [ 28%]
+tests/test_tax.py FFFFF                                                  [100%]
+
+=================================== FAILURES ===================================
+_________________________ test_round_vat[10.005-10.01] _________________________
+...
+=========================== short test summary info ============================
+FAILED tests/test_tax.py::test_round_vat[10.005-10.01] - AssertionError: asse...
+...
+======================= 7 failed, 9 deselected in 0.14s ========================
 ```
+
+What still differs from plain pytest: with `-s`, a test's own output reaches
+the terminal while it runs in its worker, not between progress characters; and
+testsuite properties that plugins add from inside a test process (hypothesis'
+statistics) are missing from the JUnit XML, as under pytest-xdist.
 
 JSON output (`--json`):
 

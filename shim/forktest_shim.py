@@ -814,6 +814,7 @@ class Replay:
     def pytest_cmdline_main(self, config):
         _, fds, _, _ = socket.recv_fds(self.conn.sock, 1, 2)
         out, self.stderr_fd = fds
+        os.set_inheritable(self.stderr_fd, False)
         os.dup2(out, 1)
         os.close(out)
         sys.stdout.reconfigure(line_buffering=os.isatty(1))
@@ -830,6 +831,7 @@ class Replay:
 
         self.begin = self.recv()
         os.dup2(self.stderr_fd, 2)
+        os.close(self.stderr_fd)
         if self.begin["headline"] is not None:
             sys.stdout.write(self.begin["headline"] + "\n")
             sys.stdout.flush()

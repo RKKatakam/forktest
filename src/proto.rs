@@ -9,6 +9,12 @@ use std::os::unix::net::UnixStream;
 
 const MAX_FRAME: usize = 1 << 30;
 
+/// Linux sets close-on-exec as the descriptors arrive; macOS has no such flag, so `recv_fds` sets it after.
+#[cfg(target_os = "linux")]
+const RECV_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const RECV_FLAGS: libc::c_int = 0;
+
 pub struct Frame {
     pub msg: serde_json::Value,
     pub blob: Vec<u8>,
@@ -85,7 +91,8 @@ pub fn send_fds(stream: &UnixStream, fds: &[BorrowedFd<'_>]) -> std::io::Result<
     }
 }
 
-/// Receives the byte `send_fds` sent and the `n` descriptors it carried.
+/// Receives the byte `send_fds` sent and the `n` descriptors it carried, close-on-exec so no interpreter spawned
+/// later inherits them: a client's stdout held open by one never reaches end of file.
 pub fn recv_fds(stream: &UnixStream, n: usize) -> std::io::Result<Vec<OwnedFd>> {
     let bytes = (n * std::mem::size_of::<i32>()) as u32;
     let mut control = vec![0u8; unsafe { libc::CMSG_SPACE(bytes) } as usize];
@@ -97,7 +104,7 @@ pub fn recv_fds(stream: &UnixStream, n: usize) -> std::io::Result<Vec<OwnedFd>> 
     msg.msg_control = control.as_mut_ptr().cast();
     msg.msg_controllen = control.len() as _;
     let got = loop {
-        match unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) } {
+        match unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, RECV_FLAGS) } {
             -1 if Error::last_os_error().kind() == ErrorKind::Interrupted => {}
             -1 => return Err(Error::last_os_error()),
             got => break got,
@@ -111,7 +118,9 @@ pub fn recv_fds(stream: &UnixStream, n: usize) -> std::io::Result<Vec<OwnedFd>> 
                 let data = libc::CMSG_DATA(cmsg).cast::<i32>();
                 let count = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<i32>();
                 for i in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(data.add(i).read_unaligned()));
+                    let fd = data.add(i).read_unaligned();
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    fds.push(OwnedFd::from_raw_fd(fd));
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
@@ -152,6 +161,10 @@ mod tests {
         send_fds(&a, &[pipe_w.as_fd(), pipe_w.as_fd()]).unwrap();
         drop(pipe_w);
         let fds = recv_fds(&b, 2).unwrap();
+        for fd in &fds {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC, "a received descriptor leaks into spawned processes");
+        }
         let mut w = std::fs::File::from(fds.into_iter().next().unwrap());
         w.write_all(b"hi").unwrap();
         drop(w);

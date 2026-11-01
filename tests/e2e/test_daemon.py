@@ -300,6 +300,13 @@ def test_a_run_survives_the_daemon_stopping_under_it(served):
     assert rc == 0 and selection(events).selected == 0, "every test ran to the end once"
 
 
+def test_a_daemon_run_piped_into_another_program_reaches_end_of_file(served):
+    start(served)
+    for fork_from in ("spawn", "collected"):
+        proc = served.run("--all", "--fork-from", fork_from, "tests/", timeout=30, FORKTEST_LOG="1")
+        assert "served by the daemon" in proc.stderr and "16 passed" in proc.stdout, proc.stdout + proc.stderr
+
+
 def test_the_zygote_dying_mid_run_loses_no_results_and_is_rebuilt(served):
     demo = served
     demo.write("tests/test_sleepy.py", "import time\n\ndef test_sleepy():\n    time.sleep(1.5)\n")

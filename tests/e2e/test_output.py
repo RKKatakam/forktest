@@ -160,3 +160,26 @@ def test_a_file_given_twice_with_keep_duplicates_runs_twice_as_in_pytest(fresh: 
     args = ("-p", "no:cacheprovider", "--keep-duplicates", "tests/test_dup.py", "tests/test_dup.py")
     ours, theirs = fresh.run("--no-daemon", *args), fresh.pytest(*args)
     assert (ours.returncode, normalised(ours.stdout)) == (theirs.returncode, normalised(theirs.stdout)), ours.stdout
+
+
+def without_clock(xml: str) -> str:
+    return re.sub(r' (time|timestamp|hostname)="[^"]*"', "", xml)
+
+
+def test_a_run_that_selects_nothing_writes_pytests_xml_for_an_empty_run(fresh: Project):
+    fresh.run("--no-daemon")
+    (fresh.root / "out.xml").write_text("left by an earlier run")
+    proc = fresh.run("--no-daemon", "--junitxml", "out.xml")
+    assert "0 of 16 tests selected" in proc.stdout, proc.stdout
+    fresh.pytest("-p", "no:cacheprovider", "-k", "no_test_matches_this", "--junitxml", "pytest.xml")
+    assert without_clock((fresh.root / "out.xml").read_text()) == without_clock((fresh.root / "pytest.xml").read_text())
+
+
+def test_a_lost_reporter_says_the_junit_xml_was_not_written(fresh: Project):
+    with open(fresh.root / "conftest.py", "a") as f:
+        f.write('\n\ndef pytest_runtest_logreport(report):\n    import os\n    if "PYTEST_XDIST_WORKER" not in os.environ:\n        os._exit(7)\n')
+    (fresh.root / "out.xml").write_text("left by an earlier run")
+    for mode in ((), ("--json",)):
+        proc = fresh.run("--no-daemon", "--all", *mode, "--junitxml", "out.xml")
+        assert "pytest's reporter exited" in proc.stderr and "no JUnit XML was written" in proc.stderr, proc.stderr
+        assert not (fresh.root / "out.xml").exists()

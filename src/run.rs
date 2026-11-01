@@ -11,6 +11,7 @@ use crate::zygote::{
     Batch, Collected, CollectedItem, Control, ForkPoint, ForkPolicy, Names, Partial, ReporterEnd, Session, SessionConfig,
     Terminal, ToReporter, WorkerEvent,
 };
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -447,6 +448,10 @@ impl Project {
     /// Runs one request, emitting its events, and returns pytest's exit code when it stopped before reporting.
     /// With a `terminal`, pytest's own reporter prints the run there.
     pub fn run(&mut self, req: &Request, terminal: Option<Terminal>, emit: &mut dyn FnMut(&Event)) -> anyhow::Result<i32> {
+        // An XML left from an earlier run must not pass for this run's.
+        if let Some(path) = &req.junitxml {
+            let _ = std::fs::remove_file(path);
+        }
         let mut learned = Learned::default();
         let result = self.pipeline(req, terminal.as_ref(), emit, &mut learned);
         if let Some((_, session)) = &mut self.session {
@@ -634,6 +639,7 @@ impl Project {
                 let files: BTreeSet<String> = narrowed.iter().cloned().chain(whole).collect();
                 if files.is_empty() {
                     log(|| "no python started".into());
+                    write_empty_junitxml(req, started)?;
                     learned.graph = graph.export();
                     emit(&Event::Selection {
                         changed: affected.changed,
@@ -771,7 +777,7 @@ impl Project {
                 to.send(&replay::begin(None, &items, collected.shown.deselected, &collected.shown, true, started));
                 to.send(&replay::end());
                 let session = &mut self.session.as_mut().expect("collected above").1;
-                if let Some(event) = reporter_event(session.finish_reporter()) {
+                if let Some(event) = reporter_event(session.finish_reporter(), req.junitxml.as_deref()) {
                     emit(&event);
                 }
             }
@@ -803,6 +809,7 @@ impl Project {
             // Nothing runs: forktest's own one-line report says so, and the exit code stays forktest's.
             reporter = None;
             session.drop_reporter();
+            write_empty_junitxml(req, started)?;
         }
         if let Some(to) = &reporter {
             let deselected = (universe.len() - selected.len()) as u64 + collected.shown.deselected;
@@ -832,7 +839,7 @@ impl Project {
         }
         if let Some(to) = reporter.take() {
             to.send(&replay::end());
-            if let Some(event) = reporter_event(session.finish_reporter()) {
+            if let Some(event) = reporter_event(session.finish_reporter(), req.junitxml.as_deref()) {
                 emit(&event);
             }
         }
@@ -1030,13 +1037,64 @@ impl Project {
 
 /// What the human reporter needs to know of how pytest's reporter ended. A session that ended before it printed
 /// forktest's headline printed nothing the user saw, so forktest's own output stands in.
-fn reporter_event(end: Option<(ReporterEnd, bool)>) -> Option<Event> {
+fn reporter_event(end: Option<(ReporterEnd, bool)>, junitxml: Option<&Path>) -> Option<Event> {
     let (end, began) = end?;
-    Some(match end {
-        Ok(exit) if began => Event::Reported { exit },
-        Ok(exit) => Event::ReporterLost { reason: format!("pytest's reporter exited with code {exit} before the run"), headline_shown: false },
-        Err(reason) => Event::ReporterLost { reason, headline_shown: began },
-    })
+    let (reason, headline_shown) = match end {
+        Ok(exit) if began => return Some(Event::Reported { exit }),
+        Ok(exit) => (format!("pytest's reporter exited with code {exit} before the run"), false),
+        Err(reason) => (reason, began),
+    };
+    let reason = match junitxml.filter(|p| !p.exists()) {
+        Some(path) => format!("{reason}; no JUnit XML was written to {}", path.display()),
+        None => reason,
+    };
+    Some(Event::ReporterLost { reason, headline_shown })
+}
+
+/// The JUnit XML pytest writes for a run with no tests, for a run that selected none and so starts no reporter.
+fn write_empty_junitxml(req: &Request, started: std::time::SystemTime) -> anyhow::Result<()> {
+    let Some(path) = &req.junitxml else { return Ok(()) };
+    let elapsed = started.elapsed().unwrap_or_default().as_secs_f64();
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="0" time="{elapsed:.3}" timestamp="{}" hostname="{}" /></testsuites>"#,
+        local_iso_timestamp(started),
+        hostname()
+    );
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, xml).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Python's `datetime.fromtimestamp(t).astimezone().isoformat()`, which pytest's JUnit timestamp is.
+fn local_iso_timestamp(t: std::time::SystemTime) -> String {
+    let since = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = since.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    let offset = tm.tm_gmtoff / 60;
+    let sign = if offset < 0 { '-' } else { '+' };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}{sign}{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+        since.subsec_micros(),
+        offset.abs() / 60,
+        offset.abs() % 60
+    )
+}
+
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return String::new();
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 fn session_key(req: &Request, policy: ForkPolicy) -> SessionKey {

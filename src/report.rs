@@ -27,7 +27,11 @@ impl<W: Write> Reporter for JsonlReporter<W> {
     fn handle(&mut self, event: &Event) -> io::Result<()> {
         match event {
             Event::Result(r) if r.outcome == Outcome::Passed => return Ok(()),
-            Event::Reported { .. } | Event::ReporterLost { .. } => return Ok(()),
+            Event::ReporterLost { reason, .. } => {
+                eprintln!("forktest: {reason}");
+                return Ok(());
+            }
+            Event::Reported { .. } => return Ok(()),
             _ => {}
         }
         let mut line = ascii_json(&event.to_line());

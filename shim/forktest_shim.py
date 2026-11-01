@@ -502,12 +502,14 @@ class BasePlugin:
         # run's other workers saved. Only the reporter clears data, and only what earlier runs left.
         if hasattr(early_config.known_args_namespace, "cov_append"):
             early_config.known_args_namespace.cov_append = True
+        no_distribution(early_config.known_args_namespace)
         return (yield)
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_cmdline_main(self, config):
         # Nothing here prints session output, and plugins configuring (live logging) must find no terminal reporter.
         config.pluginmanager.set_blocked("terminalreporter")
+        no_distribution(config.option)
 
     @pytest.hookimpl(trylast=True)
     def pytest_configure(self, config):
@@ -742,6 +744,15 @@ def measured_coverage(config):
     return getattr(getattr(plugin, "cov_controller", None), "cov", None)
 
 
+def no_distribution(option):
+    """Turns off pytest-xdist's distribution (`-n 2` in addopts), as xdist does in its own workers: forktest's workers
+    run the tests in parallel, and an xdist controller here would collect and run them all again. xdist stays loaded,
+    so its `worker_id` fixture still reads the identity `become_worker` gives."""
+    for name, value in (("dist", "no"), ("distload", False), ("numprocesses", None), ("maxprocesses", None), ("tx", [])):
+        if hasattr(option, name):
+            setattr(option, name, value)
+
+
 def become_worker(config, rid, index, count):
     """Gives a worker the identity a pytest-xdist worker has, just before its tests run.
 
@@ -848,10 +859,12 @@ class Replay:
         if hasattr(ns, "cov_append"):
             self.erase_coverage = not ns.cov_append
             ns.cov_append = True
+        no_distribution(ns)
         return (yield)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_cmdline_main(self, config):
+        no_distribution(config.option)
         _, fds, _, _ = socket.recv_fds(self.conn.sock, 1, 2)
         out, self.stderr_fd = fds
         os.set_inheritable(self.stderr_fd, False)

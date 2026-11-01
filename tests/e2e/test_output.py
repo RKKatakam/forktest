@@ -3,6 +3,9 @@
 import re
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import pytest
 
 from conftest import Project
 from test_daemon import daemon_log, served, start  # noqa: F401
@@ -273,3 +276,22 @@ def test_all_prints_what_pytest_prints_when_workers_collect_their_own_files(fres
     for fork_from in ("imported", "imported", "spawn"):
         ours = fresh.run("--no-daemon", "--all", "--fork-from", fork_from, *args)
         assert (ours.returncode, normalised(ours.stdout)) == (theirs.returncode, normalised(theirs.stdout)), ours.stdout
+
+
+XDIST_PYTHON = Path("/tmp/covtest/.venv/bin/python")
+USES_WORKER_ID = "def test_runs_in_a_worker(worker_id):\n    assert worker_id.startswith('gw')\n"
+
+
+@pytest.mark.skipif(not XDIST_PYTHON.exists(), reason=f"no interpreter with pytest-xdist at {XDIST_PYTHON}")
+@pytest.mark.parametrize("n", ["2", "auto"])
+def test_n_in_addopts_runs_in_forktests_workers_with_pytests_counts(fresh: Project, n):
+    project = Project(fresh.root, fresh.binary, str(XDIST_PYTHON))
+    config = project.root / "pyproject.toml"
+    config.write_text(config.read_text().replace('pythonpath = ["."]', f'pythonpath = ["."]\naddopts = "-n {n}"'))
+    project.write("tests/test_worker.py", USES_WORKER_ID)
+    theirs = project.pytest("-p", "no:cacheprovider")
+    assert theirs.returncode == 0 and "17 passed" in theirs.stdout, theirs.stdout
+    for fork_from in ("collected", "imported", "spawn"):
+        ours = project.run("--no-daemon", "--all", "--fork-from", fork_from, "-p", "no:cacheprovider")
+        assert "INTERNALERROR" not in ours.stdout + ours.stderr, ours.stdout + ours.stderr
+        assert ours.returncode == 0 and normalised(ours.stdout)[-1] == normalised(theirs.stdout)[-1], ours.stdout

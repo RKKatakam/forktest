@@ -1,13 +1,15 @@
 //! One request from selection to events: decide what to collect, collect it, select, run, record.
 
 use crate::events::{Done, Event, Outcome, TestResult};
+use crate::replay::{self, InOrder};
 use crate::fingerprint::{Dep, FILE, Fingerprints, Hash128, MODULE, RelPath};
 use crate::graph::ImportGraph;
 use crate::root::{config_files, is_excluded};
 use crate::select::{self, Affected, Current, Reason, SinceBaseline, WorkingTree};
 use crate::store::{DepSet, GitBaseline, InventoryRow, Record, Store, StoreView, dep_hash};
 use crate::zygote::{
-    Batch, Collected, CollectedItem, Control, ForkPoint, ForkPolicy, Names, Partial, Session, SessionConfig, WorkerEvent,
+    Batch, Collected, CollectedItem, Control, ForkPoint, ForkPolicy, Names, Partial, ReporterEnd, Session, SessionConfig,
+    Terminal, ToReporter, WorkerEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -37,6 +39,25 @@ pub struct Request {
     /// `None` decides from thread counts and the `forktest_fork_from` ini option.
     pub fork_from: Option<ForkPoint>,
     pub stdout_to_stderr: bool,
+    /// Where pytest's reporter writes its JUnit XML.
+    #[serde(default)]
+    pub junitxml: Option<PathBuf>,
+    /// The asking terminal's variables pytest's colour and width depend on, `None` for unset.
+    #[serde(default)]
+    pub terminal_env: Vec<(String, Option<String>)>,
+}
+
+/// The environment variables pytest's terminal output depends on.
+pub const TERMINAL_ENV: &[&str] = &["TERM", "COLUMNS", "LINES", "NO_COLOR", "FORCE_COLOR", "PY_COLORS"];
+
+impl Request {
+    fn reporter_args(&self) -> Vec<String> {
+        let mut args = self.pytest_args.clone();
+        if let Some(path) = &self.junitxml {
+            args.push(format!("--junitxml={}", path.display()));
+        }
+        args
+    }
 }
 
 /// What the store remembers about the project's Python side between runs.
@@ -420,9 +441,13 @@ impl Project {
     }
 
     /// Runs one request, emitting its events, and returns pytest's exit code when it stopped before reporting.
-    pub fn run(&mut self, req: &Request, emit: &mut dyn FnMut(&Event)) -> anyhow::Result<i32> {
+    /// With a `terminal`, pytest's own reporter prints the run there.
+    pub fn run(&mut self, req: &Request, terminal: Option<Terminal>, emit: &mut dyn FnMut(&Event)) -> anyhow::Result<i32> {
         let mut learned = Learned::default();
-        let result = self.pipeline(req, emit, &mut learned);
+        let result = self.pipeline(req, terminal.as_ref(), emit, &mut learned);
+        if let Some((_, session)) = &mut self.session {
+            session.drop_reporter();
+        }
         if req.strict || self.l1_pid().is_none() {
             self.warm = None;
         }
@@ -534,8 +559,15 @@ impl Project {
         })
     }
 
-    fn pipeline(&mut self, req: &Request, emit: &mut dyn FnMut(&Event), learned: &mut Learned) -> anyhow::Result<i32> {
+    fn pipeline(
+        &mut self,
+        req: &Request,
+        terminal: Option<&Terminal>,
+        emit: &mut dyn FnMut(&Event),
+        learned: &mut Learned,
+    ) -> anyhow::Result<i32> {
         let t0 = Instant::now();
+        let started = std::time::SystemTime::now();
         let root = self.root.clone();
         let key = args_key(&req.pytest_args);
         let fps = self.fps.clone();
@@ -592,6 +624,15 @@ impl Project {
             }
         };
 
+        // The reporter's startup overlaps collection and the run.
+        let mut reporter = match terminal {
+            Some(t) => Some(self.session_for(req, full_policy(req), &project)?.start_reporter(
+                req.reporter_args(),
+                &req.terminal_env,
+                t.try_clone()?,
+            )?),
+            None => None,
+        };
         let (collected, warm) = match warm {
             Some(warm) => {
                 log(|| format!("served by the warm collection of {} tests", warm.tests()));
@@ -659,6 +700,12 @@ impl Project {
             }
         };
         let session = &mut self.session.as_mut().expect("collected above").1;
+        if let Some(t) = terminal
+            && !session.has_reporter()
+        {
+            // Collection healed by starting the interpreters again, and the reporter went with them.
+            reporter = Some(session.start_reporter(req.reporter_args(), &req.terminal_env, t.try_clone()?)?);
+        }
 
         let files = partial.as_ref().map(|p| &p.files[..]);
         let partial = partial.is_some();
@@ -691,6 +738,15 @@ impl Project {
             emit(&Event::CollectError { nodeid: nodeid.clone(), message: message.clone() });
         }
         if !collected.errors.is_empty() && !req.pytest_args.iter().any(|a| a == "--continue-on-collection-errors") {
+            if let Some(to) = reporter.take() {
+                let items: Vec<&str> = collected.items.iter().map(|i| i.nodeid.as_str()).collect();
+                to.send(&replay::begin(None, &items, collected.shown.deselected, &collected.shown, true, started));
+                to.send(&replay::end());
+                let session = &mut self.session.as_mut().expect("collected above").1;
+                if let Some(event) = reporter_event(session.finish_reporter()) {
+                    emit(&event);
+                }
+            }
             emit(&Event::Done(Done { errors: collected.errors.len() as u64, duration_ms: ms(t0), ..Done::default() }));
             return Ok(0);
         }
@@ -703,13 +759,27 @@ impl Project {
         reasons.retain(|n, _| path_of.contains_key(n.as_str()));
         let (selected, rest): (Vec<&str>, Vec<&str>) =
             collected.items.iter().map(|i| i.nodeid.as_str()).partition(|n| reasons.contains_key(*n));
+        let reason_counts = select::reason_counts(&reasons);
+        let headline = crate::report::headline(changed.len(), selected.len() as u64, universe.len() as u64, &reason_counts, ms(t0));
         emit(&Event::Selection {
             changed,
             selected: selected.len() as u64,
             total: universe.len() as u64,
-            reasons: select::reason_counts(&reasons),
+            reasons: reason_counts,
             duration_ms: ms(t0),
         });
+        // A run that collected and ran everything reports what plain pytest would, module-level skips included.
+        let ran_everything = matches!(req.mode, Mode::All) || (!partial && selected.len() == universe.len());
+        let session = &mut self.session.as_mut().expect("started above").1;
+        if selected.is_empty() {
+            // Nothing runs: forktest's own one-line report says so, and the exit code stays forktest's.
+            reporter = None;
+            session.drop_reporter();
+        }
+        if let Some(to) = &reporter {
+            let deselected = (universe.len() - selected.len()) as u64 + collected.shown.deselected;
+            to.send(&replay::begin(Some(headline), &selected, deselected, &collected.shown, ran_everything, started));
+        }
 
         let mut run = Execution {
             root: &root,
@@ -722,9 +792,8 @@ impl Project {
             req,
             cancel: &self.cancel,
         };
-        let session = &mut self.session.as_mut().expect("started above").1;
         let mut tally = Tally::default();
-        let executed = run.execute(session, &selected, req.nice, learned, emit, &mut |r| tally.add(r.outcome));
+        let executed = run.execute(session, &selected, req.nice, reporter.as_ref(), learned, emit, &mut |r| tally.add(r.outcome));
         if !partial && let Some(args) = &mut learned.args {
             args.fork_point = Some(fork_point_name(session.fork_point()).into());
         }
@@ -732,8 +801,12 @@ impl Project {
         if self.cancel.load(Ordering::Relaxed) {
             return Ok(0);
         }
-        // A run that collected and ran everything reports what plain pytest would, module-level skips included.
-        let ran_everything = matches!(req.mode, Mode::All) || (!partial && selected.len() == universe.len());
+        if let Some(to) = reporter.take() {
+            to.send(&replay::end());
+            if let Some(event) = reporter_event(session.finish_reporter()) {
+                emit(&event);
+            }
+        }
         let collect_skips = if ran_everything { collected.skips.len() as u64 } else { 0 };
         emit(&Event::Done(Done {
             passed: tally.passed,
@@ -760,7 +833,7 @@ impl Project {
                 emit(&Event::Miss { nodeid: r.nodeid.clone(), message: r.message.clone().unwrap_or_default() });
             }
         };
-        run.execute(session, &rest, true, learned, &mut on_unselected, &mut |_| {})?;
+        run.execute(session, &rest, true, None, learned, &mut on_unselected, &mut |_| {})?;
         if self.cancel.load(Ordering::Relaxed) {
             return Ok(0);
         }
@@ -926,6 +999,17 @@ impl Project {
     }
 }
 
+/// What the human reporter needs to know of how pytest's reporter ended. A session that ended before it printed
+/// forktest's headline printed nothing the user saw, so forktest's own output stands in.
+fn reporter_event(end: Option<(ReporterEnd, bool)>) -> Option<Event> {
+    let (end, began) = end?;
+    Some(match end {
+        Ok(exit) if began => Event::Reported { exit },
+        Ok(exit) => Event::ReporterLost { reason: format!("pytest's reporter exited with code {exit} before the run"), headline_shown: false },
+        Err(reason) => Event::ReporterLost { reason, headline_shown: began },
+    })
+}
+
 fn session_key(req: &Request, policy: ForkPolicy) -> SessionKey {
     SessionKey { args: req.pytest_args.clone(), policy, stdout_to_stderr: req.stdout_to_stderr }
 }
@@ -968,6 +1052,10 @@ fn merge_project_meta(meta: &mut ProjectMeta, collected: &Collected, dropped: &[
     meta.avoid.extend(collected.rewrite.iter().cloned());
 }
 
+/// What one test leaves for release in collection order: its message for pytest's reporter, and its result when
+/// results are emitted in order.
+type Held = (Option<serde_json::Value>, Option<TestResult>);
+
 /// Seconds one more worker adds before its first test: its fork, measured at about 3 ms on the demo.
 const WORKER_COST: f64 = 0.003;
 
@@ -990,6 +1078,7 @@ impl Execution<'_> {
         session: &mut Session,
         nodeids: &[&str],
         nice: bool,
+        reporter: Option<&ToReporter>,
         learned: &mut Learned,
         emit: &mut dyn FnMut(&Event),
         on_result: &mut dyn FnMut(&TestResult),
@@ -1002,38 +1091,61 @@ impl Execution<'_> {
         self.fps.prefetch(closures.iter().map(|p| &**p).collect::<Vec<_>>());
         let mut deps = Deps::new(self.root, self.fps, self.graph);
         let mut names = Names::default();
-        let mut failures = 0u32;
-        let mut maxfail = self.maxfail;
+        // With `--maxfail` the run stops after a failure in collection order, so results are emitted in that order too
+        // and none past the stop is reported. Otherwise they stream as they arrive.
+        let mut order: InOrder<Held> = InOrder::new(nodeids, self.maxfail);
+        let mut warned: HashSet<String> = HashSet::new();
         let (view, path_of, collect_errors) = (self.view, self.path_of, &mut self.collect_errors);
         let records = &mut learned.records;
-        let mut report = |result: TestResult, emit: &mut dyn FnMut(&Event)| {
-            on_result(&result);
-            emit(&Event::Result(result));
+        let send = |msg: serde_json::Value| {
+            if let Some(to) = reporter {
+                to.send(&msg);
+            }
+        };
+        let mut arrive = |order: &mut InOrder<Held>, result: TestResult, pytest: Option<serde_json::Value>, emit: &mut dyn FnMut(&Event)| {
+            let (nodeid, failed) = (result.nodeid.clone(), result.outcome.is_failure());
+            let mut report = |result: TestResult| {
+                on_result(&result);
+                emit(&Event::Result(result));
+            };
+            let held = match order.maxfail {
+                0 => {
+                    report(result);
+                    None
+                }
+                _ => Some(result),
+            };
+            for (msg, result) in order.arrived(&nodeid, failed, (pytest, held)) {
+                msg.map(send);
+                result.map(&mut report);
+            }
         };
         let mut sink = |event: WorkerEvent, names: &Names| -> Control {
             match event {
-                WorkerEvent::Result { result, cost, hits, reads, .. } => {
+                WorkerEvent::Result { result, cost, hits, reads, pytest, .. } => {
                     let file = path_of.get(result.nodeid.as_str()).copied().unwrap_or(test_file(&result.nodeid));
                     let stored = view.tests.get(&result.nodeid).map(|t| t.digest);
                     let set = deps.of(file, &hits, &reads, names, stored);
                     records.push(Record { nodeid: result.nodeid.clone(), outcome: result.outcome, cost, deps: set });
-                    let failed = result.outcome.is_failure();
-                    report(result, emit);
-                    if failed {
-                        failures += 1;
-                        if maxfail > 0 && failures >= maxfail {
-                            return Control::Stop;
-                        }
+                    arrive(&mut order, result, pytest.map(replay::test), emit);
+                }
+                WorkerEvent::Started { maxfail, warnings } => {
+                    order.maxfail = maxfail;
+                    // Every worker that collects a file records its collection warnings; pytest shows them once.
+                    let new: Vec<_> = warnings.into_iter().filter(|w| warned.insert(w.to_string())).collect();
+                    if !new.is_empty() {
+                        send(replay::warnings(new));
                     }
                 }
-                WorkerEvent::Started { maxfail: m } => maxfail = m,
-                WorkerEvent::CollectError { nodeid, message, .. } => {
+                WorkerEvent::CollectError { nodeid, message, report } => {
                     if collect_errors.insert(nodeid.clone()) {
+                        report.map(replay::collect).map(send);
                         emit(&Event::CollectError { nodeid, message });
                     }
                 }
                 WorkerEvent::Lost { nodeids, message, .. } => {
                     for nodeid in nodeids {
+                        let lost = reporter.map(|_| replay::lost(&nodeid, &message));
                         let result = TestResult {
                             nodeid,
                             outcome: Outcome::Error,
@@ -1043,14 +1155,15 @@ impl Execution<'_> {
                             message: Some(message.clone()),
                             trace: Vec::new(),
                         };
-                        report(result, emit);
+                        arrive(&mut order, result, lost, emit);
                     }
                 }
             }
-            Control::Continue
+            if order.stopped() { Control::Stop } else { Control::Continue }
         };
+        let replay = reporter.is_some();
         if self.req.strict {
-            return session.run_in_process(nodeids.iter().map(|n| n.to_string()).collect(), &mut names, &mut sink);
+            return session.run_in_process(nodeids.iter().map(|n| n.to_string()).collect(), replay, &mut names, &mut sink);
         }
         let workers = match self.req.workers {
             0 => std::thread::available_parallelism().map_or(2, |n| n.get()),
@@ -1076,7 +1189,7 @@ impl Execution<'_> {
                 Batch { nodeids, files }
             })
             .collect();
-        session.run(batches, nice, &mut names, self.cancel, &mut sink)
+        session.run(batches, nice, replay, &mut names, self.cancel, &mut sink)
     }
 }
 

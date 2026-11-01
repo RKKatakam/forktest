@@ -5,6 +5,7 @@ mod fingerprint;
 mod graph;
 mod proto;
 mod python;
+mod replay;
 mod report;
 mod root;
 mod run;

@@ -223,7 +223,7 @@ def test_xfail_and_xpass_are_reported_like_pytest_and_a_strict_xpass_fails(demo)
 
     demo.edit("tests/test_marks.py", "assert False", "assert 0 == 1")
     human = demo.run("--no-daemon").stdout
-    assert human.splitlines()[-1].startswith("1 failed, 0 passed, 1 xfailed in ")
+    assert " 1 failed, 17 deselected, 1 xfailed in " in human.splitlines()[-1], human
 
 
 def test_a_reader_that_closes_early_gets_no_internal_error_and_the_run_still_records(demo):

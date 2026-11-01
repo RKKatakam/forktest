@@ -7,7 +7,7 @@ use crate::proto;
 use crate::report::{HumanReporter, Reporter, Reporters};
 use crate::root::{is_config_file, is_excluded};
 use crate::run::{Mode, Project, Request};
-use crate::zygote::ForkPoint;
+use crate::zygote::{ForkPoint, Terminal};
 use anyhow::Context;
 use notify::{RecursiveMode, Watcher};
 use serde_json::{Value, json};
@@ -93,12 +93,17 @@ pub fn run_via_daemon(
     root: &Path,
     python: &Path,
     req: &Request,
+    terminal: Option<&Terminal>,
     reporters: &mut dyn FnMut() -> Reporters,
 ) -> Option<i32> {
     let paths = Paths { root: root.to_path_buf() };
-    let msg = json!({"op": "run", "python": python, "request": req});
+    let msg = json!({"op": "run", "python": python, "request": req, "terminal": terminal.is_some()});
     for attempt in 0..2 {
         let stream = send(&paths, &msg)?;
+        if let Some(t) = terminal {
+            use std::os::fd::AsFd;
+            proto::send_fds(&stream, &[t.out.as_fd(), t.err.as_fd()]).ok()?;
+        }
         let mut out = reporters();
         let mut end: Option<Value> = None;
         for line in BufReader::new(stream).lines() {
@@ -274,7 +279,7 @@ fn stop(paths: &Paths) -> i32 {
 
 enum Msg {
     Fs(notify::Result<notify::Event>),
-    Run(UnixStream, PathBuf, Request),
+    Run(UnixStream, PathBuf, Request, Option<Terminal>),
     Stop,
 }
 
@@ -452,6 +457,16 @@ fn accept(listener: UnixListener, tx: Sender<Msg>, shared: &Shared) {
         let Ok(mut stream) = stream else { continue };
         let _ = stream.set_read_timeout(Some(CLIENT_TIMEOUT));
         let Ok(Some(frame)) = proto::read_frame(&mut stream) else { continue };
+        let terminal = match frame.msg["terminal"].as_bool() {
+            Some(true) => match proto::recv_fds(&stream, 2) {
+                Ok(fds) => {
+                    let [out, err] = <[_; 2]>::try_from(fds).ok().expect("recv_fds checks the count");
+                    Some(Terminal { out, err })
+                }
+                Err(_) => continue,
+            },
+            _ => None,
+        };
         let _ = stream.set_read_timeout(None);
         let reply = |stream: &mut UnixStream, v: Value| {
             let _ = writeln!(stream, "{v}");
@@ -475,7 +490,7 @@ fn accept(listener: UnixListener, tx: Sender<Msg>, shared: &Shared) {
                 let python = PathBuf::from(frame.msg["python"].as_str().unwrap_or_default());
                 match serde_json::from_value::<Request>(frame.msg["request"].clone()) {
                     Ok(req) => {
-                        let _ = tx.send(Msg::Run(stream, python, req));
+                        let _ = tx.send(Msg::Run(stream, python, req, terminal));
                     }
                     Err(e) => reply(&mut stream, json!({"refused": format!("unreadable request: {e}")})),
                 }
@@ -520,7 +535,7 @@ impl Daemon {
             match msg {
                 Some(Msg::Stop) => return,
                 Some(Msg::Fs(event)) => self.on_fs(event),
-                Some(Msg::Run(stream, python, req)) => self.serve_client(stream, &python, req),
+                Some(Msg::Run(stream, python, req, terminal)) => self.serve_client(stream, &python, req, terminal),
                 None => {}
             }
             if self.shared.stopping.load(Ordering::SeqCst) {
@@ -560,6 +575,8 @@ impl Daemon {
             pytest_args: self.args.clone(),
             fork_from: self.fork_from,
             stdout_to_stderr: false,
+            junitxml: None,
+            terminal_env: Vec::new(),
         }
     }
 
@@ -759,7 +776,7 @@ impl Daemon {
         let _ = std::fs::remove_file(&cookie);
     }
 
-    fn serve_client(&mut self, mut stream: UnixStream, python: &Path, mut req: Request) {
+    fn serve_client(&mut self, mut stream: UnixStream, python: &Path, mut req: Request, terminal: Option<Terminal>) {
         if python != self.project.python() {
             let reason = format!("it runs {}, this run asks for {}", self.project.python().display(), python.display());
             let _ = writeln!(stream, "{}", json!({"refused": reason}));
@@ -778,7 +795,7 @@ impl Daemon {
         self.shared.cancel.store(false, Ordering::SeqCst);
         let cancel = self.shared.cancel.clone();
         let mut writer = std::io::BufWriter::new(&stream);
-        let result = self.project.run(&req, &mut |e: &Event| {
+        let result = self.project.run(&req, terminal, &mut |e: &Event| {
             let sent = writeln!(writer, "{}", e.to_line()).and_then(|_| writer.flush());
             if sent.is_err() {
                 cancel.store(true, Ordering::SeqCst);
@@ -825,10 +842,11 @@ impl Daemon {
         self.finish_rebuild();
         let req = self.request(true);
         let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
-        let mut reporter = HumanReporter::new(std::io::stdout(), tty, true);
+        let mut reporter = HumanReporter::new(std::io::stdout(), tty, true, true);
+        let terminal = Terminal::ours(false).ok();
         self.shared.cancel.store(false, Ordering::SeqCst);
         self.shared.watch_run.store(true, Ordering::SeqCst);
-        let result = self.project.run(&req, &mut |e: &Event| {
+        let result = self.project.run(&req, terminal, &mut |e: &Event| {
             let _ = reporter.handle(e);
         });
         self.shared.watch_run.store(false, Ordering::SeqCst);

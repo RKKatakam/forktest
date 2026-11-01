@@ -9,8 +9,8 @@ use anyhow::{Context, bail};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::BufReader;
-use std::os::fd::AsFd;
+use std::io::{BufReader, Write};
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -94,11 +94,61 @@ pub struct Collected {
     pub fixtures: Vec<(String, String)>,
     /// Per collected file: names executed and files read while collecting it.
     pub per_file: HashMap<String, (Vec<(String, String)>, Vec<String>)>,
+    /// What pytest's reporter shows of the collection.
+    pub shown: Shown,
     /// Where workers will fork from, decided by the thread check and the policy.
     pub fork_point: ForkPoint,
     /// pytest's exit code when it stopped before the run loop (usage error, interrupted collection).
     pub exit_code: Option<i32>,
 }
+
+/// What pytest's reporter shows of a collection, serialized by pytest's own hooks.
+#[derive(Default)]
+pub struct Shown {
+    /// Failed and skipped collect reports, in collection order.
+    pub collect_reports: Vec<Value>,
+    /// Warnings recorded while collecting.
+    pub warnings: Vec<Value>,
+    /// Items pytest's own options (`-k`, `-m`) deselected.
+    pub deselected: u64,
+}
+
+/// Where pytest's reporter writes: the terminal of whoever asked for the run.
+pub struct Terminal {
+    pub out: OwnedFd,
+    pub err: OwnedFd,
+}
+
+impl Terminal {
+    /// This process's stdout and stderr; `/dev/null` for stdout when it carries something else, such as JSON lines.
+    pub fn ours(stdout_taken: bool) -> std::io::Result<Terminal> {
+        let out = match stdout_taken {
+            true => File::options().write(true).open("/dev/null")?.into(),
+            false => std::io::stdout().as_fd().try_clone_to_owned()?,
+        };
+        Ok(Terminal { out, err: std::io::stderr().as_fd().try_clone_to_owned()? })
+    }
+
+    pub fn try_clone(&self) -> std::io::Result<Terminal> {
+        Ok(Terminal { out: self.out.try_clone()?, err: self.err.try_clone()? })
+    }
+}
+
+/// Forwards messages to pytest's reporter in the order sent, from any thread, without ever blocking the run.
+#[derive(Clone)]
+pub struct ToReporter(Sender<Vec<u8>>);
+
+impl ToReporter {
+    pub fn send(&self, msg: &Value) {
+        let mut frame = Vec::new();
+        if proto::write_frame(&mut frame, msg, &[]).is_ok() {
+            let _ = self.0.send(frame);
+        }
+    }
+}
+
+/// How pytest's reporter ended.
+pub type ReporterEnd = Result<i32, String>;
 
 /// A collection of some files only. Files holding a test in `only` are collected for just those tests' functions
 /// and classes; the rest whole.
@@ -143,10 +193,13 @@ pub enum WorkerEvent {
         /// Ids into `Names::list`, fixture locations included.
         hits: Vec<u32>,
         reads: Vec<String>,
+        /// pytest's serialized reports and warnings of the test, when the run replays them.
+        pytest: Option<Value>,
     },
-    CollectError { nodeid: String, message: String },
-    /// A worker that collected its own files read its config: sent before its first result.
-    Started { maxfail: u32 },
+    CollectError { nodeid: String, message: String, report: Option<Value> },
+    /// A worker that collected its own files read its config: sent before its first result, with the warnings its
+    /// collection recorded when the run replays them.
+    Started { maxfail: u32, warnings: Vec<Value> },
     /// The worker died or crashed; these nodeids of its batch never reported.
     Lost {
         #[cfg_attr(not(test), expect(dead_code, reason = "tests check which worker died"))]
@@ -177,6 +230,8 @@ pub struct Session {
     background: Option<Background>,
     /// Collect ids of L1s forked from L0 and dropped before they connected, killed when they do.
     abandoned: HashSet<u64>,
+    /// Ids of reporters forked from L0 and dropped before they connected, killed when they do.
+    abandoned_reporters: HashSet<u64>,
     tolerated: u32,
     dropped: Vec<String>,
     preimported: usize,
@@ -184,7 +239,21 @@ pub struct Session {
     serial: u64,
     /// Where children's stderr goes instead of ours.
     stderr: Option<File>,
+    reporter: Option<Reporter>,
     server: Server,
+}
+
+/// pytest's reporter for the current run.
+struct Reporter {
+    id: u64,
+    proc: Proc,
+    /// The terminal and the start message, handed over when it connects.
+    handover: Option<(Terminal, Value)>,
+    /// Gives the writer thread the reporter's stream once it has connected.
+    stream: Option<Sender<UnixStream>>,
+    began: bool,
+    end: Option<ReporterEnd>,
+    started: Instant,
 }
 
 /// A full collection in an L1 of its own while other work goes on.
@@ -240,12 +309,14 @@ impl Session {
             l1: None,
             background: None,
             abandoned: HashSet::new(),
+            abandoned_reporters: HashSet::new(),
             tolerated: 0,
             dropped: Vec::new(),
             preimported: 0,
             fork_point: ForkPoint::Collected,
             serial: 0,
             stderr,
+            reporter: None,
             server,
             config,
         };
@@ -439,6 +510,9 @@ impl Session {
     /// Takes the frames of the background collection, and of an L1 dropped before it connected, so the waits of
     /// other work never see them.
     fn claim(&mut self, conn: u64, msg: &Value) -> bool {
+        if self.claim_reporter(conn, msg) {
+            return true;
+        }
         let hello = msg["type"] == "hello" && msg["role"] == "l1";
         let pid = msg["pid"].as_i64().unwrap_or(0) as i32;
         if hello && msg["cid"].as_u64().is_some_and(|cid| self.abandoned.remove(&cid)) {
@@ -470,12 +544,145 @@ impl Session {
         true
     }
 
+    /// Starts pytest's reporter for one run, replacing any earlier one: a pytest session with `args` that writes to
+    /// `terminal` and replays what the returned sender forwards. It forks from L0, which has pytest imported, or is a
+    /// fresh interpreter when there is no L0. It sets `env` first, so a daemon's reporter sees the client's terminal.
+    pub fn start_reporter(
+        &mut self,
+        args: Vec<String>,
+        env: &[(String, Option<String>)],
+        terminal: Terminal,
+    ) -> anyhow::Result<ToReporter> {
+        self.drop_reporter();
+        self.serial += 1;
+        let id = self.serial;
+        let child = match &self.l0 {
+            Some(l0) => {
+                let conn = l0.conn;
+                self.send(conn, &json!({"type": "reporter", "id": id}))?;
+                None
+            }
+            None => {
+                let child = self.spawn(&["reporter", &id.to_string()])?;
+                groups::add(child.id() as i32);
+                Some(child)
+            }
+        };
+        let (tx, rx) = channel::<Vec<u8>>();
+        let (stream_tx, stream_rx) = channel::<UnixStream>();
+        std::thread::spawn(move || {
+            let Ok(mut stream) = stream_rx.recv() else { return };
+            for frame in rx {
+                if stream.write_all(&frame).is_err() {
+                    return;
+                }
+            }
+        });
+        let start = json!({"type": "start", "args": args, "env": env});
+        self.reporter = Some(Reporter {
+            id,
+            proc: Proc { pid: child.as_ref().map_or(0, |c| c.id() as i32), conn: u64::MAX, child },
+            handover: Some((terminal, start)),
+            stream: Some(stream_tx),
+            began: false,
+            end: None,
+            started: Instant::now(),
+        });
+        Ok(ToReporter(tx))
+    }
+
+    pub fn has_reporter(&self) -> bool {
+        self.reporter.is_some()
+    }
+
+    /// Waits for the reporter to exit once everything forwarded, `end` included, has been sent. Returns pytest's exit
+    /// code or why there is none, and whether it got as far as `begin`. `None` when no reporter was started.
+    pub fn finish_reporter(&mut self) -> Option<(ReporterEnd, bool)> {
+        loop {
+            let r = self.reporter.as_mut()?;
+            if r.end.is_none()
+                && let Some(Ok(Some(status))) = r.proc.child.as_mut().map(Child::try_wait)
+            {
+                r.end = Some(Err(format!("pytest's reporter exited ({status})")));
+            }
+            if r.end.is_none() && r.proc.conn == u64::MAX && r.started.elapsed() > HELLO_TIMEOUT {
+                r.end = Some(Err(format!("pytest's reporter did not connect in {HELLO_TIMEOUT:?}")));
+            }
+            if r.end.is_some() {
+                break;
+            }
+            self.next(TICK);
+        }
+        let mut r = self.reporter.take()?;
+        let end = r.end.take()?;
+        self.reap(r.proc);
+        Some((end, r.began))
+    }
+
+    /// Kills the reporter, if any.
+    pub fn drop_reporter(&mut self) {
+        if let Some(r) = self.reporter.take() {
+            if r.proc.pid == 0 && r.proc.conn == u64::MAX {
+                self.abandoned_reporters.insert(r.id);
+            }
+            self.reap(r.proc);
+        }
+    }
+
+    /// Takes the reporter's frames: its hello, which gets it the terminal and its args, and how it ended.
+    fn claim_reporter(&mut self, conn: u64, msg: &Value) -> bool {
+        if msg["type"] == "hello" && msg["role"] == "reporter" {
+            let pid = msg["pid"].as_i64().unwrap_or(0) as i32;
+            let Some(r) = self.reporter.as_mut().filter(|r| msg["id"] == r.id) else {
+                if msg["id"].as_u64().is_some_and(|id| self.abandoned_reporters.remove(&id)) {
+                    kill_group(pid);
+                }
+                self.conns.remove(&conn);
+                return true;
+            };
+            r.proc.conn = conn;
+            if r.proc.child.is_none() {
+                r.proc.pid = pid;
+                groups::add(pid);
+            }
+            let handed = (|| -> anyhow::Result<()> {
+                let (terminal, start) = r.handover.take().context("a second hello")?;
+                let c = self.conns.get_mut(&conn).context("the reporter closed its connection")?;
+                proto::send_fds(&c.stream, &[terminal.out.as_fd(), terminal.err.as_fd()])?;
+                proto::write_frame(&mut c.stream, &start, &[])?;
+                let stream = c.stream.try_clone()?;
+                if let Some(tx) = r.stream.take() {
+                    let _ = tx.send(stream);
+                }
+                Ok(())
+            })();
+            if let Err(e) = handed {
+                r.end.get_or_insert(Err(format!("handing pytest's reporter the terminal: {e:#}")));
+            }
+            return true;
+        }
+        let Some(r) = self.reporter.as_mut().filter(|r| r.proc.conn == conn) else { return false };
+        match msg["type"].as_str() {
+            Some("began") => r.began = true,
+            Some("exit") => {
+                r.end.get_or_insert(Ok(msg["code"].as_i64().unwrap_or(3) as i32));
+            }
+            Some("crash") => {
+                let message = msg["message"].as_str().unwrap_or_default();
+                r.end.get_or_insert(Err(format!("pytest's reporter crashed: {message}")));
+            }
+            _ => {}
+        }
+        true
+    }
+
     /// Runs batches from the current fork point, in parallel, streaming events. `nice` lowers worker priority.
     /// Returns when every worker has finished or been killed, or `cancel` was set.
     pub fn run(
         &mut self,
         batches: Vec<Batch>,
         nice: bool,
+        replay: bool,
         names: &mut Names,
         cancel: &AtomicBool,
         sink: &mut dyn FnMut(WorkerEvent, &Names) -> Control,
@@ -491,7 +698,7 @@ impl Session {
             ForkPoint::Collected => {
                 let conn = self.l1.as_ref().unwrap().conn;
                 let batches: Vec<_> = batches.iter().map(|b| &b.nodeids).collect();
-                self.send(conn, &json!({"type": "run", "rid": rid, "batches": batches, "nice": nice}))?;
+                self.send(conn, &json!({"type": "run", "rid": rid, "batches": batches, "nice": nice, "replay": replay}))?;
                 Some(conn)
             }
             ForkPoint::Imported => {
@@ -499,7 +706,8 @@ impl Session {
                 let batches: Vec<_> =
                     batches.iter().map(|b| json!({"nodeids": b.nodeids, "files": b.files})).collect();
                 let args = &self.config.pytest_args;
-                self.send(conn, &json!({"type": "run_workers", "rid": rid, "args": args, "batches": batches, "nice": nice}))?;
+                let msg = json!({"type": "run_workers", "rid": rid, "args": args, "batches": batches, "nice": nice, "replay": replay});
+                self.send(conn, &msg)?;
                 Some(conn)
             }
             ForkPoint::Spawn => {
@@ -542,7 +750,8 @@ impl Session {
                             let b = &batches[index];
                             self.send(conn, &json!({"type": "config", "preimport": [], "root": self.config.root}))?;
                             let args = &self.config.pytest_args;
-                            self.send(conn, &json!({"type": "work", "args": args, "nodeids": b.nodeids, "files": b.files, "nice": nice}))?;
+                            let work = json!({"type": "work", "args": args, "nodeids": b.nodeids, "files": b.files, "nice": nice, "replay": replay});
+                            self.send(conn, &work)?;
                         }
                     } else if kind == "exited" && Some(conn) == parent && msg["rid"] == rid {
                         if let Some(slot) = msg["index"].as_u64().and_then(|i| slots.get_mut(i as usize)) {
@@ -555,7 +764,8 @@ impl Session {
                         match kind {
                             "started" if !halted => {
                                 let maxfail = msg["maxfail"].as_u64().unwrap_or(0) as u32;
-                                if let Control::Stop = sink(WorkerEvent::Started { maxfail }, names) {
+                                let warnings = msg["pytest"]["warnings"].as_array().cloned().unwrap_or_default();
+                                if let Control::Stop = sink(WorkerEvent::Started { maxfail, warnings }, names) {
                                     halt(&mut slots, &mut halted);
                                 }
                             }
@@ -617,13 +827,14 @@ impl Session {
     pub fn run_in_process(
         &mut self,
         nodeids: Vec<String>,
+        replay: bool,
         names: &mut Names,
         sink: &mut dyn FnMut(WorkerEvent, &Names) -> Control,
     ) -> anyhow::Result<()> {
         let conn = self.l1.as_ref().context("run_in_process before collect")?.conn;
         self.serial += 1;
         let rid = self.serial;
-        self.send(conn, &json!({"type": "run_in_process", "rid": rid, "nodeids": nodeids}))?;
+        self.send(conn, &json!({"type": "run_in_process", "rid": rid, "nodeids": nodeids, "replay": replay}))?;
         let mut slot = Slot::new(&Batch { nodeids, files: Vec::new() });
         loop {
             match self.next(TICK) {
@@ -737,7 +948,7 @@ impl Session {
         let nodeid = msg["nodeid"].as_str().unwrap_or_default().to_string();
         if msg["type"] == "collect_error" {
             let message = msg["message"].as_str().unwrap_or_default().to_string();
-            return Some(WorkerEvent::CollectError { nodeid, message });
+            return Some(WorkerEvent::CollectError { nodeid, message, report: msg.get("report").cloned() });
         }
         let local = &mut self.conns.get_mut(&conn)?.names;
         for name in msg["names"].as_array().into_iter().flatten() {
@@ -763,6 +974,7 @@ impl Session {
             cost: msg["cost"].as_f64().unwrap_or(0.0),
             hits,
             reads: strings(&msg["reads"]),
+            pytest: msg.get("pytest").cloned(),
         })
     }
 
@@ -837,6 +1049,10 @@ impl Session {
                 }
                 Ok(Incoming::Closed(conn)) => {
                     self.conns.remove(&conn);
+                    if let Some(r) = self.reporter.as_mut().filter(|r| r.proc.conn == conn) {
+                        r.end.get_or_insert_with(|| Err("pytest's reporter exited before it reported".into()));
+                        continue;
+                    }
                     match self.background.as_mut().filter(|bg| bg.proc.conn == conn) {
                         Some(bg) => {
                             bg.outcome.get_or_insert_with(|| crash("the Python process exited"));
@@ -899,6 +1115,7 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
+        self.drop_reporter();
         self.drop_background();
         self.drop_l1();
         self.kill_l0();
@@ -924,6 +1141,7 @@ impl Collected {
             rewrite: Vec::new(),
             fixtures: Vec::new(),
             per_file: HashMap::new(),
+            shown: Shown::default(),
             fork_point,
             exit_code: Some(code),
         }
@@ -948,6 +1166,11 @@ impl Collected {
             rewrite: strings(&msg["rewrite"]),
             fixtures: pairs(&msg["fixtures"]),
             per_file: per_file.map(|(k, v)| (k.clone(), (pairs(&v["names"]), strings(&v["reads"])))).collect(),
+            shown: Shown {
+                collect_reports: msg["pytest"]["collect_reports"].as_array().cloned().unwrap_or_default(),
+                warnings: msg["pytest"]["warnings"].as_array().cloned().unwrap_or_default(),
+                deselected: msg["pytest"]["deselected"].as_u64().unwrap_or(0),
+            },
             fork_point,
             exit_code: None,
         }
@@ -1441,7 +1664,7 @@ mod tests {
             let mut report = Report::default();
             let mut names = Names::default();
             let cancel = AtomicBool::new(false);
-            session.run(batches(&collected.items, 4), false, &mut names, &cancel, &mut report.sink()).unwrap();
+            session.run(batches(&collected.items, 4), false, false, &mut names, &cancel, &mut report.sink()).unwrap();
             let run = t.elapsed();
             eprintln!("demo timings: start {started:?}, collect {collect:?}, run {run:?}");
             assert!(report.lost.is_empty(), "{:?}", report.lost);
@@ -1522,7 +1745,7 @@ mod tests {
             session.start_background().unwrap();
             let tax = session.collect(Some(&partial(&["tests/test_tax.py"], &[]))).unwrap();
             let mut report = Report::default();
-            session.run(batches(&tax.items, 2), false, &mut names, &cancel, &mut report.sink()).unwrap();
+            session.run(batches(&tax.items, 2), false, false, &mut names, &cancel, &mut report.sink()).unwrap();
             assert!(report.lost.is_empty(), "{:?}", report.lost);
             assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), tax.items.len() as u64)]));
             assert!(session.collecting_in_background());
@@ -1536,7 +1759,7 @@ mod tests {
             assert_eq!(full.items.len(), 16);
             assert!(!session.collecting_in_background());
             let mut report = Report::default();
-            session.run(batches(&full.items, 4), false, &mut names, &cancel, &mut report.sink()).unwrap();
+            session.run(batches(&full.items, 4), false, false, &mut names, &cancel, &mut report.sink()).unwrap();
             assert_eq!(report.results.len(), 16, "{:?}", report.lost);
 
             session.start_background().unwrap();
@@ -1597,7 +1820,7 @@ mod tests {
                     parent_threads.push(threads::os_threads(l0).unwrap());
                     sink(event, names)
                 };
-                session.run(batches(&collected.items, 4), false, &mut names, &cancel, &mut sink).unwrap();
+                session.run(batches(&collected.items, 4), false, false, &mut names, &cancel, &mut sink).unwrap();
             }
             let run = t.elapsed();
             let timed_out = cancel.swap(true, Ordering::SeqCst);
@@ -1615,7 +1838,7 @@ mod tests {
             #[cfg(target_os = "macos")]
             assert_eq!(lazy.fork_point, ForkPoint::Collected);
             let mut report = Report::default();
-            session.run(batches(&lazy.items, 2), false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();
+            session.run(batches(&lazy.items, 2), false, false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();
             assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 2)]));
 
             drop(session);
@@ -1644,7 +1867,7 @@ mod tests {
             assert_eq!(collected.fork_point, ForkPoint::Imported);
             let mut report = Report::default();
             let mut names = Names::default();
-            session.run(batches(&collected.items, 2), false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();
+            session.run(batches(&collected.items, 2), false, false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();
             assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 3)]));
         }
         assert_no_orphans();
@@ -1662,7 +1885,7 @@ mod tests {
             let nodeids: Vec<String> = collected.items.iter().map(|i| i.nodeid.clone()).collect();
             let mut report = Report::default();
             let mut names = Names::default();
-            session.run_in_process(nodeids.clone(), &mut names, &mut report.sink()).unwrap();
+            session.run_in_process(nodeids.clone(), false, &mut names, &mut report.sink()).unwrap();
             assert_eq!(report.counts(), expected);
             let ran: Vec<_> = report.results.iter().map(|r| r.1.nodeid.clone()).collect();
             assert_eq!(ran, nodeids);
@@ -1696,7 +1919,7 @@ mod tests {
             let mut lost = 0;
             let t = Instant::now();
             session
-                .run(batches, false, &mut Names::default(), &AtomicBool::new(false), &mut |event, _| match event {
+                .run(batches, false, false, &mut Names::default(), &AtomicBool::new(false), &mut |event, _| match event {
                     WorkerEvent::Result { result, .. } => {
                         let stop = result.outcome.is_failure();
                         results.push(result);
@@ -1773,7 +1996,7 @@ mod tests {
             assert_eq!(collected.items.len(), 16);
             let mut report = Report::default();
             let t = Instant::now();
-            session.run(batches(&collected.items, 4), false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
+            session.run(batches(&collected.items, 4), false, false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
             eprintln!("demo spawn run: {:?}", t.elapsed());
             assert!(report.lost.is_empty(), "{:?}", report.lost);
             assert_eq!(report.counts(), expected);
@@ -1839,7 +2062,7 @@ def test_warning_is_an_error():
             assert_eq!(collected.skips, ["tests/test_skipped_module.py"]);
             assert_eq!(collected.errors.iter().map(|e| e.0.as_str()).collect::<Vec<_>>(), ["tests/test_broken.py"]);
             let mut report = Report::default();
-            session.run(batches(&collected.items, 3), false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
+            session.run(batches(&collected.items, 3), false, false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
             assert!(report.lost.is_empty(), "{policy:?}: {:?}", report.lost);
             assert_eq!(report.counts(), expected, "{policy:?}");
             let failed = report.results.iter().find(|r| r.1.nodeid.ends_with("::test_fails")).unwrap();
@@ -1879,7 +2102,7 @@ def test_warning_is_an_error():
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
             let collected = session.collect(None).unwrap();
             let mut report = Report::default();
-            session.run(batches(&collected.items, 1), false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
+            session.run(batches(&collected.items, 1), false, false, &mut Names::default(), &AtomicBool::new(false), &mut report.sink()).unwrap();
             assert_eq!(report.counts(), BTreeMap::from([("passed".to_string(), 1)]));
             let [(worker, nodeids, message)] = &report.lost[..] else { panic!("{:?}", report.lost) };
             assert_eq!(*worker, 0);

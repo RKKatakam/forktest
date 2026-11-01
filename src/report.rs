@@ -1,9 +1,8 @@
-//! Human, JSONL and JUnit reporters, the exit status, and the fan-out that survives a reader closing early.
+//! Human and JSONL reporters, the exit status, and the fan-out that survives a reader closing early.
 
 use crate::events::{Done, Event, Outcome, TestResult};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
-use std::path::PathBuf;
 
 pub trait Reporter {
     fn handle(&mut self, event: &Event) -> io::Result<()>;
@@ -26,10 +25,10 @@ impl<W: Write> JsonlReporter<W> {
 
 impl<W: Write> Reporter for JsonlReporter<W> {
     fn handle(&mut self, event: &Event) -> io::Result<()> {
-        if let Event::Result(r) = event
-            && r.outcome == Outcome::Passed
-        {
-            return Ok(());
+        match event {
+            Event::Result(r) if r.outcome == Outcome::Passed => return Ok(()),
+            Event::Reported { .. } | Event::ReporterLost { .. } => return Ok(()),
+            _ => {}
         }
         let mut line = ascii_json(&event.to_line());
         line.push('\n');
@@ -77,18 +76,53 @@ impl Counts {
     }
 }
 
-/// Compact terminal output: failures stream as they arrive, files summarize at the end.
+/// forktest's headline: what changed and how many tests that selects.
+pub fn headline(changed: usize, selected: u64, total: u64, reasons: &BTreeMap<String, u64>, ms: u64) -> String {
+    let head = if reasons.get("all") == Some(&selected) && selected > 0 {
+        format!("all {} tests selected", thousands(total))
+    } else if reasons.get("new") == Some(&total) && total > 0 {
+        format!("no history · {} of {} tests selected", thousands(selected), thousands(total))
+    } else {
+        let s = if changed != 1 { "s" } else { "" };
+        format!("{changed} file{s} changed · {} of {} tests selected", thousands(selected), thousands(total))
+    };
+    format!("forktest · {head} ({})", seconds(ms, 2))
+}
+
+/// Where the human reporter stands with pytest's own reporter.
+enum Stand {
+    /// pytest's reporter may print the run: hold everything until it says whether it did.
+    Holding(Vec<Event>),
+    /// pytest's reporter printed the run; only the safety net is left to show.
+    Quiet,
+    /// forktest's own compact output.
+    Own,
+}
+
+/// Compact terminal output: failures stream as they arrive, files summarize at the end. When pytest's reporter prints
+/// the run, this shows only what pytest knows nothing of, the safety net.
 pub struct HumanReporter<W: Write> {
     out: W,
     expect_verify: bool,
     color: bool,
+    stand: Stand,
     files: Vec<(String, Counts)>,
     index: HashMap<String, usize>,
 }
 
 impl<W: Write> HumanReporter<W> {
-    pub fn new(out: W, color: bool, expect_verify: bool) -> Self {
-        HumanReporter { out, expect_verify, color, files: Vec::new(), index: HashMap::new() }
+    /// `pytest_output` holds this reporter's output until the run says whether pytest's reporter printed it.
+    pub fn new(out: W, color: bool, expect_verify: bool, pytest_output: bool) -> Self {
+        let stand = if pytest_output { Stand::Holding(Vec::new()) } else { Stand::Own };
+        HumanReporter { out, expect_verify, color, stand, files: Vec::new(), index: HashMap::new() }
+    }
+
+    fn own(&mut self, held: Vec<Event>, skip_headline: bool) -> io::Result<()> {
+        self.stand = Stand::Own;
+        for e in held.iter().filter(|e| !(skip_headline && matches!(e, Event::Selection { .. }))) {
+            self.show(e)?;
+        }
+        Ok(())
     }
 
     fn mark(&self, ok: bool) -> &'static str {
@@ -106,17 +140,6 @@ impl<W: Write> HumanReporter<W> {
         self.out.flush()
     }
 
-    fn selection(&mut self, changed: usize, selected: u64, total: u64, reasons: &std::collections::BTreeMap<String, u64>, ms: u64) -> io::Result<()> {
-        let head = if reasons.get("all") == Some(&selected) && selected > 0 {
-            format!("all {} tests selected", thousands(total))
-        } else if reasons.get("new") == Some(&total) && total > 0 {
-            format!("no history · {} of {} tests selected", thousands(selected), thousands(total))
-        } else {
-            let s = if changed != 1 { "s" } else { "" };
-            format!("{changed} file{s} changed · {} of {} tests selected", thousands(selected), thousands(total))
-        };
-        self.emit(&format!("forktest · {head} ({})", seconds(ms, 2)))
-    }
 
     fn result(&mut self, r: &TestResult) -> io::Result<()> {
         let file = r.nodeid.split("::").next().unwrap_or_default().to_string();
@@ -184,11 +207,11 @@ impl<W: Write> HumanReporter<W> {
     }
 }
 
-impl<W: Write> Reporter for HumanReporter<W> {
-    fn handle(&mut self, event: &Event) -> io::Result<()> {
+impl<W: Write> HumanReporter<W> {
+    fn show(&mut self, event: &Event) -> io::Result<()> {
         match event {
             Event::Selection { changed, selected, total, reasons, duration_ms } => {
-                self.selection(changed.len(), *selected, *total, reasons, *duration_ms)
+                self.emit(&headline(changed.len(), *selected, *total, reasons, *duration_ms))
             }
             Event::Result(r) => self.result(r),
             Event::CollectError { nodeid, message } => {
@@ -204,6 +227,39 @@ impl<W: Write> Reporter for HumanReporter<W> {
                 self.emit(&format!("safety net: {checked} unselected tests ran in {} · {tail}", seconds(*duration_ms, 2)))
             }
             Event::Done(d) => self.done(d),
+            Event::Reported { .. } | Event::ReporterLost { .. } => Ok(()),
+        }
+    }
+}
+
+impl<W: Write> Reporter for HumanReporter<W> {
+    fn handle(&mut self, event: &Event) -> io::Result<()> {
+        let Stand::Holding(held) = &mut self.stand else {
+            return match (&self.stand, event) {
+                (Stand::Quiet, Event::Miss { .. } | Event::Verified { .. }) => self.show(event),
+                (Stand::Quiet, _) => Ok(()),
+                _ => self.show(event),
+            };
+        };
+        match event {
+            Event::Reported { .. } => {
+                self.stand = Stand::Quiet;
+                Ok(())
+            }
+            Event::ReporterLost { reason, headline_shown } => {
+                eprintln!("forktest: {reason}; showing forktest's own report");
+                let held = std::mem::take(held);
+                self.own(held, *headline_shown)
+            }
+            Event::Done(_) => {
+                let held = std::mem::take(held);
+                self.own(held, false)?;
+                self.show(event)
+            }
+            _ => {
+                held.push(event.clone());
+                Ok(())
+            }
         }
     }
 }
@@ -267,143 +323,12 @@ fn indent(text: &str, n: usize, limit: Option<usize>) -> String {
     lines.iter().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n")
 }
 
-/// pytest's `bin_xml_escape`: a character XML 1.0 forbids (an ANSI escape, say) becomes visible `#xNN` text.
-fn bin_xml_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\t' | '\n' | '\r' | '\u{20}'..='\u{7e}' | '\u{80}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'.. => out.push(c),
-            c if (c as u32) <= 0xff => out.push_str(&format!("#x{:02X}", c as u32)),
-            c => out.push_str(&format!("#x{:04X}", c as u32)),
-        }
-    }
-    out
-}
-
-fn escape(text: &str) -> String {
-    bin_xml_escape(text).replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-}
-
-fn quoteattr(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in bin_xml_escape(value).chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\n' => out.push_str("&#10;"),
-            '\r' => out.push_str("&#13;"),
-            '\t' => out.push_str("&#9;"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-pub struct JunitReporter {
-    path: PathBuf,
-    results: Vec<TestResult>,
-    collect_errors: Vec<(String, String)>,
-    done: Option<Done>,
-}
-
-/// pytest's `mangle_test_address`: params come off before the `::` split, and only the file part loses `.py`.
-fn junit_names(nodeid: &str) -> (String, String) {
-    let (path, tail) = nodeid.split_once("::").unwrap_or((nodeid, ""));
-    let path = path.replace('/', ".");
-    let mut names = vec![path.strip_suffix(".py").unwrap_or(&path).to_string()];
-    if nodeid.contains("::") {
-        let (head, params) = tail.split_once('[').map_or((tail, None), |(h, p)| (h, Some(p)));
-        names.extend(head.split("::").map(str::to_string));
-        if let Some(params) = params {
-            let last = names.last_mut().unwrap();
-            last.push('[');
-            last.push_str(params);
-        }
-    }
-    let name = names.pop().unwrap();
-    (names.join("."), name)
-}
-
-impl JunitReporter {
-    pub fn new(path: PathBuf) -> Self {
-        JunitReporter { path, results: Vec::new(), collect_errors: Vec::new(), done: None }
-    }
-
-    fn render(&self) -> String {
-        let d = self.done.clone().unwrap_or_default();
-        let errors = d.errors + self.collect_errors.len() as u64;
-        let mut lines = vec![
-            r#"<?xml version="1.0" encoding="utf-8"?>"#.to_string(),
-            format!(
-                r#"<testsuites><testsuite name="forktest" tests="{}" failures="{}" errors="{errors}" skipped="{}" time="{}">"#,
-                self.results.len(),
-                d.failed,
-                d.skipped + d.xfailed,
-                format!("{:.3}", d.duration_ms as f64 / 1000.0),
-            ),
-        ];
-        for r in &self.results {
-            let (classname, name) = junit_names(&r.nodeid);
-            let head = format!(
-                r#"<testcase classname={} name={} time="{:.3}""#,
-                quoteattr(&classname),
-                quoteattr(&name),
-                r.duration
-            );
-            let tag = match r.outcome {
-                Outcome::Passed | Outcome::Xpassed => {
-                    lines.push(head + " />");
-                    continue;
-                }
-                Outcome::Failed => "failure",
-                Outcome::Error => "error",
-                Outcome::Skipped | Outcome::Xfailed => "skipped",
-            };
-            let kind = if r.outcome == Outcome::Xfailed { r#" type="pytest.xfail""# } else { "" };
-            let message = r.message.as_deref().unwrap_or_default();
-            let first = splitlines(message).first().copied().unwrap_or_default();
-            lines.push(format!(
-                "{head}><{tag}{kind} message={}>{}</{tag}></testcase>",
-                quoteattr(first),
-                escape(message)
-            ));
-        }
-        for (nodeid, message) in &self.collect_errors {
-            lines.push(format!(
-                r#"<testcase classname="collection" name={} time="0"><error message="collection error">{}</error></testcase>"#,
-                quoteattr(nodeid),
-                escape(message)
-            ));
-        }
-        lines.push("</testsuite></testsuites>".into());
-        lines.join("\n") + "\n"
-    }
-}
-
-impl Reporter for JunitReporter {
-    fn handle(&mut self, event: &Event) -> io::Result<()> {
-        match event {
-            Event::Result(r) => self.results.push(r.clone()),
-            Event::CollectError { nodeid, message } => self.collect_errors.push((nodeid.clone(), message.clone())),
-            Event::Done(d) => self.done = Some(d.clone()),
-            _ => {}
-        }
-        Ok(())
-    }
-
-    fn close(&mut self) -> io::Result<()> {
-        std::fs::write(&self.path, self.render())
-    }
-}
-
 /// Remembers only what the exit code should be.
 #[derive(Default)]
 pub struct ExitStatus {
     done: Option<Done>,
+    /// pytest's own exit code, when its reporter reported the run.
+    pytest: Option<i32>,
     total: Option<u64>,
     misses: u64,
     collect_errors: u64,
@@ -413,6 +338,7 @@ impl ExitStatus {
     pub fn handle(&mut self, event: &Event) {
         match event {
             Event::Done(d) => self.done = Some(d.clone()),
+            Event::Reported { exit } => self.pytest = Some(*exit),
             Event::Selection { total, .. } => self.total = Some(*total),
             Event::Miss { .. } => self.misses += 1,
             Event::CollectError { .. } => self.collect_errors += 1,
@@ -423,6 +349,9 @@ impl ExitStatus {
     /// `fallback` is pytest's own exit code, for a run that stopped before reporting anything.
     pub fn code(&self, fallback: i32) -> i32 {
         let Some(done) = &self.done else { return if fallback != 0 { fallback } else { 3 } };
+        if let Some(code) = self.pytest {
+            return if self.misses > 0 { 1 } else { code };
+        }
         if self.collect_errors > 0 && self.total.is_none() {
             return 2;
         }
@@ -483,7 +412,7 @@ mod tests {
 
     fn human(events: &[Event], verify: bool) -> String {
         let mut out = Vec::new();
-        let mut r = HumanReporter::new(&mut out, false, verify);
+        let mut r = HumanReporter::new(&mut out, false, verify, false);
         for e in events {
             r.handle(e).unwrap();
         }
@@ -550,48 +479,6 @@ mod tests {
             "{\"event\":\"fail\",\"test\":\"t.py::\\u00e9\",\"duration_ms\":12.3,\"file\":\"tests/test_a.py\",\"line\":7,\
              \"message\":\"\\ud83d\\ude00\\u007f\",\"trace\":[{\"file\":\"tests/test_a.py\",\"line\":7,\"fn\":\"test_b\"}]}\n"
         );
-    }
-
-    #[test]
-    fn junit_matches_the_python_reporter() {
-        let dir = crate::fingerprint::tests::tmp_dir("junit");
-        let path = dir.join("out.xml");
-        let mut r = JunitReporter::new(path.clone());
-        for e in [
-            result("tests/test_a.py::TestX::test_a", Outcome::Passed, None),
-            result("tests/test_a.py::test_b", Outcome::Failed, Some("a < b & \"c\"\nmore")),
-            result("tests/test_a.py::test_c", Outcome::Xfailed, Some("known")),
-            Event::CollectError { nodeid: "tests/test_x.py".into(), message: "boom".into() },
-            Event::Done(Done { passed: 1, failed: 1, xfailed: 1, duration_ms: 52, ..Done::default() }),
-        ] {
-            r.handle(&e).unwrap();
-        }
-        r.close().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(path).unwrap(),
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
-             <testsuites><testsuite name=\"forktest\" tests=\"3\" failures=\"1\" errors=\"1\" skipped=\"1\" time=\"0.052\">\n\
-             <testcase classname=\"tests.test_a.TestX\" name=\"test_a\" time=\"0.012\" />\n\
-             <testcase classname=\"tests.test_a\" name=\"test_b\" time=\"0.012\"><failure message=\"a &lt; b &amp; &quot;c&quot;\">a &lt; b &amp; \"c\"\nmore</failure></testcase>\n\
-             <testcase classname=\"tests.test_a\" name=\"test_c\" time=\"0.012\"><skipped type=\"pytest.xfail\" message=\"known\">known</skipped></testcase>\n\
-             <testcase classname=\"collection\" name=\"tests/test_x.py\" time=\"0\"><error message=\"collection error\">boom</error></testcase>\n\
-             </testsuite></testsuites>\n"
-        );
-    }
-
-    #[test]
-    fn junit_text_escapes_what_xml_forbids_as_pytest_does() {
-        assert_eq!(escape("\u{1b}[31mred\u{1b}[0m <&>\u{7f}\u{fffe}\tok"), "#x1B[31mred#x1B[0m &lt;&amp;&gt;#x7F#xFFFE\tok");
-        assert_eq!(quoteattr("a\u{8}b"), "\"a#x08b\"");
-    }
-
-    #[test]
-    fn junit_names_follow_pytest() {
-        let n = |id: &str| junit_names(id);
-        assert_eq!(n("tests/test_a.py::TestX::test_a"), ("tests.test_a.TestX".into(), "test_a".into()));
-        assert_eq!(n("tests/test_a.py::test_p[a::b/c.py]"), ("tests.test_a".into(), "test_p[a::b/c.py]".into()));
-        assert_eq!(n("pkg/test_b.py::TestY::test_q[1]"), ("pkg.test_b.TestY".into(), "test_q[1]".into()));
-        assert_eq!(n("tests/test_x.py"), ("".into(), "tests.test_x".into()));
     }
 
     #[test]

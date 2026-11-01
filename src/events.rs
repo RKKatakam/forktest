@@ -81,6 +81,10 @@ pub enum Event {
     CollectError { nodeid: String, message: String },
     Miss { nodeid: String, message: String },
     Verified { checked: u64, misses: u64, duration_ms: u64 },
+    /// pytest's own reporter printed the run, headline first, and its session exited with `exit`.
+    Reported { exit: i32 },
+    /// pytest's reporter could not report the run; forktest's own output stands in.
+    ReporterLost { reason: String, headline_shown: bool },
     Done(Done),
 }
 
@@ -112,6 +116,10 @@ impl Event {
             Event::Miss { nodeid, message } => json!({"event": "miss", "test": nodeid, "message": message}),
             Event::Verified { checked, misses, duration_ms } => {
                 json!({"event": "verified", "checked": checked, "misses": misses, "duration_ms": duration_ms})
+            }
+            Event::Reported { exit } => json!({"event": "reported", "exit": exit}),
+            Event::ReporterLost { reason, headline_shown } => {
+                json!({"event": "reporter_lost", "reason": reason, "headline_shown": headline_shown})
             }
             Event::Done(d) => json!({
                 "event": "done", "passed": d.passed, "failed": d.failed, "errors": d.errors,
@@ -151,6 +159,10 @@ impl Event {
             "collect_error" => Event::CollectError { nodeid: s("nodeid"), message: s("message") },
             "miss" => Event::Miss { nodeid: s("test"), message: s("message") },
             "verified" => Event::Verified { checked: n("checked"), misses: n("misses"), duration_ms: n("duration_ms") },
+            "reported" => Event::Reported { exit: v["exit"].as_i64().unwrap_or(3) as i32 },
+            "reporter_lost" => {
+                Event::ReporterLost { reason: s("reason"), headline_shown: v["headline_shown"].as_bool().unwrap_or(false) }
+            }
             "done" => Event::Done(Done {
                 passed: n("passed"),
                 failed: n("failed"),
@@ -191,6 +203,8 @@ mod tests {
             Event::CollectError { nodeid: "tests/test_x.py".into(), message: "boom".into() },
             Event::Miss { nodeid: "t::a".into(), message: "m".into() },
             Event::Verified { checked: 9, misses: 0, duration_ms: 3 },
+            Event::Reported { exit: 1 },
+            Event::ReporterLost { reason: "gone".into(), headline_shown: true },
             Event::Done(Done { passed: 6, failed: 1, duration_ms: 52, ..Done::default() }),
         ];
         for e in events {

@@ -2,9 +2,9 @@
 
 use crate::events::Event;
 use crate::fingerprint::{FILE, MODULE};
-use crate::report::{HumanReporter, JsonlReporter, JunitReporter, Reporter, Reporters};
-use crate::run::{Mode, Project, Request, Unsupported};
-use crate::zygote::ForkPoint;
+use crate::report::{HumanReporter, JsonlReporter, Reporter, Reporters};
+use crate::run::{Mode, Project, Request, TERMINAL_ENV, Unsupported};
+use crate::zygote::{ForkPoint, Terminal};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 
@@ -102,13 +102,14 @@ pub fn main(argv: Vec<String>) -> i32 {
         Some("watch") => return crate::daemon::watch_command(&root, &argv[1..]),
         _ => {}
     }
-    let opts = match Opts::parse(&argv) {
+    let mut opts = match Opts::parse(&argv) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("{USAGE}\nforktest: error: {e}");
             return 2;
         }
     };
+    opts.junitxml = opts.junitxml.map(|p| cwd.join(p));
     // The daemon's interpreters run in the root, so relative pytest args only mean the same there.
     let from_root = std::fs::canonicalize(&cwd).is_ok_and(|c| c == root);
     match dispatch(opts, root, from_root) {
@@ -132,16 +133,18 @@ fn dispatch(opts: Opts, root: PathBuf, from_root: bool) -> anyhow::Result<i32> {
         return plain_pytest(&python, &opts.pytest_args);
     }
     let mut reporters = || {
-        let mut live: Vec<Box<dyn Reporter>> = vec![if opts.json {
+        let live: Box<dyn Reporter> = if opts.json {
             Box::new(JsonlReporter::new(std::io::stdout()))
         } else {
             let tty = unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
-            Box::new(HumanReporter::new(std::io::stdout(), tty, opts.verify))
-        }];
-        if let Some(path) = &opts.junitxml {
-            live.push(Box::new(JunitReporter::new(path.clone())));
-        }
-        Reporters::new(live)
+            Box::new(HumanReporter::new(std::io::stdout(), tty, opts.verify, true))
+        };
+        Reporters::new(vec![live])
+    };
+    // pytest's own reporter prints the run, and writes the JUnit XML, unless the run is JSON lines alone.
+    let terminal = match opts.json && opts.junitxml.is_none() {
+        true => None,
+        false => Some(Terminal::ours(opts.json)?),
     };
     let request = Request {
         mode: match (&opts.since, opts.all) {
@@ -156,16 +159,18 @@ fn dispatch(opts: Opts, root: PathBuf, from_root: bool) -> anyhow::Result<i32> {
         pytest_args: opts.pytest_args.clone(),
         fork_from: opts.fork_from,
         stdout_to_stderr: opts.json,
+        junitxml: opts.junitxml.clone(),
+        terminal_env: TERMINAL_ENV.iter().map(|k| (k.to_string(), std::env::var(k).ok())).collect(),
     };
     if !opts.no_daemon
         && from_root
-        && let Some(code) = crate::daemon::run_via_daemon(&root, &python, &request, &mut reporters)
+        && let Some(code) = crate::daemon::run_via_daemon(&root, &python, &request, terminal.as_ref(), &mut reporters)
     {
         return Ok(code);
     }
     let mut reporters = reporters();
     let mut project = Project::open(&root, python.clone())?;
-    let result = project.run(&request, &mut |e: &Event| reporters.emit(e));
+    let result = project.run(&request, terminal, &mut |e: &Event| reporters.emit(e));
     if let Err(e) = &result
         && let Some(unsupported) = e.downcast_ref::<Unsupported>()
     {

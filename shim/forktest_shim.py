@@ -253,7 +253,7 @@ class Sender:
         self.conn = conn
         self.ids = {}
 
-    def result(self, result, cost, hits, reads):
+    def result(self, result, cost, hits, reads, replay=None):
         new = []
         ids = array.array("I")
         for name in hits:
@@ -264,15 +264,63 @@ class Sender:
             ids.append(i)
         if sys.byteorder != "little":
             ids.byteswap()
-        self.conn.send({"type": "result", **result, "cost": cost, "names": new, "reads": sorted(reads)}, ids.tobytes())
+        msg = {"type": "result", **result, "cost": cost, "names": new, "reads": sorted(reads)}
+        if replay is not None:
+            msg["pytest"] = replay
+        self.conn.send(msg, ids.tobytes())
 
 
 class _ReportCollector:
-    def __init__(self):
+    """One item's reports, and with ``replay`` what pytest's reporter needs of them and of its warnings."""
+
+    def __init__(self, config, replay):
+        self.config = config
+        self.replay = replay
         self.reports = []
+        self.warnings = []
+        self.running = False
+
+    def begin(self):
+        self.reports = []
+        self.warnings = []
+        self.running = True
+
+    def end(self):
+        self.running = False
+        if not self.replay:
+            return None
+        return {"reports": [serialized(self.config, r) for r in self.reports], "warnings": self.warnings}
 
     def pytest_runtest_logreport(self, report):
         self.reports.append(report)
+
+    def pytest_warning_recorded(self, warning_message, when, nodeid, location):
+        # The hook is historic: registering this replays every warning recorded before, which `running` keeps out.
+        if self.running and self.replay and when == "runtest":
+            self.warnings.append(warning_data(warning_message, when, nodeid, location))
+
+
+def serialized(config, report):
+    data = config.hook.pytest_report_to_serializable(config=config, report=report)
+    data.pop("forktest_trace", None)
+    if hasattr(report.longrepr, "toterminal") and isinstance(data["longrepr"], str):
+        # Serialized as its text; the reporter restores a repr, since pytest tells a plain string apart from one.
+        data["forktest_repr"] = type(report.longrepr).__name__
+    return data
+
+
+def warning_data(warning_message, when, nodeid, location):
+    category = warning_message.category
+    return {
+        "message": str(warning_message.message),
+        "category": [category.__module__, category.__qualname__],
+        "filename": warning_message.filename,
+        "lineno": warning_message.lineno,
+        "line": warning_message.line,
+        "when": when,
+        "nodeid": nodeid,
+        "location": location,
+    }
 
 
 def result_of(nodeid, reports, project):
@@ -350,25 +398,26 @@ class Fixtures:
         return sorted(out)
 
 
-def run_items(items, sender, recorder, project, fixtures):
+def run_items(items, sender, recorder, project, fixtures, replay):
     if not items:
         return
-    collector = _ReportCollector()
+    collector = _ReportCollector(items[0].config, replay)
     pluginmanager = items[0].config.pluginmanager
     pluginmanager.register(collector)
     try:
         for i, item in enumerate(items):
             nextitem = items[i + 1] if i + 1 < len(items) else None
-            collector.reports = []
+            collector.begin()
             started = time.perf_counter()
             recorder.begin()
             # The full hook, not runtestprotocol: plugins such as warnings (filterwarnings marks) wrap it.
             item.ihook.pytest_runtest_protocol(item=item, nextitem=nextitem)
             hits, reads = recorder.end()
+            pytest_side = collector.end()
             result = result_of(item.nodeid, collector.reports, project)
             # Building a failure's report can cost 100 times the test, and the reports' durations leave it out.
             cost = time.perf_counter() - started
-            sender.result(result, cost, hits | fixtures.of(item), reads)
+            sender.result(result, cost, hits | fixtures.of(item), reads, pytest_side)
     finally:
         pluginmanager.unregister(collector)
 
@@ -392,6 +441,10 @@ class BasePlugin:
         self.narrowing = Narrowing(only) if only else None
         self.errors = []
         self.skips = []
+        # What pytest's reporter shows of collection: failed and skipped collect reports, and collection warnings.
+        self.collect_reports = []
+        self.collect_warnings = []
+        self.deselected = 0
         self.items = []
         self.config = None
 
@@ -423,6 +476,15 @@ class BasePlugin:
             self.errors.append([report.nodeid, str(report.longrepr)])
         elif report.skipped:
             self.skips.append(report.nodeid)
+        if not report.passed:
+            self.collect_reports.append(serialized(self.config, report))
+
+    def pytest_warning_recorded(self, warning_message, when, nodeid, location):
+        if when == "collect":
+            self.collect_warnings.append(warning_data(warning_message, when, nodeid, location))
+
+    def pytest_deselected(self, items):
+        self.deselected += len(items)
 
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, session, config, items):
@@ -494,6 +556,7 @@ class L1Plugin(BasePlugin):
                 path: {"names": sorted(names), "reads": sorted(reads)} for path, (names, reads) in self.per_file.items()
             },
             "py_threads": threading.active_count(),
+            "pytest": {"collect_reports": self.collect_reports, "warnings": self.collect_warnings, "deselected": self.deselected},
         }
 
     def known_modules(self):
@@ -524,26 +587,28 @@ class L1Plugin(BasePlugin):
             if msg is None or msg["type"] == "exit":
                 os.killpg(0, signal.SIGKILL)
             if msg["type"] == "run":
-                self.fork_workers(msg["rid"], [[by_id[n] for n in batch if n in by_id] for batch in msg["batches"]], msg["nice"])
+                batches = [[by_id[n] for n in batch if n in by_id] for batch in msg["batches"]]
+                self.fork_workers(msg["rid"], batches, msg["nice"], msg["replay"])
             elif msg["type"] == "run_in_process":
                 sender = Sender(self.conn)
-                run_items([by_id[n] for n in msg["nodeids"] if n in by_id], sender, self.recorder, self.project, self.fixtures)
+                items = [by_id[n] for n in msg["nodeids"] if n in by_id]
+                run_items(items, sender, self.recorder, self.project, self.fixtures, msg["replay"])
                 self.conn.send({"type": "done", "rid": msg["rid"]})
 
-    def fork_workers(self, rid, batches, nice):
+    def fork_workers(self, rid, batches, nice, replay):
         pids = {}
         gc.freeze()
         try:
             for index, items in enumerate(batches):
                 pid = os.fork()
                 if pid == 0:
-                    self.forked_worker(rid, index, items, nice)
+                    self.forked_worker(rid, index, items, nice, replay)
                 pids[pid] = index
         finally:
             gc.unfreeze()
         wait_and_report(self.conn, rid, pids)
 
-    def forked_worker(self, rid, index, items, nice):
+    def forked_worker(self, rid, index, items, nice, replay):
         try:
             default_signals()
             self.conn.close()
@@ -553,7 +618,7 @@ class L1Plugin(BasePlugin):
                 if nice:
                     os.nice(10)
                 self.reinit_capture()
-                run_items(items, Sender(conn), self.recorder, self.project, self.fixtures)
+                run_items(items, Sender(conn), self.recorder, self.project, self.fixtures, replay)
                 conn.send({"type": "done"})
             except BaseException as exc:
                 conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
@@ -564,18 +629,27 @@ class L1Plugin(BasePlugin):
 class BatchPlugin(BasePlugin):
     """A worker that collects its batch's files itself and runs exactly its nodeids, in order."""
 
-    def __init__(self, conn, root, files, nodeids):
+    def __init__(self, conn, root, files, nodeids, replay):
         super().__init__(conn, root, files)
         self.nodeids = nodeids
+        self.replay = replay
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtestloop(self, session):
-        self.conn.send({"type": "started", "maxfail": self.config.getoption("maxfail") or 0})
-        for nodeid, message in self.errors:
-            self.conn.send({"type": "collect_error", "nodeid": nodeid, "message": message})
+        started = {"type": "started", "maxfail": self.config.getoption("maxfail") or 0}
+        if self.replay:
+            started["pytest"] = {"warnings": self.collect_warnings}
+        self.conn.send(started)
+        failed = (r for r in self.collect_reports if r["outcome"] == "failed")
+        for (nodeid, message), report in zip(self.errors, failed):
+            msg = {"type": "collect_error", "nodeid": nodeid, "message": message}
+            if self.replay:
+                msg["report"] = report
+            self.conn.send(msg)
         by_id = {item.nodeid: item for item in self.items}
+        items = [by_id[n] for n in self.nodeids if n in by_id]
         try:
-            run_items([by_id[n] for n in self.nodeids if n in by_id], Sender(self.conn), self.recorder, self.project, self.fixtures)
+            run_items(items, Sender(self.conn), self.recorder, self.project, self.fixtures, self.replay)
             self.conn.send({"type": "done"})
         except BaseException as exc:
             self.conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
@@ -590,12 +664,12 @@ def wait_and_report(conn, rid, pids):
             conn.send({"type": "exited", "rid": rid, "index": index, "status": status})
 
 
-def batch_worker(conn, root, args, nodeids, files, nice):
+def batch_worker(conn, root, args, nodeids, files, nice, replay):
     """Runs one batch with its own collection, for the Imported and Spawn fork points. Never returns."""
     try:
         if nice:
             os.nice(10)
-        rc = pytest.main(list(args), plugins=[BatchPlugin(conn, root, files, nodeids)])
+        rc = pytest.main(list(args), plugins=[BatchPlugin(conn, root, files, nodeids, replay)])
         conn.send({"type": "crash", "message": f"pytest exited with code {int(rc)} before running the batch"})
     except BaseException as exc:
         try:
@@ -613,6 +687,210 @@ def l1_main(conn, root, msg):
         rc = pytest.main(list(msg["args"]), plugins=[plugin])
         if not plugin.served:
             conn.send({"type": "failed", "code": int(rc)})
+    except BaseException as exc:
+        try:
+            conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
+        except Exception:
+            pass
+    flush_and_exit(0)
+
+
+class Placeholder(pytest.Item):
+    """A test the reporter shows: it ran in a worker, so here it only has a nodeid."""
+
+    def runtest(self):
+        pass
+
+
+def warning_message_of(data):
+    import importlib
+    import warnings
+
+    module, qualname = data["category"]
+    try:
+        category = importlib.import_module(module)
+        for part in qualname.split("."):
+            category = getattr(category, part)
+    except Exception:
+        category = type(qualname.rpartition(".")[2], (UserWarning,), {"__module__": module})
+    return warnings.WarningMessage(data["message"], category, data["filename"], data["lineno"], line=data["line"])
+
+
+class Replay:
+    """Turns pytest's session into a reporter: Rust sends the run's reports, in collection order, and this replays
+    them through the hooks pytest's terminal reporter, junitxml and other plugins listen to. Nothing is collected or
+    run here. Rust sends ``begin`` once collection is done, so nothing reaches the terminal before forktest's headline.
+    """
+
+    def __init__(self, conn, stderr_fd):
+        self.conn = conn
+        self.stderr_fd = stderr_fd
+        self.begin = None
+
+    def pytest_addoption(self, parser):
+        parser.addini("forktest_fork_from", "Where forktest workers fork from: auto, collected, imported or spawn.")
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_sessionstart(self, session):
+        from _pytest import timing
+
+        self.begin = self.recv()
+        os.dup2(self.stderr_fd, 2)
+        if self.begin["headline"] is not None:
+            sys.stdout.write(self.begin["headline"] + "\n")
+            sys.stdout.flush()
+        self.conn.send({"type": "began"})
+        # The session's clocks (the summary's "in 0.52s", JUnit's suite time) start when forktest's run started.
+        shift = max(0.0, time.time() - self.begin["started"])
+        clocks = {name: getattr(timing, name) for name in ("time", "perf_counter") if hasattr(timing, name)}
+        for name, clock in clocks.items():
+            setattr(timing, name, lambda clock=clock: clock() - shift)
+        try:
+            return (yield)
+        finally:
+            for name, clock in clocks.items():
+                setattr(timing, name, clock)
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_collection(self, session):
+        from _pytest.reports import CollectReport
+
+        config = session.config
+        hook = config.hook
+        terminal = config.pluginmanager.getplugin("terminalreporter")
+        if terminal is not None:
+            terminal.pytest_collection()
+        begin = self.begin
+        for data in begin["warnings"]:
+            self.warn(hook, data)
+        for data in begin["collect_reports"]:
+            hook.pytest_collectreport(report=report_of(config, data))
+        items = [Placeholder.from_parent(session, name=n, nodeid=n) for n in begin["items"]]
+        deselected = [Placeholder.from_parent(session, name=f"deselected{i}", nodeid=f"deselected{i}") for i in range(begin["deselected"])]
+        hook.pytest_collectreport(report=CollectReport("", "passed", None, items + deselected))
+        if deselected:
+            hook.pytest_deselected(items=deselected)
+        session.items = items
+        session.testscollected = len(items)
+        hook.pytest_collection_finish(session=session)
+        return True
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_runtestloop(self, session):
+        if session.testsfailed and not session.config.option.continue_on_collection_errors:
+            n = session.testsfailed
+            raise session.Interrupted(f"{n} error{'s' if n != 1 else ''} during collection")
+        config = session.config
+        hook = config.hook
+        while True:
+            msg = self.recv()
+            kind = msg["type"]
+            if kind == "end":
+                return True
+            if kind == "collect":
+                hook.pytest_collectreport(report=report_of(config, msg["report"]))
+                continue
+            if kind == "warnings":
+                for data in msg["warnings"]:
+                    self.warn(hook, data)
+                continue
+            if kind == "lost":
+                self.replay_test(hook, [lost_report(msg["nodeid"], msg["message"])], [])
+            else:
+                reports = [report_of(config, d) for d in msg["reports"]]
+                self.replay_test(hook, reports, msg["warnings"])
+            if session.shouldfail:
+                raise session.Failed(session.shouldfail)
+            if session.shouldstop:
+                raise session.Interrupted(session.shouldstop)
+
+    def replay_test(self, hook, reports, warnings):
+        first = reports[0]
+        hook.pytest_runtest_logstart(nodeid=first.nodeid, location=first.location)
+        for report in reports:
+            hook.pytest_runtest_logreport(report=report)
+        for data in warnings:
+            self.warn(hook, data)
+        hook.pytest_runtest_logfinish(nodeid=first.nodeid, location=first.location)
+
+    def warn(self, hook, data):
+        location = tuple(data["location"]) if data["location"] is not None else None
+        kwargs = {"warning_message": warning_message_of(data), "when": data["when"], "nodeid": data["nodeid"], "location": location}
+        hook.pytest_warning_recorded.call_historic(kwargs=kwargs)
+
+    def recv(self):
+        msg = self.conn.recv()
+        if msg is None:
+            flush_and_exit(1)
+        return msg
+
+
+def report_of(config, data):
+    """The report a worker serialized. JSON has no tuples, and pytest tells a skip's ``longrepr`` by being one."""
+    from _pytest.reports import CollectErrorRepr
+
+    for key in ("longrepr", "location"):
+        if isinstance(data.get(key), list):
+            data[key] = tuple(data[key])
+    kind = data.pop("forktest_repr", None)
+    report = config.hook.pytest_report_from_serializable(config=config, data=data)
+    if kind == "CollectErrorRepr":
+        report.longrepr = CollectErrorRepr(report.longrepr)
+    elif kind is not None:
+        report.longrepr = TextRepr(report.longrepr)
+    return report
+
+
+class TextRepr:
+    """A failure representation that only has its text, as pytest-xdist's workers send one."""
+
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+    def toterminal(self, out):
+        for line in self.text.split("\n"):
+            out.line(line)
+
+
+def lost_report(nodeid, message):
+    from _pytest.reports import TestReport
+
+    path, _, name = nodeid.partition("::")
+    return TestReport(nodeid, (path, None, name), {}, "failed", message, "setup")
+
+
+def reporter_main(conn):
+    """pytest's own reporter for one run: replays what Rust forwards. Never returns.
+
+    Rust hands over the terminal's stdout and stderr first. stdout is in place before pytest configures, so its
+    terminal writer decides colour and width from the real terminal; stderr waits for ``begin``, so a config error
+    L1 reports anyway is not printed twice.
+    """
+    try:
+        _, fds, _, _ = socket.recv_fds(conn.sock, 1, 2)
+        out, err = fds
+        os.dup2(out, 1)
+        os.close(out)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+        os.close(devnull)
+        if os.isatty(1):
+            sys.stdout.reconfigure(line_buffering=True)
+        start = conn.recv()
+        if start is None:
+            flush_and_exit(0)
+        for name, value in start["env"]:
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        rc = pytest.main(list(start["args"]), plugins=[Replay(conn, err)])
+        for stream in (sys.stdout, sys.stderr):
+            stream.flush()
+        conn.send({"type": "exit", "code": int(rc)})
     except BaseException as exc:
         try:
             conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
@@ -707,6 +985,18 @@ def l0_main():
                     os._exit(1)
             gc.unfreeze()
             l1_pids.append(pid)
+        elif msg["type"] == "reporter":
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    os.setpgid(0, 0)
+                    default_signals()
+                    conn.close()
+                    reporter = Conn()
+                    reporter.send({"type": "hello", "role": "reporter", "pid": os.getpid(), "id": msg["id"]})
+                    reporter_main(reporter)
+                finally:
+                    os._exit(1)
         elif msg["type"] == "run_workers":
             pids = {}
             gc.freeze()
@@ -719,7 +1009,7 @@ def l0_main():
                             conn.close()
                             worker = Conn()
                             worker.send({"type": "hello", "role": "worker", "pid": os.getpid(), "rid": msg["rid"], "index": index})
-                            batch_worker(worker, root, msg["args"], batch["nodeids"], batch["files"], msg["nice"])
+                            batch_worker(worker, root, msg["args"], batch["nodeids"], batch["files"], msg["nice"], msg["replay"])
                         finally:
                             os._exit(1)
                     pids[pid] = index
@@ -731,6 +1021,9 @@ def l0_main():
 def spawned_main(argv):
     """A fresh interpreter for the Spawn fork point: says hello, gets config, then collects or runs one batch."""
     conn = Conn()
+    if argv[0] == "reporter":
+        conn.send({"type": "hello", "role": "reporter", "pid": os.getpid(), "id": int(argv[1])})
+        reporter_main(conn)
     if argv[0] == "l1":
         conn.send({"type": "hello", "role": "l1", "pid": os.getpid(), "cid": int(argv[1])})
     else:
@@ -742,13 +1035,13 @@ def spawned_main(argv):
     if argv[0] == "l1":
         l1_main(conn, config["root"], msg)
     default_signals()
-    batch_worker(conn, config["root"], msg["args"], msg["nodeids"], msg["files"], msg["nice"])
+    batch_worker(conn, config["root"], msg["args"], msg["nodeids"], msg["files"], msg["nice"], msg["replay"])
 
 
 if __name__ == "__main__":
     if sys.argv[1:2] == ["l0"]:
         l0_main()
-    elif sys.argv[1:2] in (["l1"], ["worker"]):
+    elif sys.argv[1:2] in (["l1"], ["worker"], ["reporter"]):
         spawned_main(sys.argv[1:])
     else:
-        sys.exit(f"usage: {sys.argv[0]} l0 | l1 CID | worker RID INDEX")
+        sys.exit(f"usage: {sys.argv[0]} l0 | l1 CID | worker RID INDEX | reporter ID")

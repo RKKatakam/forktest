@@ -142,10 +142,7 @@ fn dispatch(opts: Opts, root: PathBuf, from_root: bool) -> anyhow::Result<i32> {
         Reporters::new(vec![live])
     };
     // pytest's own reporter prints the run, and writes the JUnit XML, unless the run is JSON lines alone.
-    let terminal = match opts.json && opts.junitxml.is_none() {
-        true => None,
-        false => Some(Terminal::ours(opts.json)?),
-    };
+    let terminal = if opts.json && opts.junitxml.is_none() { None } else { Some(Terminal::ours(opts.json)?) };
     let request = Request {
         mode: match (&opts.since, opts.all) {
             (_, true) => Mode::All,

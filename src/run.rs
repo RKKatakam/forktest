@@ -1,9 +1,9 @@
 //! One request from selection to events: decide what to collect, collect it, select, run, record.
 
 use crate::events::{Done, Event, Outcome, TestResult};
-use crate::replay::{self, InOrder};
 use crate::fingerprint::{Dep, FILE, Fingerprints, Hash128, MODULE, RelPath};
 use crate::graph::ImportGraph;
+use crate::replay::{self, InOrder};
 use crate::root::{config_files, is_excluded};
 use crate::select::{self, Affected, Current, Reason, SinceBaseline, WorkingTree};
 use crate::store::{DepSet, GitBaseline, InventoryRow, Record, Store, StoreView, dep_hash};

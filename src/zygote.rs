@@ -122,9 +122,10 @@ pub struct Terminal {
 impl Terminal {
     /// This process's stdout and stderr; `/dev/null` for stdout when it carries something else, such as JSON lines.
     pub fn ours(stdout_taken: bool) -> std::io::Result<Terminal> {
-        let out = match stdout_taken {
-            true => File::options().write(true).open("/dev/null")?.into(),
-            false => std::io::stdout().as_fd().try_clone_to_owned()?,
+        let out = if stdout_taken {
+            File::options().write(true).open("/dev/null")?.into()
+        } else {
+            std::io::stdout().as_fd().try_clone_to_owned()?
         };
         Ok(Terminal { out, err: std::io::stderr().as_fd().try_clone_to_owned()? })
     }
@@ -134,8 +135,7 @@ impl Terminal {
     }
 }
 
-/// Forwards messages to pytest's reporter in the order sent, from any thread, without ever blocking the run.
-#[derive(Clone)]
+/// Forwards messages to pytest's reporter in the order sent, without ever blocking the run.
 pub struct ToReporter(Sender<Vec<u8>>);
 
 impl ToReporter {

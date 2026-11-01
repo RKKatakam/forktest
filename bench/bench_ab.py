@@ -3,7 +3,7 @@
 usage: python bench/bench_ab.py ROOT TESTPATH EDIT_FILE ANCHOR_LINE ROUNDS [--xdist] [--serial]
 
 ROOT must hold a .venv with the project and pytest installed. The Python
-forktest runs from the source tree in $FORKTEST_PY_SRC (a checkout of main),
+forktest runs from the source tree in $FORKTEST_PY_SRC (a checkout of the python-version tag),
 the Rust one is $FORKTEST_BIN. Each round inserts a no-op statement above
 ANCHOR_LINE, then times every side's edit run, every side's no-op rerun and
 every side's --all, interleaved. A warm-up round fills both stores and is not

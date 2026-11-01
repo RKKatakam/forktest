@@ -644,7 +644,7 @@ print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlin
     fn closures_match_the_python_reference() {
         let tests_dir = Path::new(ROOT).join("pandas/tests/frame");
         let Some(reference) = crate::fingerprint::parity::python_reference() else {
-            eprintln!("skipped: set FORKTEST_PY_SRC to a checkout of main's src to compare with the Python forktest");
+            eprintln!("skipped: set FORKTEST_PY_SRC to a checkout of the python-version tag's src to compare with the Python forktest");
             return;
         };
         if !tests_dir.exists() {

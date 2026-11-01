@@ -821,7 +821,7 @@ print(json.dumps(out))
         }
     }
 
-    /// The Python forktest's source tree (a checkout of main's `src`), which these parity tests compare against.
+    /// The Python forktest's source tree (the `src` of a python-version checkout), which these parity tests compare against.
     pub(crate) fn python_reference() -> Option<std::path::PathBuf> {
         let src = std::path::PathBuf::from(std::env::var_os("FORKTEST_PY_SRC")?);
         if crate::python::dev_python().exists() && src.join("forktest/fingerprint.py").exists() {
@@ -834,7 +834,7 @@ print(json.dumps(out))
     #[test]
     fn qualnames_match_the_python_reference() {
         let Some(reference) = python_reference() else {
-            eprintln!("skipped: set FORKTEST_PY_SRC to a checkout of main's src to compare with the Python forktest");
+            eprintln!("skipped: set FORKTEST_PY_SRC to a checkout of the python-version tag's src to compare with the Python forktest");
             return;
         };
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));

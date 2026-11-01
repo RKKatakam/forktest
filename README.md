@@ -6,10 +6,10 @@ from it, and runs only those tests. Your suite, fixtures, markers, plugins and
 `conftest.py` files run on pytest's own machinery, unchanged.
 
 forktest is one Rust binary that drives pytest inside your project's own
-interpreter. It never forks a process that has threads, so suites that use
-JAX, torch or anything else with native thread pools run correctly. The
-original pure-Python version stays on the `main` branch as the behavioral
-reference.
+interpreter. It never forks a process that has threads, so suites whose
+imports start native thread pools (numpy's OpenBLAS, JAX) run correctly. The
+original pure-Python version is tagged `python-version` and stays the
+behavioral reference.
 
 ## Install
 
@@ -239,7 +239,7 @@ reports the median wall-clock time of one CLI invocation with the range after
 it. Other work kept the load average between 3 and 6 for most rounds and up
 to 10 at the end of the pandas ones. Every forktest run reported the same
 pass, fail, skip and xfail counts as pytest. The Python version ran from a
-checkout of `main` (1fe3bc5).
+checkout of the `python-version` tag (1fe3bc5).
 
 #### The demo
 
@@ -321,6 +321,30 @@ compares forktest's root with pytest's rootdir across 43 layouts.
 
 ## Limitations, honestly
 
+forktest is checked against pytest on ten projects (see above), not on every
+suite. Use it for the edit-and-test loop, and keep `forktest --all` or plain
+`pytest` as the gate in CI.
+
+- **A run after an edit runs only the tests that edit affects.** If selection
+  misses a dependency, a test the edit broke does not run and the run passes
+  where pytest would fail. `forktest --all` runs every test.
+- **State that does not survive `fork()` is not detected.** forktest counts a
+  process's threads before forking, and falls back to forking before the
+  imports or to fresh interpreters when there are any. State without a thread
+  is invisible to that check: a CUDA context created at import (a forked child
+  cannot use it), macOS Objective-C or CoreFoundation code initialised before
+  the fork, and database connections, gRPC channels or sockets opened at
+  import, which every worker then shares. Such a suite crashes, hangs or errors
+  rather than passing silently; `--fork-from spawn` or `--strict-pytest` runs
+  it. PyTorch and CUDA are untested.
+- **Tested scope.** The plugins checked are pytest-cov, pytest-timeout,
+  pytest-xdist's `-n` and worker identity, and the cache provider (`--lf`),
+  on pytest 8 and Python 3.12 or newer. Others (pytest-django against a real
+  database, pytest-asyncio, pytest-benchmark, pytest-randomly, plugins with
+  their own collection hooks) are untested.
+- **Tests that depend on order or shared state across modules** can behave
+  differently, because tests run in several processes as under
+  `pytest -n auto`.
 - **Each worker builds session fixtures itself.** A session fixture runs once
   per worker rather than once per run, as under pytest-xdist, and a test that
   mutates one does not affect tests in other workers. Workers carry
@@ -376,5 +400,10 @@ python bench/bench_daemon.py SOURCE EDIT_FILE OLD NEW EXPECT_FAILED ROUNDS
 ```
 
 `FORKTEST_BIN` names the binary the Python tests and benches run, and
-`FORKTEST_PY_SRC` a checkout of `main`'s `src` for the Python version.
+`FORKTEST_PY_SRC` the `src` of a `python-version` checkout for the Python version.
 `RUST_PLAN.md` is the design. `DESIGN.md` is the original product spec.
+
+## Author
+
+forktest is written and maintained by kittu ([@RKKatakam](https://github.com/RKKatakam)).
+Released under the MIT license; see `LICENSE`.

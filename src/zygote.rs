@@ -910,6 +910,12 @@ impl Session {
         self.preimported
     }
 
+    /// OS threads L0's preimports started in pools that survive a fork (numpy's OpenBLAS), which the thread check
+    /// allows every process forked from it.
+    pub fn tolerated_threads(&self) -> u32 {
+        self.tolerated
+    }
+
     /// Replaces the pytest args later collections and runs use. L0 never saw them, so it stays.
     pub fn set_args(&mut self, args: Vec<String>) {
         self.drop_l1();

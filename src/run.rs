@@ -79,6 +79,10 @@ struct ProjectMeta {
 #[derive(Serialize, Deserialize, Default)]
 struct ArgsMeta {
     fork_point: Option<String>,
+    /// L0's tolerated threads when `fork_point` was observed. An L1 whose only extra threads are numpy's pool has
+    /// none to spare once L0 preimports numpy, so another count leaves the stored fork point unproven.
+    #[serde(default)]
+    fork_point_tolerated: Option<u32>,
     python_files: Vec<String>,
     /// Every file matching `python_files`, and every `conftest.py`, at the last full collection.
     test_files: Vec<String>,
@@ -602,6 +606,8 @@ impl Project {
         let graph = graph_of(&root, &self.store, &fps, &project.modules)?;
 
         let warm = self.warm_for(req);
+        // The stored fork point is checked again by this run's L1.
+        let mut recheck = false;
         let full = match &warm {
             Some(_) => Some("warm"),
             None => full_collection_reason(req, &root, &fps, &inventory, &args_meta),
@@ -667,13 +673,21 @@ impl Project {
                     log(|| format!("collecting {} files: {}", p.files.len(), p.files.join(" ")));
                 }
                 // Where the last full collection of these args could fork from. A partial run that needs no L1 trusts
-                // it; any L1 is still thread-checked, and only a full collection records a new answer.
-                let known_fork_point = match (req.fork_from, full, args_meta.fork_point.as_deref()) {
-                    (Some(p), _, _) => Some(p),
-                    (None, None, Some("imported")) => Some(ForkPoint::Imported),
-                    (None, None, Some("spawn")) => Some(ForkPoint::Spawn),
+                // it when L0 tolerates the threads it did then; any L1 is still thread-checked, and only a full collection,
+                // or one that checks an untrusted answer, records a new one.
+                let stored = match (full, args_meta.fork_point.as_deref()) {
+                    (None, Some("imported")) => Some(ForkPoint::Imported),
+                    (None, Some("spawn")) => Some(ForkPoint::Spawn),
                     _ => None,
                 };
+                if stored.is_some() && req.fork_from.is_none() {
+                    let now = self.session_for(req, full_policy(req), &project)?.tolerated_threads();
+                    recheck = args_meta.fork_point_tolerated != Some(now);
+                    if recheck {
+                        log(|| format!("the stored fork point was found with {:?} tolerated threads, not {now}; collecting in L1 to check it", args_meta.fork_point_tolerated));
+                    }
+                }
+                let known_fork_point = req.fork_from.or(stored.filter(|_| !recheck));
                 self.warm = None;
                 let seen = if partial.is_none() { self.content_hashes(&project) } else { HashMap::new() };
                 // Workers that collect their own files need no L1 when the inventory already names every test to run.
@@ -822,8 +836,9 @@ impl Project {
         };
         let mut tally = Tally::default();
         let executed = run.execute(session, &selected, req.nice, reporter.as_ref(), learned, emit, &mut |r| tally.add(r.outcome));
-        if !partial && let Some(args) = &mut learned.args {
+        if (!partial || recheck) && let Some(args) = &mut learned.args {
             args.fork_point = Some(fork_point_name(session.fork_point()).into());
+            args.fork_point_tolerated = Some(session.tolerated_threads());
         }
         executed?;
         log(|| format!("every test reported {} ms into the run", ms(t0)));

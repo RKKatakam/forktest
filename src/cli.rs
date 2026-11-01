@@ -33,6 +33,8 @@ pub struct Opts {
     pub no_daemon: bool,
     pub python: Option<PathBuf>,
     pub fork_from: Option<ForkPoint>,
+    /// Print the project root and exit. Hidden, for `bench/rootdir_matrix.py`.
+    pub print_root: bool,
     /// Everything else, in order.
     pub pytest_args: Vec<String>,
 }
@@ -57,6 +59,7 @@ impl Opts {
                 "--strict-pytest" => o.strict = true,
                 "--verify-selection" => o.verify = true,
                 "--no-daemon" => o.no_daemon = true,
+                "--print-root" => o.print_root = true,
                 "--since" => o.since = Some(value("--since")?),
                 "--junitxml" => o.junitxml = Some(PathBuf::from(value("--junitxml")?)),
                 "--why" => o.why = Some(value("--why")?),
@@ -109,6 +112,10 @@ pub fn main(argv: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if opts.print_root {
+        println!("{}", root.display());
+        return 0;
+    }
     // The daemon's interpreters run in the root, so relative pytest args only mean the same there.
     let from_root = std::fs::canonicalize(&cwd).is_ok_and(|c| c == root);
     match dispatch(opts, root, from_root) {

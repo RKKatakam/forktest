@@ -2,12 +2,13 @@
 
 use crate::zygote::Shown;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Holds what each test reports until every test before it in collection order has been released, and stops the run
 /// where pytest would: after the `maxfail`-th failure in that order.
 pub struct InOrder<T> {
-    position: HashMap<String, usize>,
+    /// Each nodeid's places in collection order not yet filled; `--keep-duplicates` gives one nodeid several.
+    position: HashMap<String, VecDeque<usize>>,
     held: Vec<Option<(bool, T)>>,
     next: usize,
     failures: u32,
@@ -17,8 +18,12 @@ pub struct InOrder<T> {
 
 impl<T> InOrder<T> {
     pub fn new(order: &[&str], maxfail: u32) -> InOrder<T> {
+        let mut position: HashMap<String, VecDeque<usize>> = HashMap::new();
+        for (i, n) in order.iter().enumerate() {
+            position.entry(n.to_string()).or_default().push_back(i);
+        }
         InOrder {
-            position: order.iter().enumerate().map(|(i, n)| (n.to_string(), i)).collect(),
+            position,
             held: order.iter().map(|_| None).collect(),
             next: 0,
             failures: 0,
@@ -31,8 +36,8 @@ impl<T> InOrder<T> {
     /// test that reached `maxfail`.
     pub fn arrived(&mut self, nodeid: &str, failed: bool, report: T) -> Vec<T> {
         let mut due = Vec::new();
-        let Some(&i) = self.position.get(nodeid) else { return due };
-        self.held[i].get_or_insert((failed, report));
+        let Some(i) = self.position.get_mut(nodeid).and_then(VecDeque::pop_front) else { return due };
+        self.held[i] = Some((failed, report));
         while !self.stopped
             && let Some((failed, report)) = self.held.get_mut(self.next).and_then(Option::take)
         {
@@ -130,6 +135,15 @@ mod tests {
         assert_eq!(ids(o.arrived("b", true, msg("b"))), ["b"]);
         assert!(o.stopped(), "b is the first failure in order; c and d are past the stop");
         assert!(o.arrived("x", true, msg("x")).is_empty());
+    }
+
+    #[test]
+    fn a_nodeid_collected_twice_fills_its_places_in_turn() {
+        let mut o = InOrder::new(&["a", "b", "a"], 0);
+        assert!(o.arrived("a", true, msg("a1")).iter().eq(["a1"].iter()));
+        assert!(o.arrived("a", true, msg("a2")).is_empty());
+        assert_eq!(ids(o.arrived("b", false, msg("b"))), ["b", "a2"]);
+        assert!(o.arrived("a", true, msg("a3")).is_empty(), "a has no place left");
     }
 
     #[test]

@@ -153,3 +153,10 @@ def test_cov_reports_what_the_workers_measured_as_pytest_does(fresh: Project):
         assert coverage_section(ours.stdout) == coverage_section(theirs.stdout), ours.stdout
         assert "Required test coverage of 100% not reached" in ours.stdout
     assert not list(fresh.root.glob(".coverage.*"))
+
+
+def test_a_file_given_twice_with_keep_duplicates_runs_twice_as_in_pytest(fresh: Project):
+    fresh.write("tests/test_dup.py", "def test_ok():\n    pass\n\n\ndef test_bad():\n    assert False\n")
+    args = ("-p", "no:cacheprovider", "--keep-duplicates", "tests/test_dup.py", "tests/test_dup.py")
+    ours, theirs = fresh.run("--no-daemon", *args), fresh.pytest(*args)
+    assert (ours.returncode, normalised(ours.stdout)) == (theirs.returncode, normalised(theirs.stdout)), ours.stdout

@@ -542,7 +542,7 @@ impl Session {
                             let b = &batches[index];
                             self.send(conn, &json!({"type": "config", "preimport": [], "root": self.config.root}))?;
                             let args = &self.config.pytest_args;
-                            self.send(conn, &json!({"type": "work", "args": args, "nodeids": b.nodeids, "files": b.files, "nice": nice}))?;
+                            self.send(conn, &json!({"type": "work", "args": args, "nodeids": b.nodeids, "files": b.files, "nice": nice, "workers": batches.len()}))?;
                         }
                     } else if kind == "exited" && Some(conn) == parent && msg["rid"] == rid {
                         if let Some(slot) = msg["index"].as_u64().and_then(|i| slots.get_mut(i as usize)) {

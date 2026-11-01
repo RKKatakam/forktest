@@ -13,6 +13,7 @@ import struct
 import sys
 import threading
 import time
+import uuid
 
 # dyld has loaded forktest's time zone fix by now. Tests and the processes they start should not see it.
 if "forktest_tzfix" in os.environ.get("DYLD_INSERT_LIBRARIES", ""):
@@ -537,13 +538,13 @@ class L1Plugin(BasePlugin):
             for index, items in enumerate(batches):
                 pid = os.fork()
                 if pid == 0:
-                    self.forked_worker(rid, index, items, nice)
+                    self.forked_worker(rid, index, len(batches), items, nice)
                 pids[pid] = index
         finally:
             gc.unfreeze()
         wait_and_report(self.conn, rid, pids)
 
-    def forked_worker(self, rid, index, items, nice):
+    def forked_worker(self, rid, index, count, items, nice):
         try:
             default_signals()
             self.conn.close()
@@ -553,6 +554,7 @@ class L1Plugin(BasePlugin):
                 if nice:
                     os.nice(10)
                 self.reinit_capture()
+                become_worker(self.config, rid, index, count)
                 run_items(items, Sender(conn), self.recorder, self.project, self.fixtures)
                 conn.send({"type": "done"})
             except BaseException as exc:
@@ -564,9 +566,10 @@ class L1Plugin(BasePlugin):
 class BatchPlugin(BasePlugin):
     """A worker that collects its batch's files itself and runs exactly its nodeids, in order."""
 
-    def __init__(self, conn, root, files, nodeids):
+    def __init__(self, conn, root, files, nodeids, identity):
         super().__init__(conn, root, files)
         self.nodeids = nodeids
+        self.identity = identity
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtestloop(self, session):
@@ -575,11 +578,26 @@ class BatchPlugin(BasePlugin):
             self.conn.send({"type": "collect_error", "nodeid": nodeid, "message": message})
         by_id = {item.nodeid: item for item in self.items}
         try:
+            become_worker(self.config, *self.identity)
             run_items([by_id[n] for n in self.nodeids if n in by_id], Sender(self.conn), self.recorder, self.project, self.fixtures)
             self.conn.send({"type": "done"})
         except BaseException as exc:
             self.conn.send({"type": "crash", "message": f"{type(exc).__name__}: {exc}"})
         flush_and_exit(0)
+
+
+def become_worker(config, rid, index, count):
+    """Gives a worker the identity a pytest-xdist worker has, just before its tests run.
+
+    Suites and plugins key per-worker state on it: xdist's `worker_id` fixture, pytest-django's per-worker test
+    databases, ports and temp names. Set after session start, so pytest-cov keeps its single-process mode.
+    """
+    if hasattr(config, "workerinput"):
+        return
+    workerid = f"gw{index}"
+    uid = uuid.uuid5(uuid.NAMESPACE_OID, f"{os.getppid()}:{rid}").hex
+    os.environ.update(PYTEST_XDIST_WORKER=workerid, PYTEST_XDIST_WORKER_COUNT=str(count), PYTEST_XDIST_TESTRUNUID=uid)
+    config.workerinput = {"workerid": workerid, "workercount": count, "testrunuid": uid, "mainargv": list(sys.argv)}
 
 
 def wait_and_report(conn, rid, pids):
@@ -590,12 +608,12 @@ def wait_and_report(conn, rid, pids):
             conn.send({"type": "exited", "rid": rid, "index": index, "status": status})
 
 
-def batch_worker(conn, root, args, nodeids, files, nice):
+def batch_worker(conn, root, args, nodeids, files, nice, identity):
     """Runs one batch with its own collection, for the Imported and Spawn fork points. Never returns."""
     try:
         if nice:
             os.nice(10)
-        rc = pytest.main(list(args), plugins=[BatchPlugin(conn, root, files, nodeids)])
+        rc = pytest.main(list(args), plugins=[BatchPlugin(conn, root, files, nodeids, identity)])
         conn.send({"type": "crash", "message": f"pytest exited with code {int(rc)} before running the batch"})
     except BaseException as exc:
         try:
@@ -746,7 +764,8 @@ def l0_main():
                             conn.close()
                             worker = Conn()
                             worker.send({"type": "hello", "role": "worker", "pid": os.getpid(), "rid": msg["rid"], "index": index})
-                            batch_worker(worker, root, msg["args"], batch["nodeids"], batch["files"], msg["nice"])
+                            identity = (msg["rid"], index, len(msg["batches"]))
+                            batch_worker(worker, root, msg["args"], batch["nodeids"], batch["files"], msg["nice"], identity)
                         finally:
                             os._exit(1)
                     pids[pid] = index
@@ -769,7 +788,8 @@ def spawned_main(argv):
     if argv[0] == "l1":
         l1_main(conn, config["root"], msg)
     default_signals()
-    batch_worker(conn, config["root"], msg["args"], msg["nodeids"], msg["files"], msg["nice"])
+    identity = (int(argv[1]), int(argv[2]), msg["workers"])
+    batch_worker(conn, config["root"], msg["args"], msg["nodeids"], msg["files"], msg["nice"], identity)
 
 
 if __name__ == "__main__":

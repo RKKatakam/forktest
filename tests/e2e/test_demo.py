@@ -7,6 +7,8 @@ import sqlite3
 import subprocess
 import xml.etree.ElementTree as ET
 
+import pytest
+
 from conftest import Miss, TestResult, Verified, done, failed, selection, verified
 
 ROUND_VAT_EXECUTORS = {
@@ -464,3 +466,20 @@ def test_collection_errors_stop_the_run_like_pytest(demo):
     assert rc == 2 and done(events).errors == 1 and selection(events) is None
     events, rc = demo.forktest("--continue-on-collection-errors")
     assert rc == 1 and done(events).passed == 0 and selection(events).total == 16
+
+
+WORKER_ID_TEST = "import os\n\n\ndef test_worker():\n    assert False, os.environ.get('PYTEST_XDIST_WORKER', 'master') + '/' + os.environ.get('PYTEST_XDIST_WORKER_COUNT', '-')\n"
+
+
+@pytest.mark.parametrize("fork_from", ["collected", "imported", "spawn"])
+def test_workers_carry_xdist_worker_identities(fresh, fork_from):
+    fresh.write("tests/test_worker_a.py", WORKER_ID_TEST)
+    fresh.write("tests/test_worker_b.py", WORKER_ID_TEST)
+    files = ("tests/test_worker_a.py", "tests/test_worker_b.py")
+    events, _ = fresh.forktest("--all", "-n", "2", "--fork-from", fork_from, *files)
+    ids = sorted(e.message.split("\n")[0].removeprefix("AssertionError: ") for e in events if isinstance(e, TestResult) and e.outcome == "failed")
+    assert ids == ["gw0/2", "gw1/2"], ids
+
+    events, _ = fresh.forktest("--all", "--strict-pytest", *files)
+    ids = {e.message.split("\n")[0].removeprefix("AssertionError: ") for e in events if isinstance(e, TestResult)}
+    assert ids == {"master/-"}, ids

@@ -297,6 +297,24 @@ pub struct JunitReporter {
     done: Option<Done>,
 }
 
+/// pytest's `mangle_test_address`: params come off before the `::` split, and only the file part loses `.py`.
+fn junit_names(nodeid: &str) -> (String, String) {
+    let (path, tail) = nodeid.split_once("::").unwrap_or((nodeid, ""));
+    let path = path.replace('/', ".");
+    let mut names = vec![path.strip_suffix(".py").unwrap_or(&path).to_string()];
+    if nodeid.contains("::") {
+        let (head, params) = tail.split_once('[').map_or((tail, None), |(h, p)| (h, Some(p)));
+        names.extend(head.split("::").map(str::to_string));
+        if let Some(params) = params {
+            let last = names.last_mut().unwrap();
+            last.push('[');
+            last.push_str(params);
+        }
+    }
+    let name = names.pop().unwrap();
+    (names.join("."), name)
+}
+
 impl JunitReporter {
     pub fn new(path: PathBuf) -> Self {
         JunitReporter { path, results: Vec::new(), collect_errors: Vec::new(), done: None }
@@ -316,13 +334,11 @@ impl JunitReporter {
             ),
         ];
         for r in &self.results {
-            let (classname, name) = r.nodeid.rsplit_once("::").unwrap_or(("", &r.nodeid));
-            let classname = classname.replace('/', ".");
-            let classname = classname.strip_suffix(".py").unwrap_or(&classname).replace("::", ".");
+            let (classname, name) = junit_names(&r.nodeid);
             let head = format!(
                 r#"<testcase classname={} name={} time="{:.3}""#,
                 quoteattr(&classname),
-                quoteattr(name),
+                quoteattr(&name),
                 r.duration
             );
             let tag = match r.outcome {
@@ -542,12 +558,21 @@ mod tests {
             std::fs::read_to_string(path).unwrap(),
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
              <testsuites><testsuite name=\"forktest\" tests=\"3\" failures=\"1\" errors=\"1\" skipped=\"1\" time=\"0.052\">\n\
-             <testcase classname=\"tests.test_a.py.TestX\" name=\"test_a\" time=\"0.012\" />\n\
+             <testcase classname=\"tests.test_a.TestX\" name=\"test_a\" time=\"0.012\" />\n\
              <testcase classname=\"tests.test_a\" name=\"test_b\" time=\"0.012\"><failure message=\"a &lt; b &amp; &quot;c&quot;\">a &lt; b &amp; \"c\"\nmore</failure></testcase>\n\
              <testcase classname=\"tests.test_a\" name=\"test_c\" time=\"0.012\"><skipped type=\"pytest.xfail\" message=\"known\">known</skipped></testcase>\n\
              <testcase classname=\"collection\" name=\"tests/test_x.py\" time=\"0\"><error message=\"collection error\">boom</error></testcase>\n\
              </testsuite></testsuites>\n"
         );
+    }
+
+    #[test]
+    fn junit_names_follow_pytest() {
+        let n = |id: &str| junit_names(id);
+        assert_eq!(n("tests/test_a.py::TestX::test_a"), ("tests.test_a.TestX".into(), "test_a".into()));
+        assert_eq!(n("tests/test_a.py::test_p[a::b/c.py]"), ("tests.test_a".into(), "test_p[a::b/c.py]".into()));
+        assert_eq!(n("pkg/test_b.py::TestY::test_q[1]"), ("pkg.test_b.TestY".into(), "test_q[1]".into()));
+        assert_eq!(n("tests/test_x.py"), ("".into(), "tests.test_x".into()));
     }
 
     #[test]

@@ -183,15 +183,65 @@ miss is reported rather than hidden.
 
 ## Measured
 
-On a 12-core Apple Silicon laptop, Python 3.12 for the demo and 3.14 for
-attrs and pandas, on 2026-10-30. Each table interleaves its sides round by
-round after a warm-up round, and reports the median wall-clock time of one
-CLI invocation with the range after it. Other work kept the load average
-between 3 and 6 for most rounds and up to 10 at the end of the pandas ones.
-Every forktest run reported the same pass, fail, skip and xfail counts as
-pytest. The Python version ran from a checkout of `main` (1fe3bc5).
+### Ten projects, macOS and Linux
 
-### The demo
+`bench/corpus.py` on 2026-11-01, at b1c4c16. Each project ran three rounds,
+every runner interleaved within a round; the tables give medians in seconds.
+The edit inserts a no-op statement at the top of one function (the edited
+function is listed in `bench/corpus.py`) and the `forktest` column is that
+run; `forktest --all` runs every test from a warm store. Every runner's pass,
+fail, skip and xfail counts matched pytest's on both machines, and
+`bench/outcome_parity.py` found every test's outcome identical to pytest's on
+all ten projects.
+
+macOS, a 12-core Apple Silicon laptop, load average 1.3 rising to 4.4:
+
+| project | tests | pytest | pytest -n auto | forktest --all | forktest after the edit | tests it ran |
+|---|---|---|---|---|---|---|
+| demo | 16 | 1.32 | 0.93 | 0.39 | 0.13 | 4 |
+| jaxdemo | 8 | 0.67 | 1.35 | 0.64 | 0.51 | 7 |
+| more-itertools | 769 | 10.57 | 7.45 | 6.43 | 0.16 | 9 |
+| attrs | 1,412 | 4.60 | 2.16 | 1.00 | 0.47 | 36 |
+| click | 2,287 | 3.05 | 3.27 | 1.30 | 0.41 | 1,134 |
+| flask | 494 | 0.84 | 0.99 | 0.35 | 0.21 | 29 |
+| rich | 981 | 3.89 | 3.31 | 2.39 | 0.44 | 84 |
+| pandas `tests/frame` | 16,877 | 22.68 | 9.69 | 6.48 | 1.87 | 82 |
+| fastapi | 4,753 | 55.72 | 15.34 | 8.05 | 4.91 | 3,529 |
+| django-rest-framework | 1,667 | 2.28 | 2.31 | 1.25 | 0.45 | 30 |
+
+Linux, a 32-core x86_64 desktop on Ubuntu, otherwise idle:
+
+| project | tests | pytest | pytest -n auto | forktest --all | forktest after the edit | tests it ran |
+|---|---|---|---|---|---|---|
+| demo | 16 | 1.17 | 1.19 | 0.39 | 0.12 | 4 |
+| jaxdemo | 8 | 0.86 | 2.88 | 0.87 | 0.58 | 7 |
+| more-itertools | 769 | 16.83 | 5.71 | 4.09 | 0.14 | 9 |
+| attrs | 1,412 | 4.59 | 2.46 | 0.79 | 0.46 | 34 |
+| click | 2,287 | 2.40 | 6.15 | 1.06 | 0.33 | 1,134 |
+| flask | 494 | 0.74 | 1.51 | 0.30 | 0.19 | 29 |
+| rich | 981 | 3.67 | 3.39 | 2.32 | 0.41 | 84 |
+| pandas `tests/frame` | 16,877 | 23.26 | 12.48 | 4.82 | 1.40 | 82 |
+| fastapi | 4,753 | 54.96 | 18.17 | 5.03 | 3.69 | 3,529 |
+| django-rest-framework | 1,667 | 2.37 | 3.35 | 1.24 | 0.43 | 30 |
+
+The edit runs include the tests that failed last time (2 on macOS attrs, 8 on
+rich, 41 on pandas, 1 on fastapi). rich's `--all` cannot go below its 2.0 s
+`test_growing_display_autorefresh`, and jaxdemo is bound by `import jax`, so
+on Linux its `--all` is level with plain pytest. A run with nothing changed
+starts no Python and takes about 10 ms.
+
+### Against the Python version
+
+On a 12-core Apple Silicon laptop, Python 3.12 for the demo and 3.14 for
+attrs and pandas, on 2026-10-30, before forktest printed pytest's own output.
+Each table interleaves its sides round by round after a warm-up round, and
+reports the median wall-clock time of one CLI invocation with the range after
+it. Other work kept the load average between 3 and 6 for most rounds and up
+to 10 at the end of the pandas ones. Every forktest run reported the same
+pass, fail, skip and xfail counts as pytest. The Python version ran from a
+checkout of `main` (1fe3bc5).
+
+#### The demo
 
 `examples/demo`, 16 tests, one of them sleeping 0.25 s. The edit inserts a
 statement into `round_vat` and selects the 7 tests that run it; the daemon
@@ -209,7 +259,7 @@ A rerun with nothing changed starts no Python. The edit run is bound by
 starting Python and `import pytest` (about 70 ms) and the 0.25 s sleeps bound
 `--all`.
 
-### attrs
+#### attrs
 
 [attrs](https://github.com/python-attrs/attrs) at c8bb9bf: 1,413 tests, 2 of
 which fail in a shallow clone. The edit adds a line to
@@ -226,7 +276,7 @@ rounds.
 No `--all` run can beat its longest test,
 `TestMetadata::test_not_none_metadata`, which takes 0.42 s by pytest's count.
 
-### pandas
+#### pandas
 
 [pandas](https://github.com/pandas-dev/pandas) at c32acd3, an editable meson
 build, pytest 9.2, without pyarrow. The slice is `pandas/tests/frame`: 16,876
@@ -245,7 +295,7 @@ the project, and the 41 failing tests format their tracebacks. Collection is
 narrowed to the selected functions: 280 items instead of the 9,037 their files
 hold.
 
-### JAX
+#### JAX
 
 `examples/jaxdemo`: 8 tests, and `tests/test_eager.py` builds JAX arrays at
 import, which starts 61 native threads during collection. The Python forktest
@@ -261,31 +311,39 @@ Workers fork from L0, before collection, and each starts its own JAX
 backend. No run printed JAX's fork warning. `import pytest, jax` alone takes
 0.36 s of the edit run.
 
-### Other projects
+#### Other checks
 
-`bench/corpus.py` runs pytest, `pytest -n auto`, forktest, rtest and rpytest
-on more projects (more-itertools, click, flask, rich, FastAPI, Django REST
-framework) and checks every count against pytest; `bench/args_parity.py`
-checks exit codes and counts for 127 argument sets across five projects.
+`bench/args_parity.py` compares exit codes and counts with pytest's for 90
+argument sets across five projects; all 90 agreed on macOS and Linux on
+2026-11-01. `bench/output_parity.py` diffs forktest's terminal output and
+JUnit XML against plain pytest's, case by case, and `bench/rootdir_matrix.py`
+compares forktest's root with pytest's rootdir across 43 layouts.
 
 ## Limitations, honestly
 
-- **Linux is untested.** Everything above ran on macOS. The Linux paths
-  (`/proc` thread counts, inotify) compile and are written for it, but have
-  not run. The daemon watches the project recursively, and inotify's watch
-  limit may need raising on large trees.
+- **Each worker builds session fixtures itself.** A session fixture runs once
+  per worker rather than once per run, as under pytest-xdist, and a test that
+  mutates one does not affect tests in other workers. Workers carry
+  pytest-xdist's identity (`worker_id` is `gw0`, `gw1`, ...; `PYTEST_XDIST_WORKER`
+  is set), so per-worker isolation keyed on it works. `--strict-pytest` gives
+  exact single-process semantics.
 - **First runs record everything.** A run with an empty store collects and
   records every test, which on attrs is slower than `pytest -n auto`. Every
   later run is faster.
-- **Each worker builds session fixtures itself.** A session fixture runs once
-  per worker rather than once per run, and a test that mutates one does not
-  affect tests in other workers. `--strict-pytest` gives exact single-process
-  semantics.
 - **A function behind a cache is recorded by the test that filled it.** With
   `functools.lru_cache`, or a JAX function reached through a jit trace another
   test already compiled, later tests in the same worker never run it, so an
   edit to it does not select them. `--verify-selection` and the watch safety
   net report such a miss.
+- **Coverage on a selection.** `--cov` reports what the workers measured, as
+  pytest-cov does. A run that selects only some tests reports their coverage
+  and leaves `--cov-fail-under` to `forktest --all`.
+- **Output that differs from plain pytest.** With `-s`, a test's own output
+  reaches the terminal while its worker runs it. Testsuite properties added
+  from inside a test process (hypothesis' statistics,
+  `record_testsuite_property`) are missing from the JUnit XML, as under
+  pytest-xdist. `-n` in `addopts` runs in forktest's own workers, so pytest-xdist's
+  worker banner is not printed.
 - **A file's stat is trusted.** A file whose `mtime_ns`, `ctime_ns` and size
   match the stored ones is not read again. A file read within 2 s of its
   last change is read again next time, as git does for racily clean files.
@@ -296,15 +354,14 @@ checks exit codes and counts for 127 argument sets across five projects.
   from an `@file`, and a `tool.pytest` table written only as nested inline
   tables, are not followed. When pytest picks a different rootdir anyway,
   forktest warns and selection may be off.
-- **Captured output is not shown.** Failure events carry the assertion
-  message and the project frames, not the captured stdout of the test.
 - **An edit saved during a run** can be recorded against the wrong content.
   The safety net and the next full run catch it.
 - **Same-second, same-size edits can run stale bytecode.** CPython's `.pyc`
   check uses the source mtime in whole seconds and the size, as plain pytest
   does. forktest's selection is content-based and still picks the right tests.
-- pytest-xdist is replaced, not supported. `forktest -h` shows pytest's help;
-  forktest's own options are listed above.
+- **The daemon watches the project recursively**, and on Linux inotify's watch
+  limit may need raising on large trees.
+- `forktest -h` shows pytest's help; forktest's own options are listed above.
 - **Windows** is not supported.
 
 ## Development

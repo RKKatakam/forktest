@@ -267,14 +267,27 @@ fn indent(text: &str, n: usize, limit: Option<usize>) -> String {
     lines.iter().map(|l| format!("{pad}{l}")).collect::<Vec<_>>().join("\n")
 }
 
+/// pytest's `bin_xml_escape`: a character XML 1.0 forbids (an ANSI escape, say) becomes visible `#xNN` text.
+fn bin_xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' | '\n' | '\r' | '\u{20}'..='\u{7e}' | '\u{80}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'.. => out.push(c),
+            c if (c as u32) <= 0xff => out.push_str(&format!("#x{:02X}", c as u32)),
+            c => out.push_str(&format!("#x{:04X}", c as u32)),
+        }
+    }
+    out
+}
+
 fn escape(text: &str) -> String {
-    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    bin_xml_escape(text).replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
 fn quoteattr(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
-    for c in value.chars() {
+    for c in bin_xml_escape(value).chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -564,6 +577,12 @@ mod tests {
              <testcase classname=\"collection\" name=\"tests/test_x.py\" time=\"0\"><error message=\"collection error\">boom</error></testcase>\n\
              </testsuite></testsuites>\n"
         );
+    }
+
+    #[test]
+    fn junit_text_escapes_what_xml_forbids_as_pytest_does() {
+        assert_eq!(escape("\u{1b}[31mred\u{1b}[0m <&>\u{7f}\u{fffe}\tok"), "#x1B[31mred#x1B[0m &lt;&amp;&gt;#x7F#xFFFE\tok");
+        assert_eq!(quoteattr("a\u{8}b"), "\"a#x08b\"");
     }
 
     #[test]

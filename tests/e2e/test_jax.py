@@ -48,16 +48,29 @@ def test_an_edit_run_whose_workers_collect_their_own_files_starts_no_l1_and_hono
     events, rc = jaxdemo.forktest("-x")
     assert rc == 0 and done(events).passed == 8
     assert jaxdemo.log("collected") == ["forktest: collected 8 tests; workers fork from imported"]
+    rechecks = 0
+
+    def l1_skipped_or_checked_once(selected: int) -> None:
+        # Linux numpy starts an OpenBLAS pool that L0 tolerates once a run has taught it to preimport numpy; the
+        # stored fork point is then checked once more in L1, and trusted again after that.
+        nonlocal rechecks
+        no_l1 = jaxdemo.log("collected") == [] and len(jaxdemo.log(f"no L1: {selected} tests from the inventory")) == 1
+        checked = len(jaxdemo.log("the stored fork point was found with")) == 1
+        rechecks += checked
+        collected = jaxdemo.log("collected")
+        assert no_l1 or (checked and len(collected) == 1 and collected[0].endswith("workers fork from imported")), jaxdemo.stderr
+        assert rechecks <= 1, jaxdemo.stderr
 
     jaxdemo.edit("model/layers.py", DENSE, DENSE + " + 0.0")
     events, rc = jaxdemo.forktest("-x")
     assert rc == 0 and FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr
-    assert jaxdemo.log("collected") == [] and len(jaxdemo.log("no L1: 7 tests from the inventory")) == 1, jaxdemo.stderr
+    l1_skipped_or_checked_once(7)
     assert selection(events).reasons == {"coverage": 7} and done(events).passed == 7 and failed(events) == set()
 
     jaxdemo.edit("model/layers.py", DENSE + " + 0.0", DENSE + " * jnp.nan")
     events, rc = jaxdemo.forktest("-x")
-    assert jaxdemo.log("collected") == [] and FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr
+    assert FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr
+    l1_skipped_or_checked_once(selection(events).selected)
     assert rc == 1 and len(failed(events)) == 1 and done(events).failed == 1, events
 
 

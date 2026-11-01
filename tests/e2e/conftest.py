@@ -11,7 +11,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 DEMO = REPO / "examples" / "demo"
-PYTHON = os.environ.get("FORKTEST_PYTHON") or "/Users/katakam/repos/faster_pytest/.venv/bin/python"
+PYTHON = os.environ.get("FORKTEST_PYTHON") or str(REPO / ".venv" / "bin" / "python")
 
 
 @pytest.fixture(scope="session")

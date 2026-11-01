@@ -629,7 +629,6 @@ mod parity {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    const PYTHON: &str = "/Users/katakam/repos/faster_pytest/.venv/bin/python";
     const ROOT: &str = "/tmp/forktest-pandas/pandas";
     const SCRIPT: &str = r#"
 import json, sys
@@ -664,7 +663,7 @@ print(json.dumps({p: sorted(graph.closure(p)) for p in sys.stdin.read().splitlin
                 }
             }
         }
-        let mut child = Command::new(PYTHON)
+        let mut child = Command::new(crate::python::dev_python())
             .args(["-c", SCRIPT, ROOT])
             .env("PYTHONPATH", &reference)
             .stdin(Stdio::piped())

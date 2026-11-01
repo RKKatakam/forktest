@@ -191,6 +191,14 @@ fn cache_dir() -> anyhow::Result<PathBuf> {
     Ok(if cfg!(target_os = "macos") { home.join("Library/Caches") } else { home.join(".cache") })
 }
 
+/// The interpreter the process tests run: `$FORKTEST_PYTHON`, else the repo's `.venv`.
+#[cfg(test)]
+pub(crate) fn dev_python() -> PathBuf {
+    std::env::var_os("FORKTEST_PYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/python"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,11 +263,9 @@ mod tests {
 
     #[test]
     fn check_reports_what_an_interpreter_lacks() {
-        let python = Path::new("/Users/katakam/repos/faster_pytest/.venv/bin/python");
-        if python.is_file() {
-            assert_eq!(check(python), Support::Ready);
-            assert_eq!(check(python), Support::Ready, "remembered");
-        }
+        let python = super::dev_python();
+        assert_eq!(check(&python), Support::Ready);
+        assert_eq!(check(&python), Support::Ready, "remembered");
         let fake = tmp("fake").join("python");
         std::fs::write(&fake, "#!/bin/sh\necho 3.11.9 True\n").unwrap();
         std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();

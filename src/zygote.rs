@@ -1206,19 +1206,25 @@ mod tests {
 
     /// Tests share the shim path the orphan check looks for, so they run one at a time.
     static SERIAL: Mutex<()> = Mutex::new(());
-    const DEMO_PYTHON: &str = "/Users/katakam/repos/faster_pytest/.venv/bin/python";
-    const JAX_PYTHON: &str = "/tmp/jaxprobe/.venv/bin/python";
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn interpreter(path: &str) -> Option<PathBuf> {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            Some(path)
+    fn demo_python() -> PathBuf {
+        let python = crate::python::dev_python();
+        assert!(python.is_file(), "{} is missing: create the repo's .venv or set FORKTEST_PYTHON", python.display());
+        python
+    }
+
+    /// `$FORKTEST_JAX_PYTHON`, else `/tmp/jaxprobe/.venv`: an interpreter with jax and pytest. Optional.
+    fn jax_python() -> Option<PathBuf> {
+        let python = std::env::var_os("FORKTEST_JAX_PYTHON")
+            .map_or_else(|| PathBuf::from("/tmp/jaxprobe/.venv/bin/python"), PathBuf::from);
+        if python.is_file() {
+            Some(python)
         } else {
-            eprintln!("skipping: {} is missing", path.display());
+            eprintln!("skipped: no JAX interpreter at {}; set FORKTEST_JAX_PYTHON", python.display());
             None
         }
     }
@@ -1415,7 +1421,7 @@ mod tests {
     #[test]
     fn demo_runs_in_four_batches_from_the_collected_session_like_pytest() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::example("demo");
         let expected = pytest_counts(&python, &scratch.0, &[]);
         {
@@ -1458,7 +1464,7 @@ mod tests {
     #[test]
     fn collection_restricted_to_files_returns_only_their_items() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::example("demo");
         {
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
@@ -1479,7 +1485,7 @@ mod tests {
     #[test]
     fn a_partial_collection_makes_only_the_named_tests_of_their_files() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::example("demo");
         {
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
@@ -1507,7 +1513,7 @@ mod tests {
     #[test]
     fn a_background_collection_goes_on_beside_partial_runs_and_becomes_l1() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::example("demo");
         {
             let (mut session, _) = start(&scratch, config(&scratch.0, &python));
@@ -1555,7 +1561,7 @@ mod tests {
     #[test]
     fn jax_arrays_at_import_move_the_fork_point_to_before_collection() {
         let _serial = serial();
-        let Some(python) = interpreter(JAX_PYTHON) else { return };
+        let Some(python) = jax_python() else { return };
         let scratch = Scratch::example("jaxdemo");
         {
             let t = Instant::now();
@@ -1603,6 +1609,10 @@ mod tests {
             assert!(parent_threads.iter().all(|&n| n == 1), "L0 OS threads during the run: {parent_threads:?}");
 
             let lazy = session.collect(Some(&partial(&["tests/test_lazy.py"], &[]))).unwrap();
+            let lazy_threads = threads::os_threads(session.l1.as_ref().unwrap().pid).unwrap();
+            // Linux numpy starts an OpenBLAS pool at import, which nothing preimported here makes tolerable.
+            assert_eq!(lazy.fork_point == ForkPoint::Collected, lazy_threads <= 1 + session.tolerated, "L1 has {lazy_threads} OS threads");
+            #[cfg(target_os = "macos")]
             assert_eq!(lazy.fork_point, ForkPoint::Collected);
             let mut report = Report::default();
             session.run(batches(&lazy.items, 2), false, &mut names, &AtomicBool::new(false), &mut report.sink()).unwrap();
@@ -1619,7 +1629,7 @@ mod tests {
     #[test]
     fn a_python_thread_started_by_a_conftest_moves_the_fork_point() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::new();
         scratch.write(
             "conftest.py",
@@ -1643,7 +1653,7 @@ mod tests {
     #[test]
     fn strict_pytest_runs_every_item_in_one_process() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::example("demo");
         let expected = pytest_counts(&python, &scratch.0, &[]);
         {
@@ -1665,7 +1675,7 @@ mod tests {
     #[test]
     fn stop_after_the_first_failure_kills_the_other_workers() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::new();
         scratch.write("tests/test_fail.py", "def test_fails():\n    assert 1 == 2\n");
         scratch.write(
@@ -1729,7 +1739,7 @@ mod tests {
     #[test]
     fn a_preimport_that_starts_threads_is_dropped_and_l0_restarts_without_it() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let site = Scratch::new();
         site.write("threadpkg/__init__.py", "import threading, time\nthreading.Thread(target=time.sleep, args=(600,), daemon=True).start()\n");
         let _path = PythonPath::set(&site.0);
@@ -1748,7 +1758,7 @@ mod tests {
     #[test]
     fn an_interpreter_that_starts_threads_by_itself_spawns_every_worker() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let site = Scratch::new();
         site.write("sitecustomize.py", "import threading, time\nthreading.Thread(target=time.sleep, args=(600,), daemon=True).start()\n");
         let _path = PythonPath::set(&site.0);
@@ -1815,7 +1825,7 @@ def test_warning_is_an_error():
     #[test]
     fn every_outcome_matches_pytest_from_each_fork_point() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = mixed_project();
         let mut expected = pytest_counts(&python, &scratch.0, &["--continue-on-collection-errors"]);
         // pytest counts the module that skipped itself and the file that failed to collect; `Collected` reports those.
@@ -1842,7 +1852,7 @@ def test_warning_is_an_error():
     #[test]
     fn the_fork_from_ini_option_overrides_the_thread_check() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::new();
         scratch.write("pyproject.toml", "[tool.pytest.ini_options]\nforktest_fork_from = \"imported\"\n");
         scratch.write("tests/test_one.py", "def test_one():\n    assert 1\n");
@@ -1859,7 +1869,7 @@ def test_warning_is_an_error():
     #[test]
     fn a_worker_that_dies_mid_batch_loses_the_rest_of_its_batch() {
         let _serial = serial();
-        let Some(python) = interpreter(DEMO_PYTHON) else { return };
+        let python = demo_python();
         let scratch = Scratch::new();
         scratch.write(
             "tests/test_die.py",
@@ -1882,7 +1892,7 @@ def test_warning_is_an_error():
     #[test]
     fn a_fatal_signal_to_the_rust_process_takes_its_python_children_down() {
         let _serial = serial();
-        let Some(_) = interpreter(DEMO_PYTHON) else { return };
+        demo_python();
         for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGKILL] {
             signal_target_then(signal);
             eprintln!("signal {signal}: no orphans");
@@ -1919,7 +1929,7 @@ def test_warning_is_an_error():
         if std::env::var_os("FORKTEST_SIGNAL_TARGET").is_none() {
             return;
         }
-        let python = PathBuf::from(DEMO_PYTHON);
+        let python = demo_python();
         let scratch = Scratch::example("demo");
         let mut session = Session::start(config(&scratch.0, &python)).unwrap();
         session.collect(None).unwrap();

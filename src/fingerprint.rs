@@ -797,7 +797,6 @@ pub(crate) mod parity {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    const PYTHON: &str = "/Users/katakam/repos/faster_pytest/.venv/bin/python";
     const SCRIPT: &str = r#"
 import json, sys
 from forktest.fingerprint import fingerprint
@@ -825,7 +824,7 @@ print(json.dumps(out))
     /// The Python forktest's source tree (a checkout of main's `src`), which these parity tests compare against.
     pub(crate) fn python_reference() -> Option<std::path::PathBuf> {
         let src = std::path::PathBuf::from(std::env::var_os("FORKTEST_PY_SRC")?);
-        if Path::new(PYTHON).exists() && src.join("forktest/fingerprint.py").exists() {
+        if crate::python::dev_python().exists() && src.join("forktest/fingerprint.py").exists() {
             return Some(src);
         }
         None
@@ -846,7 +845,7 @@ print(json.dumps(out))
         if let Some(extra) = std::env::var_os("FORKTEST_PARITY_EXTRA") {
             py_files(Path::new(&extra), &mut files, true);
         }
-        let mut child = Command::new(PYTHON)
+        let mut child = Command::new(crate::python::dev_python())
             .args(["-c", SCRIPT])
             .env("PYTHONPATH", &reference)
             .stdin(Stdio::piped())

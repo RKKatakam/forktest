@@ -1,5 +1,6 @@
 """JAX starts native thread pools when arrays are built at import; forktest must never fork a process holding them."""
 
+import os
 import shutil
 import time
 import xml.etree.ElementTree as ET
@@ -9,7 +10,7 @@ import pytest
 
 from conftest import REPO, Project, done, failed, selection
 
-JAX_PYTHON = Path("/tmp/jaxprobe/.venv/bin/python")
+JAX_PYTHON = Path(os.environ.get("FORKTEST_JAX_PYTHON") or "/tmp/jaxprobe/.venv/bin/python")
 FORK_WARNING = "os.fork() was called"
 
 pytestmark = pytest.mark.skipif(not JAX_PYTHON.exists(), reason=f"no JAX interpreter at {JAX_PYTHON}")

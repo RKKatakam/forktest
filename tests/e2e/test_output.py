@@ -263,3 +263,13 @@ def test_a_selection_reports_coverage_but_leaves_the_fail_under_threshold_to_ful
     assert "fail-under threshold applies to full runs (forktest --all)" in proc.stdout, proc.stdout
     full = fresh.run("--no-daemon", "--all", "-p", "no:cacheprovider")
     assert full.returncode == 0 and "Required test coverage of 100% reached" in full.stdout, full.stdout
+
+
+def test_all_prints_what_pytest_prints_when_workers_collect_their_own_files(fresh: Project):
+    fresh.write("tests/test_platform.py", SKIPPED_MODULE)
+    args = ("-p", "no:cacheprovider", "-k", "tax")
+    theirs = fresh.pytest(*args)
+    assert "10 deselected / 1 skipped / 6 selected" in theirs.stdout, theirs.stdout
+    for fork_from in ("imported", "imported", "spawn"):
+        ours = fresh.run("--no-daemon", "--all", "--fork-from", fork_from, *args)
+        assert (ours.returncode, normalised(ours.stdout)) == (theirs.returncode, normalised(theirs.stdout)), ours.stdout

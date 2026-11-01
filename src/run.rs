@@ -298,11 +298,7 @@ fn full_collection_reason(
     if inventory.is_empty() || meta.python_files.is_empty() {
         return Some("no inventory for these arguments");
     }
-    // Workers that collect their own files make an L1 collection pure overhead; the inventory names every test.
-    let workers_collect = req.fork_from.map_or(matches!(meta.fork_point.as_deref(), Some("imported" | "spawn")), |p| {
-        matches!(p, ForkPoint::Imported | ForkPoint::Spawn)
-    });
-    if matches!(req.mode, Mode::All) && (req.strict || !workers_collect) {
+    if matches!(req.mode, Mode::All) {
         return Some("--all");
     }
     if req.verify {
@@ -622,10 +618,7 @@ impl Project {
                 let universe: Vec<String> = inventory.iter().flat_map(|r| r.nodeids.iter().cloned()).collect();
                 let path_of: HashMap<&str, &str> =
                     inventory.iter().flat_map(|r| r.nodeids.iter().map(|n| (n.as_str(), &*r.path))).collect();
-                let affected = match req.mode {
-                    Mode::All => Affected { reasons: universe.iter().map(|n| (n.clone(), Reason::All)).collect(), changed: Vec::new() },
-                    _ => select::select(&universe, &view, &self.store, &mut *current, &graph, &fixture_set(&project))?,
-                };
+                let affected = select::select(&universe, &view, &self.store, &mut *current, &graph, &fixture_set(&project))?;
                 let file_of = |n: &str| path_of.get(n).copied().unwrap_or(test_file(n)).to_string();
                 let mut whole: BTreeSet<String> = BTreeSet::new();
                 for row in &inventory {

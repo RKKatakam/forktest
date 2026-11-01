@@ -76,18 +76,3 @@ def test_a_selected_test_the_workers_no_longer_find_is_reported(jaxdemo):
     assert failed(events) == {"tests/test_case.py::test_case[a]"} and done(events).passed == 7, events
     lost = next(e for e in events if getattr(e, "nodeid", None) == "tests/test_case.py::test_case[a]")
     assert "did not collect" in lost.message
-
-
-def test_all_whose_workers_collect_their_own_files_starts_no_l1_and_still_finds_a_new_test(jaxdemo):
-    events, rc = jaxdemo.forktest("--all")
-    assert rc == 0 and done(events).passed == 8
-    assert jaxdemo.log("collected") == ["forktest: collected 8 tests; workers fork from imported"]
-
-    events, rc = jaxdemo.forktest("--all")
-    assert rc == 0 and done(events).passed == 8 and FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr
-    assert jaxdemo.log("collected") == [] and len(jaxdemo.log("no L1: 8 tests from the inventory")) == 1, jaxdemo.stderr
-
-    lazy = (jaxdemo.root / "tests" / "test_lazy.py").read_text()
-    jaxdemo.write("tests/test_lazy.py", lazy + "\n\ndef test_added_later():\n    assert jnp.zeros(2).sum() == 0\n")
-    events, rc = jaxdemo.forktest("--all")
-    assert rc == 0 and done(events).passed == 9 and FORK_WARNING not in jaxdemo.stderr, jaxdemo.stderr

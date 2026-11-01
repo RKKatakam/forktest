@@ -307,6 +307,23 @@ def test_a_daemon_run_piped_into_another_program_reaches_end_of_file(served):
         assert "served by the daemon" in proc.stderr and "16 passed" in proc.stdout, proc.stdout + proc.stderr
 
 
+def test_a_killed_clients_run_stops_writing_to_its_terminal(served, tmp_path):
+    served.write("tests/test_sleepy.py", "import time\n\ndef test_quick():\n    pass\n\ndef test_sleepy():\n    time.sleep(4)\n")
+    start(served)
+    with open(tmp_path / "terminal", "w") as terminal:
+        proc = subprocess.Popen([served.binary, "--all", "-n", "2"], cwd=served.root, stdout=terminal, stderr=terminal, env=served.env())
+        time.sleep(1.5)
+        proc.kill()
+        proc.wait()
+    time.sleep(0.5)
+    written = (tmp_path / "terminal").stat().st_size
+    time.sleep(4)
+    assert (tmp_path / "terminal").stat().st_size == written, (tmp_path / "terminal").read_text()
+    assert "the client went away" in daemon_log(served)
+    events, rc = client(served)
+    assert rc == 0 and done(events).passed >= 1
+
+
 def test_the_zygote_dying_mid_run_loses_no_results_and_is_rebuilt(served):
     demo = served
     demo.write("tests/test_sleepy.py", "import time\n\ndef test_sleepy():\n    time.sleep(1.5)\n")

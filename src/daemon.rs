@@ -99,7 +99,12 @@ pub fn run_via_daemon(
     let paths = Paths { root: root.to_path_buf() };
     let msg = json!({"op": "run", "python": python, "request": req, "terminal": terminal.is_some()});
     for attempt in 0..2 {
-        let stream = send(&paths, &msg)?;
+        let Some(stream) = send(&paths, &msg) else {
+            if attempt > 0 {
+                eprintln!("forktest: the daemon is gone; running without it");
+            }
+            return None;
+        };
         if let Some(t) = terminal {
             use std::os::fd::AsFd;
             proto::send_fds(&stream, &[t.out.as_fd(), t.err.as_fd()]).ok()?;
@@ -500,6 +505,36 @@ fn accept(listener: UnixListener, tx: Sender<Msg>, shared: &Shared) {
     }
 }
 
+/// Sets `cancel` when the client hangs up before the returned flag is set, so a killed client's run stops and its
+/// reporter stops writing to the client's terminal. The client sends nothing after its request, so the connection
+/// turns readable only at its end.
+fn cancel_on_hangup(stream: &UnixStream, cancel: Arc<AtomicBool>) -> Arc<AtomicBool> {
+    use std::os::fd::AsRawFd;
+    let served = Arc::new(AtomicBool::new(false));
+    let Ok(stream) = stream.try_clone() else { return served };
+    let done = served.clone();
+    std::thread::spawn(move || {
+        let mut pfd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        while !done.load(Ordering::SeqCst) {
+            if unsafe { libc::poll(&mut pfd, 1, 100) } <= 0 || done.load(Ordering::SeqCst) {
+                continue;
+            }
+            let mut byte = 0u8;
+            let got = unsafe { libc::recv(pfd.fd, (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+            let error = std::io::Error::last_os_error().kind();
+            if got < 0 && matches!(error, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
+                continue;
+            }
+            if got <= 0 {
+                log("the client went away; cancelling its run");
+                cancel.store(true, Ordering::SeqCst);
+            }
+            return;
+        }
+    });
+    served
+}
+
 /// Every `.py` file under `dir`, skipping the directories pytest and the watcher skip.
 fn py_files(root: &Path, dir: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -805,6 +840,7 @@ impl Daemon {
         self.fork_from = req.fork_from;
         self.shared.cancel.store(false, Ordering::SeqCst);
         let cancel = self.shared.cancel.clone();
+        let served = cancel_on_hangup(&stream, cancel.clone());
         let mut writer = std::io::BufWriter::new(&stream);
         let result = self.project.run(&req, terminal, &mut |e: &Event| {
             let sent = writeln!(writer, "{}", e.to_line()).and_then(|_| writer.flush());
@@ -812,6 +848,8 @@ impl Daemon {
                 cancel.store(true, Ordering::SeqCst);
             }
         });
+        // Before the end line: the client hangs up once it has read it.
+        served.store(true, Ordering::SeqCst);
         drop(writer);
         let result_code = result.as_ref().ok().copied();
         if !self.shared.stopping.load(Ordering::SeqCst) {

@@ -425,6 +425,10 @@ fn wait_for_signals(set: libc::sigset_t, tx: Sender<Msg>, shared: &Shared) {
 fn start_watcher(root: &Path, tx: Sender<Msg>, shared: Arc<Shared>) -> anyhow::Result<notify::RecommendedWatcher> {
     let root_owned = root.to_path_buf();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        // inotify reports every open and close; a read must not look like an edit.
+        if matches!(&event, Ok(e) if e.kind.is_access()) {
+            return;
+        }
         if shared.watch_run.load(Ordering::SeqCst)
             && let Ok(e) = &event
             && e.paths.iter().any(|p| relative(&root_owned, p).is_some())
